@@ -20,6 +20,8 @@ Once the environment is ready, you can open notebooks or run scripts:
 
 ```bash
 uv run python scripts/find_optimal_sma.py --data ../data/btc.parquet
+uv run python scripts/optimize_rsi.py --data ../data/btc.parquet --output strategies/rsi_from_python.toml
+uv run python scripts/train_ml_classifier.py --data ../data/btc.parquet --output models/ml_linear.toml
 ```
 
 Store generated strategy configs under `strategies/` (see `sma_cross.toml`, `rsi_reversion.toml`, etc.) and drop ML artifacts under `models/`. The Rust CLI consumes these files directly via `--strategy-config` (and the referenced `model_path`).

@@ -158,7 +158,8 @@ tesser-cli --env default <COMMAND>
 
 Commands:
   data download|validate|resample   # Download/inspect historical data
-  backtest run --strategy-config    # Executes a backtest driven by a strategy TOML (+ optional CSVs)
+  backtest run --strategy-config    # Executes a single backtest (supports multiple --data inputs)
+  backtest batch --config ...       # Runs multiple configs and writes an optional summary CSV
   live run --strategy-config        # Bootstraps a live session (scaffolding)
   strategies                        # Lists compiled strategies
 ```
@@ -190,6 +191,8 @@ uv venv
 source .venv/bin/activate
 uv pip install -e .
 uv run python scripts/find_optimal_sma.py --data ../data/btc.parquet
+uv run python scripts/optimize_rsi.py --data ../data/btc.parquet --output strategies/rsi_from_python.toml
+uv run python scripts/train_ml_classifier.py --data ../data/btc.parquet --output models/ml_linear.toml
 ```
 
 The generated TOML files feed directly into `tesser-cli backtest run --strategy-config ...`.

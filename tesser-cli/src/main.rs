@@ -62,8 +62,10 @@ enum DataCommand {
 
 #[derive(Subcommand)]
 enum BacktestCommand {
-    /// Run a backtest from a strategy config file
+    /// Run a single backtest from a strategy config file
     Run(BacktestRunArgs),
+    /// Run multiple strategy configs and aggregate the results
+    Batch(BacktestBatchArgs),
 }
 
 #[derive(Subcommand)]
@@ -165,6 +167,21 @@ struct BacktestRunArgs {
 }
 
 #[derive(Args)]
+struct BacktestBatchArgs {
+    /// Glob or directory containing strategy config files
+    #[arg(long = "config", value_name = "PATH", num_args = 1.., action = clap::ArgAction::Append)]
+    config_paths: Vec<PathBuf>,
+    /// Candle CSVs available to every strategy
+    #[arg(long = "data", value_name = "PATH", num_args = 1.., action = clap::ArgAction::Append)]
+    data_paths: Vec<PathBuf>,
+    #[arg(long, default_value_t = 0.01)]
+    quantity: f64,
+    /// Optional output CSV summarizing results
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Args)]
 struct LiveRunArgs {
     #[arg(long)]
     strategy_config: PathBuf,
@@ -201,6 +218,9 @@ async fn main() -> Result<()> {
         Commands::Data { action } => handle_data(action, &config).await?,
         Commands::Backtest {
             action: BacktestCommand::Run(args),
+        } => args.run(&config).await?,
+        Commands::Backtest {
+            action: BacktestCommand::Batch(args),
         } => args.run(&config).await?,
         Commands::Live {
             action: LiveCommand::Run(args),
@@ -276,6 +296,62 @@ impl BacktestRunArgs {
             .await
             .context("backtest failed")?;
         print_report(report);
+        Ok(())
+    }
+}
+
+impl BacktestBatchArgs {
+    async fn run(&self, _config: &AppConfig) -> Result<()> {
+        if self.config_paths.is_empty() {
+            return Err(anyhow!("provide at least one --config path"));
+        }
+        if self.data_paths.is_empty() {
+            return Err(anyhow!("provide at least one --data path for batch mode"));
+        }
+        let mut aggregated = Vec::new();
+        for config_path in &self.config_paths {
+            let contents = std::fs::read_to_string(config_path).with_context(|| {
+                format!("failed to read strategy config {}", config_path.display())
+            })?;
+            let def: StrategyConfigFile =
+                toml::from_str(&contents).context("failed to parse strategy config file")?;
+            let strategy = build_builtin_strategy(&def.name, def.params)
+                .with_context(|| format!("failed to configure strategy {}", def.name))?;
+            let mut candles = load_candles_from_paths(&self.data_paths)?;
+            candles.sort_by_key(|c| c.timestamp);
+            let execution = ExecutionEngine::new(
+                PaperExecutionClient::default(),
+                Box::new(FixedOrderSizer {
+                    quantity: self.quantity,
+                }),
+            );
+            let cfg = BacktestConfig::new(strategy.symbol().to_string(), candles);
+            let report = Backtester::new(cfg, strategy, execution)
+                .run()
+                .await
+                .with_context(|| format!("backtest failed for {}", config_path.display()))?;
+            println!(
+                "[batch] {} -> signals {}, orders {}, ending equity {:.2}",
+                config_path.display(),
+                report.signals_emitted,
+                report.orders_sent,
+                report.ending_equity
+            );
+            aggregated.push(BatchRow {
+                config: config_path.display().to_string(),
+                signals: report.signals_emitted,
+                orders: report.orders_sent,
+                ending_equity: report.ending_equity,
+            });
+        }
+
+        if let Some(output) = &self.output {
+            write_batch_report(output, &aggregated)?;
+            println!("Batch report written to {}", output.display());
+        }
+        if aggregated.is_empty() {
+            return Err(anyhow!("no batch jobs executed"));
+        }
         Ok(())
     }
 }
@@ -465,6 +541,28 @@ fn write_candles_csv(path: &Path, candles: &[Candle]) -> Result<()> {
             close: candle.close,
             volume: candle.volume,
         };
+        writer.serialize(row)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct BatchRow {
+    config: String,
+    signals: usize,
+    orders: usize,
+    ending_equity: f64,
+}
+
+fn write_batch_report(path: &Path, rows: &[BatchRow]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+    let mut writer =
+        Writer::from_path(path).with_context(|| format!("failed to create {}", path.display()))?;
+    for row in rows {
         writer.serialize(row)?;
     }
     writer.flush()?;
