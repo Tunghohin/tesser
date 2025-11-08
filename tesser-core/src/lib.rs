@@ -112,6 +112,59 @@ pub struct Candle {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Represents a single level in the order book.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct OrderBookLevel {
+    pub price: Price,
+    pub size: Quantity,
+}
+
+/// Snapshot of the order book depth.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct OrderBook {
+    pub symbol: Symbol,
+    pub bids: Vec<OrderBookLevel>,
+    pub asks: Vec<OrderBookLevel>,
+    pub timestamp: DateTime<Utc>,
+}
+
+impl OrderBook {
+    /// Returns the best bid if available.
+    #[must_use]
+    pub fn best_bid(&self) -> Option<&OrderBookLevel> {
+        self.bids.first()
+    }
+
+    /// Returns the best ask if available.
+    #[must_use]
+    pub fn best_ask(&self) -> Option<&OrderBookLevel> {
+        self.asks.first()
+    }
+
+    /// Calculates bid/ask imbalance for the top `depth` levels.
+    #[must_use]
+    pub fn imbalance(&self, depth: usize) -> Option<f64> {
+        let depth = depth.max(1);
+        let bid_vol: f64 = self.bids.iter().take(depth).map(|level| level.size).sum();
+        let ask_vol: f64 = self.asks.iter().take(depth).map(|level| level.size).sum();
+        let denom = bid_vol + ask_vol;
+        if denom.abs() < f64::EPSILON {
+            None
+        } else {
+            Some((bid_vol - ask_vol) / denom)
+        }
+    }
+}
+
+/// Incremental order book update.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct DepthUpdate {
+    pub symbol: Symbol,
+    pub bids: Vec<OrderBookLevel>,
+    pub asks: Vec<OrderBookLevel>,
+    pub timestamp: DateTime<Utc>,
+}
+
 /// Desired order placement parameters.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OrderRequest {
