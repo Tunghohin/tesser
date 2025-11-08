@@ -8,5 +8,6 @@ authors.workspace = true
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tesser-core = { path = "../tesser-core" }

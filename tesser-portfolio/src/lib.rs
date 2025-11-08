@@ -152,6 +152,12 @@ impl Portfolio {
     pub fn initial_equity(&self) -> Price {
         self.initial_equity
     }
+
+    /// Clone all tracked positions for external consumers (e.g., strategies).
+    #[must_use]
+    pub fn positions(&self) -> Vec<Position> {
+        self.positions.values().cloned().collect()
+    }
 }
 
 #[cfg(test)]

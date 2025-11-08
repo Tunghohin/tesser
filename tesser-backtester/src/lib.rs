@@ -72,8 +72,9 @@ where
         let mut orders_sent = 0;
 
         for candle in &self.config.candles {
+            self.strategy_ctx.push_candle(candle.clone());
             self.strategy
-                .on_candle(&mut self.strategy_ctx, candle)
+                .on_candle(&self.strategy_ctx, candle)
                 .context("strategy failed on candle")?;
             let signals = self.strategy.drain_signals();
             for signal in signals {
@@ -92,8 +93,10 @@ where
                     self.portfolio
                         .apply_fill(&fill)
                         .context("failed to update portfolio")?;
+                    self.strategy_ctx
+                        .update_positions(self.portfolio.positions());
                     self.strategy
-                        .on_fill(&mut self.strategy_ctx, &fill)
+                        .on_fill(&self.strategy_ctx, &fill)
                         .context("strategy failed on fill")?;
                 }
             }
