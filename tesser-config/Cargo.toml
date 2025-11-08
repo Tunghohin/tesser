@@ -1,0 +1,12 @@
+[package]
+name = "tesser-config"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+config.workspace = true
+serde.workspace = true
+toml.workspace = true

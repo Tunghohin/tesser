@@ -1,0 +1,21 @@
+[project]
+name = "tesser-research"
+version = "0.1.0"
+description = "Research environment for the Tesser quant framework"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "jupyter",
+    "numpy",
+    "pandas",
+    "polars",
+    "pyarrow",
+    "scikit-learn",
+    "toml",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "ipykernel",
+    "ruff",
+]

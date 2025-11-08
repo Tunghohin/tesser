@@ -6,6 +6,7 @@ use std::fs;
 use serde::{Deserialize, Serialize};
 use tesser_core::{Candle, Fill, OrderBook, Position, Signal, SignalKind, Symbol, Tick};
 use thiserror::Error;
+use toml::Value;
 
 /// Result alias used within strategy implementations.
 pub type StrategyResult<T> = Result<T, StrategyError>;
@@ -837,6 +838,39 @@ impl Strategy for PairsTradingArbitrage {
     fn drain_signals(&mut self) -> Vec<Signal> {
         std::mem::take(&mut self.signals)
     }
+}
+
+/// Returns the list of built-in strategy identifiers.
+pub fn builtin_strategy_names() -> &'static [&'static str] {
+    &[
+        "SmaCross",
+        "RsiReversion",
+        "BollingerBreakout",
+        "MlClassifier",
+        "PairsTradingArbitrage",
+        "OrderBookImbalance",
+    ]
+}
+
+/// Builds and configures a strategy by name using the provided parameters.
+pub fn build_builtin_strategy(name: &str, params: Value) -> StrategyResult<Box<dyn Strategy>> {
+    let mut strategy: Box<dyn Strategy> = match name.to_lowercase().as_str() {
+        "smacross" => Box::new(SmaCross::default()),
+        "rsireversion" => Box::new(RsiReversion::default()),
+        "bollingerbreakout" => Box::new(BollingerBreakout::default()),
+        "mlclassifier" => Box::new(MlClassifier::default()),
+        "pairstradingarbitrage" | "pairstrading" | "pairs" => {
+            Box::new(PairsTradingArbitrage::default())
+        }
+        "orderbookimbalance" | "obi" => Box::new(OrderBookImbalance::default()),
+        other => {
+            return Err(StrategyError::InvalidConfig(format!(
+                "unknown strategy: {other}"
+            )))
+        }
+    };
+    strategy.configure(params)?;
+    Ok(strategy)
 }
 
 /// Order book imbalance strategy operating on depth snapshots.

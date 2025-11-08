@@ -128,35 +128,85 @@ tesser/
 
 ### Example: Running a Backtest
 
-1.  Ensure you have historical data available in the required format.
-2.  Configure your backtest in `config.toml`.
-3.  Run the backtester from the command line:
-    ```sh
-    cargo run --release --bin tesser-cli -- \
-        backtest \
-        --strategy "SmaCross" \
-        --symbol "BTC-USDT" \
-        --from "2024-01-01" \
-        --to "2024-06-30"
+1.  Generate a strategy parameter file (see the `research/` section below). Example `research/strategies/sma_cross_optimal.toml`:
+    ```toml
+    strategy_name = "SmaCross"
+
+    [params]
+    symbol = "BTCUSDT"
+    fast_period = 12
+    slow_period = 30
+    min_samples = 40
     ```
+2.  Run a mock backtest with the CLI:
+    ```sh
+    cargo run -p tesser-cli -- \
+        backtest run \
+        --strategy-config research/strategies/sma_cross_optimal.toml \
+        --candles 500 \
+        --quantity 0.02
+    ```
+    (Synthetic candles are generated automatically; wiring to real data happens through the `data` subcommands.)
 
-### Quick Start (Mock Backtest)
+### CLI Overview
 
-You can validate the pipeline without any external data feeds:
+`tesser-cli` is the single entry point for local research and operations:
 
-```sh
-cargo run -p tesser-cli -- backtest --symbol BTCUSDT --candles 200 --quantity 0.01
+```text
+tesser-cli --env default <COMMAND>
+
+Commands:
+  data download|validate|resample   # Data engineering utilities (scaffolding)
+  backtest run --strategy-config    # Executes a backtest driven by a strategy TOML
+  live run --strategy-config        # Bootstraps a live session (scaffolding)
+  strategies                        # Lists compiled strategies
 ```
 
-### Bybit Testnet Utilities
+Configuration files live in `config/`. The loader merges the following sources (lowest → highest priority):
 
-The Bybit connector follows the signing process described in `bybit-api-docs/docs/v5/guide.mdx`. You can verify connectivity with the public server-time endpoint via:
+1. `config/default.toml`
+2. `config/{env}.toml` (selected by `--env`)
+3. `config/local.toml` (gitignored)
+4. Environment variables prefixed with `TESSER_` (e.g. `TESSER_exchange__bybit_testnet__api_key`)
 
-```sh
-cargo run -p tesser-cli -- bybit-time
+### Python Research Workflow
+
+Rust handles live execution; Python (powered by [`uv`](https://github.com/astral-sh/uv)) owns fast research loops. The `research/` directory provides:
+
+```
+research/
+├── notebooks/      # Exploratory analysis
+├── scripts/        # Batch jobs (e.g., parameter sweeps)
+├── strategies/     # Outputs consumed by Rust (TOML, ONNX, etc.)
+└── pyproject.toml  # Locked dependencies for uv
 ```
 
-Set the `BAPI_KEY`/`BAPI_SECRET` environment variables (or wire them into your own config loader) before attempting private calls such as order placement.
+Quick start:
+
+```sh
+cd research
+uv venv
+source .venv/bin/activate
+uv pip install -e .
+uv run python scripts/find_optimal_sma.py --data ../data/btc.parquet
+```
+
+The generated TOML files feed directly into `tesser-cli backtest run --strategy-config ...`.
+
+### Strategy Portfolio
+
+The upgraded `tesser-strategy` crate bundles a diverse suite for pressure-testing the stack:
+
+| Name | Type | Highlights |
+| --- | --- | --- |
+| `SmaCross` | Trend following | Dual moving-average crossover |
+| `RsiReversion` | Mean reversion | RSI thresholds with configurable lookbacks |
+| `BollingerBreakout` | Volatility/Band breakout | Uses standard deviation bands for entries |
+| `MlClassifier` | Machine learning | Loads an external model artifact for real-time inference |
+| `PairsTradingArbitrage` | Statistical arbitrage | Operates on two correlated symbols |
+| `OrderBookImbalance` | Microstructure | Consumes order-book snapshots to trade short-term imbalances |
+
+Each strategy exposes a typed configuration schema and registers the symbols (one or many) it operates on. This makes it trivial for the CLI, backtester, or future engines to instantiate strategies based on files generated during research.
 
 ## Contributing
 
