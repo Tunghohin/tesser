@@ -13,3 +13,4 @@ tokio.workspace = true
 tracing.workspace = true
 tesser-broker = { path = "../tesser-broker" }
 tesser-core = { path = "../tesser-core" }
+chrono.workspace = true

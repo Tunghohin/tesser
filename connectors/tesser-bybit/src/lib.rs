@@ -137,17 +137,17 @@ impl BybitClient {
             .as_ref()
             .map(|pairs| serde_urlencoded::to_string(pairs).unwrap_or_default())
             .unwrap_or_default();
-        let payload = match method {
-            Method::GET => format!(
+        let payload = if method == Method::GET {
+            format!(
                 "{timestamp}{}{}{}",
                 creds.api_key, self.config.recv_window, query_string
-            ),
-            _ => format!(
+            )
+        } else {
+            let body_string = body.to_string();
+            format!(
                 "{timestamp}{}{}{}",
-                creds.api_key,
-                self.config.recv_window,
-                body.to_string()
-            ),
+                creds.api_key, self.config.recv_window, body_string
+            )
         };
         let mut mac = HmacSha256::new_from_slice(creds.api_secret.as_bytes())
             .map_err(|err| BrokerError::Other(format!("failed to create signing key: {err}")))?;
@@ -335,7 +335,7 @@ fn millis_to_datetime(value: &str) -> chrono::DateTime<Utc> {
     value
         .parse::<i64>()
         .ok()
-        .and_then(|millis| chrono::DateTime::<Utc>::from_timestamp_millis(millis))
+        .and_then(chrono::DateTime::<Utc>::from_timestamp_millis)
         .unwrap_or_else(Utc::now)
 }
 

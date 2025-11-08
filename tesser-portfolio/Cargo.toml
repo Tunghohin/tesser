@@ -9,3 +9,7 @@ authors.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tesser-core = { path = "../tesser-core" }
+
+[dev-dependencies]
+chrono.workspace = true
+uuid.workspace = true

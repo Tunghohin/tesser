@@ -1284,6 +1284,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "futures",
  "tesser-broker",
  "tesser-core",
@@ -1320,9 +1321,11 @@ dependencies = [
 name = "tesser-portfolio"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "serde",
  "tesser-core",
  "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]
