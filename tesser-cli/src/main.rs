@@ -1,8 +1,11 @@
+mod data_validation;
+
+use crate::data_validation::{validate_dataset, ValidationConfig, ValidationOutcome};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use csv::Writer;
@@ -14,7 +17,7 @@ use tesser_data::download::{BybitDownloader, KlineRequest};
 use tesser_execution::{ExecutionEngine, FixedOrderSizer};
 use tesser_paper::PaperExecutionClient;
 use tesser_strategy::{build_builtin_strategy, builtin_strategy_names};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser)]
 #[command(author, version, about = "Tesser CLI")]
@@ -52,9 +55,9 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum DataCommand {
-    /// Download historical market data (placeholder)
+    /// Download historical market data
     Download(DataDownloadArgs),
-    /// Validate a local data set (placeholder)
+    /// Validate and optionally repair a local data set
     Validate(DataValidateArgs),
     /// Resample existing data (placeholder)
     Resample(DataResampleArgs),
@@ -139,8 +142,92 @@ impl DataDownloadArgs {
 
 #[derive(Args)]
 struct DataValidateArgs {
+    /// One or more CSV files to inspect
+    #[arg(
+        long = "path",
+        value_name = "PATH",
+        num_args = 1..,
+        action = clap::ArgAction::Append
+    )]
+    paths: Vec<PathBuf>,
+    /// Optional reference data set(s) used for cross validation
+    #[arg(
+        long = "reference",
+        value_name = "PATH",
+        num_args = 1..,
+        action = clap::ArgAction::Append
+    )]
+    reference_paths: Vec<PathBuf>,
+    /// Max allowed close-to-close jump before flagging (fractional, 0.05 = 5%)
+    #[arg(long, default_value_t = 0.05)]
+    jump_threshold: f64,
+    /// Allowed divergence between primary and reference closes (fractional)
+    #[arg(long, default_value_t = 0.002)]
+    reference_tolerance: f64,
+    /// Attempt to fill gaps by synthesizing candles
     #[arg(long)]
-    path: PathBuf,
+    repair_missing: bool,
+    /// Location to write the repaired dataset
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+impl DataValidateArgs {
+    fn run(&self) -> Result<()> {
+        if self.paths.is_empty() {
+            bail!("provide at least one --path for validation");
+        }
+        let candles =
+            load_candles_from_paths(&self.paths).with_context(|| "failed to load dataset")?;
+        if candles.is_empty() {
+            bail!("loaded dataset is empty; nothing to validate");
+        }
+        let reference = if self.reference_paths.is_empty() {
+            None
+        } else {
+            Some(
+                load_candles_from_paths(&self.reference_paths)
+                    .with_context(|| "failed to load reference dataset")?,
+            )
+        };
+
+        let price_jump_threshold = if self.jump_threshold <= 0.0 {
+            0.0001
+        } else {
+            self.jump_threshold
+        };
+        let reference_tolerance = if self.reference_tolerance <= 0.0 {
+            0.0001
+        } else {
+            self.reference_tolerance
+        };
+
+        let config = ValidationConfig {
+            price_jump_threshold,
+            reference_tolerance,
+            repair_missing: self.repair_missing,
+        };
+
+        let outcome = validate_dataset(candles, reference, config)?;
+        print_validation_summary(&outcome);
+
+        if let Some(output) = &self.output {
+            write_candles_csv(output, &outcome.repaired)?;
+            info!(
+                "Wrote {} candles ({} new) to {}",
+                outcome.repaired.len(),
+                outcome.summary.repaired_candles,
+                output.display()
+            );
+        } else if self.repair_missing && outcome.summary.repaired_candles > 0 {
+            warn!(
+                "Detected {} gap(s) filled with synthetic candles but --output was not provided",
+                outcome.summary.repaired_candles
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Args)]
@@ -237,7 +324,7 @@ async fn handle_data(cmd: DataCommand, config: &AppConfig) -> Result<()> {
             args.run(config).await?;
         }
         DataCommand::Validate(args) => {
-            info!("stub: validating dataset at {}", args.path.display());
+            args.run()?;
         }
         DataCommand::Resample(args) => {
             info!(
@@ -378,6 +465,84 @@ fn list_strategies() {
     println!("Built-in strategies:");
     for name in builtin_strategy_names() {
         println!("- {name}");
+    }
+}
+
+fn print_validation_summary(outcome: &ValidationOutcome) {
+    const MAX_EXAMPLES: usize = 5;
+    let summary = &outcome.summary;
+    println!(
+        "Validation summary for {} ({} candles)",
+        summary.symbol, summary.rows
+    );
+    println!(
+        "  Range: {} -> {}",
+        summary.start.to_rfc3339(),
+        summary.end.to_rfc3339()
+    );
+    println!("  Interval: {}", interval_label(summary.interval));
+    println!("  Missing intervals: {}", summary.missing_candles);
+    println!("  Duplicate intervals: {}", summary.duplicate_candles);
+    println!("  Zero-volume candles: {}", summary.zero_volume_candles);
+    println!("  Price spikes flagged: {}", summary.price_spike_count);
+    println!(
+        "  Cross-source mismatches: {}",
+        summary.cross_mismatch_count
+    );
+    println!("  Repaired candles generated: {}", summary.repaired_candles);
+
+    if !outcome.gaps.is_empty() {
+        println!("  Gap examples:");
+        for gap in outcome.gaps.iter().take(MAX_EXAMPLES) {
+            println!(
+                "    {} -> {} (missing {})",
+                gap.start.to_rfc3339(),
+                gap.end.to_rfc3339(),
+                gap.missing
+            );
+        }
+        if outcome.gaps.len() > MAX_EXAMPLES {
+            println!(
+                "    ... {} additional gap(s) omitted",
+                outcome.gaps.len() - MAX_EXAMPLES
+            );
+        }
+    }
+
+    if !outcome.price_spikes.is_empty() {
+        println!("  Price spike examples:");
+        for spike in outcome.price_spikes.iter().take(MAX_EXAMPLES) {
+            println!(
+                "    {} (change {:.2}%)",
+                spike.timestamp.to_rfc3339(),
+                spike.change_fraction * 100.0
+            );
+        }
+        if outcome.price_spikes.len() > MAX_EXAMPLES {
+            println!(
+                "    ... {} additional spike(s) omitted",
+                outcome.price_spikes.len() - MAX_EXAMPLES
+            );
+        }
+    }
+
+    if !outcome.cross_mismatches.is_empty() {
+        println!("  Cross-source mismatch examples:");
+        for miss in outcome.cross_mismatches.iter().take(MAX_EXAMPLES) {
+            println!(
+                "    {} primary {:.4} vs ref {:.4} ({:.2}%)",
+                miss.timestamp.to_rfc3339(),
+                miss.primary_close,
+                miss.reference_close,
+                miss.delta_fraction * 100.0
+            );
+        }
+        if outcome.cross_mismatches.len() > MAX_EXAMPLES {
+            println!(
+                "    ... {} additional mismatch(es) omitted",
+                outcome.cross_mismatches.len() - MAX_EXAMPLES
+            );
+        }
     }
 }
 
