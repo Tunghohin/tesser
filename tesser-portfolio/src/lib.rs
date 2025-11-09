@@ -158,6 +158,43 @@ impl Portfolio {
     pub fn positions(&self) -> Vec<Position> {
         self.positions.values().cloned().collect()
     }
+
+    /// Snapshot the current state for persistence.
+    #[must_use]
+    pub fn snapshot(&self) -> PortfolioState {
+        PortfolioState {
+            positions: self.positions.clone(),
+            cash: self.cash,
+            realized_pnl: self.realized_pnl,
+            initial_equity: self.initial_equity,
+        }
+    }
+
+    /// Rehydrate a portfolio from a persisted snapshot.
+    pub fn from_state(state: PortfolioState) -> Self {
+        Self {
+            positions: state.positions,
+            cash: state.cash,
+            realized_pnl: state.realized_pnl,
+            initial_equity: state.initial_equity,
+        }
+    }
+
+    /// Refresh mark-to-market pricing for a symbol when new data arrives.
+    pub fn mark_price(&mut self, symbol: &str, price: Price) {
+        if let Some(position) = self.positions.get_mut(symbol) {
+            position.mark_price(price);
+        }
+    }
+}
+
+/// Serializable representation of a portfolio used for persistence.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PortfolioState {
+    pub positions: HashMap<Symbol, Position>,
+    pub cash: Price,
+    pub realized_pnl: Price,
+    pub initial_equity: Price,
 }
 
 #[cfg(test)]

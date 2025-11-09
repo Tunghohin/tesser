@@ -24,19 +24,23 @@ anyhow = "1.0"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
+config = { version = "0.14", default-features = false, features = ["toml"] }
+csv = "1.3"
 futures = "0.3"
 hex = "0.4"
 hmac = "0.12"
-config = { version = "0.14", default-features = false, features = ["toml"] }
+hyper = { version = "0.14", features = ["http1", "tcp", "server"] }
+prometheus = { version = "0.13", default-features = false, features = ["process"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_urlencoded = "0.7"
 sha2 = "0.10"
-toml = "0.8"
 thiserror = "1.0"
-tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "time", "signal", "sync", "net", "fs"] }
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["rustls-tls-native-roots", "connect"] }
+toml = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
-csv = "1.3"

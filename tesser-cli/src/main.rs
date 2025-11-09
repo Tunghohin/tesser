@@ -1,7 +1,15 @@
+mod alerts;
 mod data_validation;
+mod live;
+mod state;
+mod telemetry;
 
+use crate::alerts::sanitize_webhook;
 use crate::data_validation::{validate_dataset, ValidationConfig, ValidationOutcome};
+use crate::live::{run_live, LiveSessionSettings};
+use crate::telemetry::init_tracing;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -11,6 +19,7 @@ use clap::{Args, Parser, Subcommand};
 use csv::Writer;
 use serde::{Deserialize, Serialize};
 use tesser_backtester::{BacktestConfig, BacktestReport, Backtester};
+use tesser_bybit::PublicChannel;
 use tesser_config::{load_config, AppConfig};
 use tesser_core::{Candle, Interval, Symbol};
 use tesser_data::download::{BybitDownloader, KlineRequest};
@@ -93,6 +102,18 @@ struct DataDownloadArgs {
     end: Option<String>,
     #[arg(long)]
     output: Option<PathBuf>,
+    /// Skip automatic validation after download completes
+    #[arg(long)]
+    skip_validation: bool,
+    /// Attempt to repair gaps detected during validation
+    #[arg(long)]
+    repair_missing: bool,
+    /// Max allowed close-to-close jump when auto-validating (fractional)
+    #[arg(long, default_value_t = 0.05)]
+    validation_jump_threshold: f64,
+    /// Allowed divergence between primary and reference closes (fractional)
+    #[arg(long, default_value_t = 0.002)]
+    validation_reference_tolerance: f64,
 }
 
 impl DataDownloadArgs {
@@ -117,7 +138,7 @@ impl DataDownloadArgs {
             "Downloading {} candles for {} ({})",
             self.interval, self.symbol, self.exchange
         );
-        let candles = downloader
+        let mut candles = downloader
             .download_klines(&request)
             .await
             .with_context(|| "failed to download candles from Bybit")?;
@@ -125,6 +146,24 @@ impl DataDownloadArgs {
         if candles.is_empty() {
             info!("No candles returned for {}", self.symbol);
             return Ok(());
+        }
+
+        if !self.skip_validation {
+            let config = ValidationConfig {
+                price_jump_threshold: self.validation_jump_threshold.max(f64::EPSILON),
+                reference_tolerance: self.validation_reference_tolerance.max(f64::EPSILON),
+                repair_missing: self.repair_missing,
+            };
+            let outcome =
+                validate_dataset(candles.clone(), None, config).context("validation failed")?;
+            print_validation_summary(&outcome);
+            if self.repair_missing && outcome.summary.repaired_candles > 0 {
+                candles = outcome.repaired;
+                info!(
+                    "Applied {} synthetic candle(s) to repair gaps",
+                    outcome.summary.repaired_candles
+                );
+            }
         }
 
         let output_path = self.output.clone().unwrap_or_else(|| {
@@ -292,6 +331,61 @@ struct LiveRunArgs {
     strategy_config: PathBuf,
     #[arg(long, default_value = "bybit_testnet")]
     exchange: String,
+    #[arg(long, default_value = "linear")]
+    category: String,
+    #[arg(long, default_value = "1m")]
+    interval: String,
+    #[arg(long, default_value_t = 1.0)]
+    quantity: f64,
+    #[arg(long)]
+    state_path: Option<PathBuf>,
+    #[arg(long)]
+    metrics_addr: Option<String>,
+    #[arg(long)]
+    log_path: Option<PathBuf>,
+    #[arg(long, default_value_t = 0.0)]
+    slippage_bps: f64,
+    #[arg(long, default_value_t = 0.0)]
+    fee_bps: f64,
+    #[arg(long, default_value_t = 0)]
+    latency_ms: u64,
+    #[arg(long, default_value_t = 512)]
+    history: usize,
+    #[arg(long)]
+    webhook_url: Option<String>,
+}
+
+impl LiveRunArgs {
+    fn resolved_log_path(&self, config: &AppConfig) -> PathBuf {
+        self.log_path
+            .clone()
+            .unwrap_or_else(|| config.live.log_path.clone())
+    }
+
+    fn resolved_state_path(&self, config: &AppConfig) -> PathBuf {
+        self.state_path
+            .clone()
+            .unwrap_or_else(|| config.live.state_path.clone())
+    }
+
+    fn resolved_metrics_addr(&self, config: &AppConfig) -> Result<SocketAddr> {
+        let addr = self
+            .metrics_addr
+            .clone()
+            .unwrap_or_else(|| config.live.metrics_addr.clone());
+        addr.parse()
+            .with_context(|| format!("invalid metrics address '{addr}'"))
+    }
+
+    fn build_alerting(&self, config: &AppConfig) -> tesser_config::AlertingConfig {
+        let mut alerting = config.live.alerting.clone();
+        let webhook = self
+            .webhook_url
+            .clone()
+            .or_else(|| alerting.webhook_url.clone());
+        alerting.webhook_url = sanitize_webhook(webhook);
+        alerting
+    }
 }
 
 #[derive(Deserialize)]
@@ -317,7 +411,14 @@ async fn main() -> Result<()> {
         _ => "trace".to_string(),
     });
 
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let log_override = match &cli.command {
+        Commands::Live {
+            action: LiveCommand::Run(args),
+        } => Some(args.resolved_log_path(&config)),
+        _ => None,
+    };
+
+    init_tracing(&filter, log_override.as_deref()).context("failed to initialize logging")?;
 
     match cli.command {
         Commands::Data { action } => handle_data(action, &config).await?,
@@ -478,16 +579,56 @@ impl LiveRunArgs {
         let exchange_cfg = config
             .exchange
             .get(&self.exchange)
-            .ok_or_else(|| anyhow::anyhow!("exchange profile {} not found", self.exchange))?;
+            .cloned()
+            .ok_or_else(|| anyhow!("exchange profile {} not found", self.exchange))?;
+
+        let contents = fs::read_to_string(&self.strategy_config)
+            .with_context(|| format!("failed to read {}", self.strategy_config.display()))?;
+        let def: StrategyConfigFile =
+            toml::from_str(&contents).context("failed to parse strategy config file")?;
+        let strategy = build_builtin_strategy(&def.name, def.params)
+            .with_context(|| format!("failed to configure strategy {}", def.name))?;
+        let symbols = strategy.subscriptions();
+        if symbols.is_empty() {
+            bail!("strategy did not declare any subscriptions");
+        }
+        if self.quantity <= 0.0 {
+            bail!("--quantity must be greater than zero");
+        }
+
+        let interval: Interval = self.interval.parse().map_err(|err: String| anyhow!(err))?;
+        let category =
+            PublicChannel::from_str(&self.category).map_err(|err| anyhow!(err.to_string()))?;
+        let metrics_addr = self.resolved_metrics_addr(config)?;
+        let state_path = self.resolved_state_path(config);
+        let alerting = self.build_alerting(config);
+        let history = self.history.max(32);
+
+        let settings = LiveSessionSettings {
+            category,
+            interval,
+            quantity: self.quantity,
+            slippage_bps: self.slippage_bps,
+            fee_bps: self.fee_bps,
+            latency_ms: self.latency_ms,
+            history,
+            metrics_addr,
+            state_path,
+            initial_equity: config.backtest.initial_equity,
+            alerting,
+        };
+
         info!(
-            "stub: launching live session on {} (REST {}, WS {})",
-            self.exchange, exchange_cfg.rest_url, exchange_cfg.ws_url
+            strategy = %def.name,
+            symbols = ?symbols,
+            exchange = %self.exchange,
+            interval = %self.interval,
+            "starting live session"
         );
-        info!(
-            "strategy config located at {} (not yet wired to execution)",
-            self.strategy_config.display()
-        );
-        Ok(())
+
+        run_live(strategy, symbols, exchange_cfg, settings)
+            .await
+            .context("live session failed")
     }
 }
 

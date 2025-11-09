@@ -14,6 +14,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 toml.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+prometheus.workspace = true
+hyper.workspace = true
+tracing-appender.workspace = true
 csv.workspace = true
 tesser-backtester = { path = "../tesser-backtester" }
 tesser-config = { path = "../tesser-config" }

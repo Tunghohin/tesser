@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub backtest: BacktestConfig,
     #[serde(default)]
     pub exchange: HashMap<String, ExchangeConfig>,
+    #[serde(default)]
+    pub live: LiveRuntimeConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,10 +38,56 @@ pub struct ExchangeConfig {
     pub api_secret: String,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct LiveRuntimeConfig {
+    #[serde(default = "default_state_path")]
+    pub state_path: PathBuf,
+    #[serde(default = "default_metrics_addr")]
+    pub metrics_addr: String,
+    #[serde(default = "default_live_log_path")]
+    pub log_path: PathBuf,
+    #[serde(default)]
+    pub alerting: AlertingConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AlertingConfig {
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    #[serde(default = "default_data_gap_secs")]
+    pub max_data_gap_secs: u64,
+    #[serde(default = "default_order_failure_limit")]
+    pub max_order_failures: u32,
+    #[serde(default = "default_drawdown_limit")]
+    pub max_drawdown: f64,
+}
+
 impl Default for BacktestConfig {
     fn default() -> Self {
         Self {
             initial_equity: default_equity(),
+        }
+    }
+}
+
+impl Default for LiveRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            state_path: default_state_path(),
+            metrics_addr: default_metrics_addr(),
+            log_path: default_live_log_path(),
+            alerting: AlertingConfig::default(),
+        }
+    }
+}
+
+impl Default for AlertingConfig {
+    fn default() -> Self {
+        Self {
+            webhook_url: None,
+            max_data_gap_secs: default_data_gap_secs(),
+            max_order_failures: default_order_failure_limit(),
+            max_drawdown: default_drawdown_limit(),
         }
     }
 }
@@ -54,6 +102,30 @@ fn default_log_level() -> String {
 
 fn default_equity() -> f64 {
     10_000.0
+}
+
+fn default_state_path() -> PathBuf {
+    PathBuf::from("./reports/live_state.json")
+}
+
+fn default_metrics_addr() -> String {
+    "127.0.0.1:9100".into()
+}
+
+fn default_live_log_path() -> PathBuf {
+    PathBuf::from("./logs/live.json")
+}
+
+fn default_data_gap_secs() -> u64 {
+    300
+}
+
+fn default_order_failure_limit() -> u32 {
+    3
+}
+
+fn default_drawdown_limit() -> f64 {
+    0.03
 }
 
 /// Loads configuration by merging files and environment variables.

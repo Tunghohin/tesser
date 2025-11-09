@@ -160,7 +160,7 @@ Commands:
   data download|validate|resample   # Download/inspect historical data
   backtest run --strategy-config    # Executes a single backtest (supports multiple --data inputs)
   backtest batch --config ...       # Runs multiple configs and writes an optional summary CSV
-  live run --strategy-config        # Bootstraps a live session (scaffolding)
+  live run --strategy-config        # Runs the live Bybit stream + paper execution loop
   strategies                        # Lists compiled strategies
 ```
 
@@ -170,6 +170,44 @@ Configuration files live in `config/`. The loader merges the following sources (
 2. `config/{env}.toml` (selected by `--env`)
 3. `config/local.toml` (gitignored)
 4. Environment variables prefixed with `TESSER_` (e.g. `TESSER_exchange__bybit_testnet__api_key`)
+
+### Live Trading & Observability
+
+`tesser-cli live run` now drives the full production event loop introduced in Phase 2:
+
+```sh
+cargo run -p tesser-cli -- \
+  live run \
+  --strategy-config research/strategies/sma_cross.toml \
+  --quantity 0.02 \
+  --interval 1m
+```
+
+What happens under the hood:
+
+- **Market data**: `tesser-bybit` maintains a resilient WebSocket connection to the public `linear` stream (`kline.<interval>.<symbol>` and `publicTrade.<symbol>` topics). The connection automatically heartbeats every 20s and reconnects on transient errors.
+- **Execution**: Signals are routed through `tesser-execution` into the paper engine. Orders are sized via `--quantity` and filled at the latest tick (with configurable slippage/fees). This lets you paper trade on real-time data before turning on a real REST client.
+- **State persistence**: Portfolio equity, open orders and last prices are serialized to `config.live.state_path` (default `./reports/live_state.json`). Restart the process and it will resume from this snapshot.
+- **Structured logging**: When running `live`, a JSON file is written to `config.live.log_path` (default `./logs/live.json`). Point Promtail/Loki/Grafana at that file to build dashboards without touching stdout logs.
+- **Metrics**: A Prometheus endpoint is exposed at `config.live.metrics_addr` (default `127.0.0.1:9100`). Scrape `/metrics` to monitor tick/candle throughput, portfolio equity, order errors, and data-gap gauges.
+- **Alerting**: The `[live.alerting]` section lets you enforce guardrails (max data gap, consecutive order failures, drawdown limit). Provide a `webhook_url` (Slack, Telegram, Alertmanager, etc.) or leave it empty for log-only alerts.
+
+Sample snippet from `config/default.toml`:
+
+```toml
+[live]
+state_path = "./reports/live_state.json"
+metrics_addr = "127.0.0.1:9100"
+log_path = "./logs/live.json"
+
+[live.alerting]
+webhook_url = ""          # Optional HTTP endpoint
+max_data_gap_secs = 300     # Alert if no ticks/candles are seen for 5 minutes
+max_order_failures = 3      # Trigger after N consecutive execution errors
+max_drawdown = 0.03         # 3% peak-to-trough drawdown guardrail
+```
+
+Every CLI flag (e.g., `--state-path`, `--metrics-addr`, `--log-path`, `--webhook-url`) overrides the config file so you can spin up multiple paper sessions with different telemetry endpoints.
 
 ### Python Research Workflow
 
