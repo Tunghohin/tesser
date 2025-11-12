@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tesser_broker::{BrokerError, BrokerInfo, BrokerResult, ExecutionClient, MarketStream};
 use tesser_core::{
-    AccountBalance, Candle, Fill, LocalOrderBook, Order, OrderBook, OrderId, OrderRequest,
-    OrderStatus, OrderType, Position, Price, Quantity, Side, Symbol, Tick,
+    AccountBalance, Candle, DepthUpdate, Fill, LocalOrderBook, Order, OrderBook, OrderId,
+    OrderRequest, OrderStatus, OrderType, Position, Price, Quantity, Side, Symbol, Tick,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
@@ -411,9 +411,8 @@ impl MatchingEngine {
     /// Apply an incremental depth update.
     pub fn upsert_market_level(&self, side: Side, price: Price, quantity: Quantity) {
         let mut depth = self.market_depth.lock().unwrap();
-        if quantity <= 0.0 {
-            depth.remove_order(side, price, quantity.abs());
-        } else {
+        depth.clear_level(side, price);
+        if quantity > 0.0 {
             depth.add_order(side, price, quantity);
         }
     }
@@ -425,6 +424,28 @@ impl MatchingEngine {
             book.remove_order(side, price, quantity.abs());
         } else {
             book.add_order(side, price, quantity);
+        }
+    }
+
+    /// Apply a depth delta emitted by the historical dataset.
+    pub fn apply_depth_update(&self, update: &DepthUpdate) {
+        for level in &update.bids {
+            self.upsert_market_level(Side::Buy, level.price, level.size);
+        }
+        for level in &update.asks {
+            self.upsert_market_level(Side::Sell, level.price, level.size);
+        }
+    }
+
+    /// Mid-price derived from the current best bid/ask.
+    #[must_use]
+    pub fn mid_price(&self) -> Option<Price> {
+        let depth = self.market_depth.lock().unwrap();
+        match (depth.best_bid(), depth.best_ask()) {
+            (Some((bid, _)), Some((ask, _))) => Some((bid + ask) / 2.0),
+            (Some((bid, _)), None) => Some(bid),
+            (None, Some((ask, _))) => Some(ask),
+            _ => None,
         }
     }
 

@@ -286,6 +286,18 @@ impl LocalOrderBook {
         }
     }
 
+    /// Remove an entire price level regardless of resting quantity.
+    pub fn clear_level(&mut self, side: Side, price: Price) {
+        match side {
+            Side::Buy => {
+                self.bids.remove(&Reverse(OrderedFloat(price)));
+            }
+            Side::Sell => {
+                self.asks.remove(&OrderedFloat(price));
+            }
+        }
+    }
+
     /// Best bid price/quantity currently stored.
     #[must_use]
     pub fn best_bid(&self) -> Option<(Price, Quantity)> {
