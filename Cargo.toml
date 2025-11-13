@@ -12,7 +12,7 @@ members = [
     "tesser-cli",
     "connectors/tesser-bybit",
     "connectors/tesser-paper",
-    "tesser-config", "tesser-indicators",
+    "tesser-config", "tesser-indicators", "tesser-test-utils",
 ]
 
 [workspace.package]
