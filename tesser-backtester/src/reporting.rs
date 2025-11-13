@@ -3,6 +3,7 @@ use std::fmt;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
+use rust_decimal::{prelude::ToPrimitive, Decimal};
 use tesser_core::{Fill, Side};
 
 const TRADING_DAYS_PER_YEAR: f64 = 252.0;
@@ -231,9 +232,10 @@ impl Reporter {
                         Side::Buy => close.fill_price - open.fill_price,
                         Side::Sell => open.fill_price - close.fill_price,
                     };
+                    let pnl_ratio = (pnl / open.fill_price).to_f64().unwrap_or(0.0);
                     Some(Trade {
-                        pnl: pnl / open.fill_price,
-                        is_win: pnl > 0.0,
+                        pnl: pnl_ratio,
+                        is_win: pnl > Decimal::ZERO,
                     })
                 } else {
                     None

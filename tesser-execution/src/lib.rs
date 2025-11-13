@@ -225,12 +225,6 @@ fn decimal_from_f64(value: f64, label: &str) -> anyhow::Result<Decimal> {
         .ok_or_else(|| anyhow!("failed to convert {label} ({value}) into Decimal"))
 }
 
-pub(crate) fn decimal_to_f64(value: Decimal, label: &str) -> anyhow::Result<f64> {
-    value
-        .to_f64()
-        .ok_or_else(|| anyhow!("failed to represent {label} ({value}) as f64"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

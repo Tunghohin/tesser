@@ -14,7 +14,7 @@ use crate::algorithm::{
     VwapAlgorithm,
 };
 use crate::repository::AlgoStateRepository;
-use crate::{decimal_to_f64, ExecutionEngine, RiskContext};
+use crate::{ExecutionEngine, RiskContext};
 use tesser_core::{ExecutionHint, Fill, Order, Quantity, Signal, Tick};
 
 /// Maps order IDs to their parent algorithm IDs for routing fills.
@@ -199,14 +199,13 @@ impl OrderOrchestrator {
             tracing::warn!("TWAP order size is zero, skipping");
             return Ok(());
         }
-        let total_qty_f64 = decimal_to_f64(total_quantity, "twap quantity")?;
 
         // Use a sensible default for number of slices
         // TODO: Make this configurable
         let num_slices = std::cmp::min(30, duration.num_minutes() as u32).max(1);
 
         // Create and start the algorithm
-        let mut algo = TwapAlgorithm::new(signal, total_qty_f64, duration, num_slices)?;
+        let mut algo = TwapAlgorithm::new(signal, total_quantity, duration, num_slices)?;
         let algo_id = *algo.id();
 
         tracing::info!(
@@ -253,9 +252,7 @@ impl OrderOrchestrator {
             tracing::warn!("VWAP order size is zero, skipping");
             return Ok(());
         }
-        let total_qty_f64 = decimal_to_f64(total_quantity, "vwap quantity")?;
-
-        let mut algo = VwapAlgorithm::new(signal, total_qty_f64, duration, participation_rate)?;
+        let mut algo = VwapAlgorithm::new(signal, total_quantity, duration, participation_rate)?;
         let algo_id = *algo.id();
         tracing::info!(
             id = %algo_id,
@@ -293,8 +290,6 @@ impl OrderOrchestrator {
             tracing::warn!("Iceberg order size is zero, skipping");
             return Ok(());
         }
-        let total_qty_f64 = decimal_to_f64(total_quantity, "iceberg quantity")?;
-        let display_size_f64 = decimal_to_f64(display_size, "iceberg display size")?;
         let limit_price = if ctx.last_price > Decimal::ZERO {
             ctx.last_price
         } else {
@@ -304,13 +299,12 @@ impl OrderOrchestrator {
             );
             Decimal::ONE
         };
-        let limit_price_f64 = decimal_to_f64(limit_price, "iceberg limit price")?;
 
         let mut algo = IcebergAlgorithm::new(
             signal,
-            total_qty_f64,
-            display_size_f64,
-            limit_price_f64,
+            total_quantity,
+            display_size,
+            limit_price,
             limit_offset_bps,
         )?;
         let algo_id = *algo.id();
@@ -389,7 +383,7 @@ impl OrderOrchestrator {
         tracing::debug!(
             algo_id = %algo_id,
             order_id = %fill.order_id,
-            fill_qty = fill.fill_quantity,
+            fill_qty = %fill.fill_quantity,
             "Routing fill to algorithm"
         );
 

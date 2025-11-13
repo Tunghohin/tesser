@@ -7,6 +7,10 @@ use std::{collections::VecDeque, sync::Arc};
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
 use reporting::{PerformanceReport, Reporter};
+use rust_decimal::{
+    prelude::{FromPrimitive, ToPrimitive},
+    Decimal,
+};
 use tesser_core::{
     Candle, DepthUpdate, Fill, Order, OrderBook, Price, Quantity, Side, Symbol, Tick,
 };
@@ -28,6 +32,12 @@ pub struct BacktestConfig {
     pub mode: BacktestMode,
 }
 
+fn decimal_to_f64(value: Price, label: &str) -> anyhow::Result<f64> {
+    value
+        .to_f64()
+        .ok_or_else(|| anyhow!("{} ({}) is out of range for f64", label, value))
+}
+
 impl BacktestConfig {
     /// Convenience constructor for a single symbol.
     pub fn new(symbol: Symbol, candles: Vec<Candle>) -> Self {
@@ -35,7 +45,7 @@ impl BacktestConfig {
             symbol,
             candles,
             lob_events: Vec::new(),
-            order_quantity: 1.0,
+            order_quantity: Decimal::ONE,
             history: 512,
             initial_equity: 10_000.0,
             execution: ExecutionModel::default(),
@@ -125,7 +135,8 @@ impl Backtester {
         matching_engine: Option<Arc<MatchingEngine>>,
     ) -> Self {
         let portfolio_config = PortfolioConfig {
-            initial_equity: config.initial_equity,
+            initial_equity: Decimal::from_f64(config.initial_equity)
+                .expect("finite initial equity"),
             max_drawdown: None, // Disable liquidate-only for backtests for now
         };
         Self {
@@ -148,7 +159,7 @@ impl Backtester {
     }
 
     async fn run_candle(&mut self) -> anyhow::Result<PerformanceReport> {
-        let mut equity_curve = Vec::new();
+        let mut equity_curve: Vec<(DateTime<Utc>, f64)> = Vec::new();
         let mut all_fills = Vec::new();
 
         for idx in 0..self.config.candles.len() {
@@ -167,7 +178,7 @@ impl Backtester {
                 for fill in triggered_fills {
                     info!(
                         order_id = %fill.order_id,
-                        price = fill.fill_price,
+                        price = %fill.fill_price,
                         "triggered paper conditional order"
                     );
                     self.record_fill(&fill, &mut all_fills)?;
@@ -204,7 +215,8 @@ impl Backtester {
                 }
             }
 
-            equity_curve.push((candle.timestamp, self.portfolio.equity()));
+            let equity = decimal_to_f64(self.portfolio.equity(), "portfolio equity")?;
+            equity_curve.push((candle.timestamp, equity));
         }
 
         let reporter = Reporter::new(self.config.initial_equity, equity_curve, all_fills);
@@ -232,27 +244,31 @@ impl Backtester {
 
     fn build_fill(&self, order: &Order, candle: &Candle) -> Fill {
         // Price within the candle's OHLC band, biased pessimistically
-        let factor = self.config.execution.pessimism_factor.clamp(0.0, 1.0);
+        let factor = Decimal::from_f64(self.config.execution.pessimism_factor.clamp(0.0, 1.0))
+            .unwrap_or(Decimal::ZERO);
         let mut price = match order.request.side {
             Side::Buy => {
-                let band = (candle.high - candle.open).max(0.0);
+                let band = (candle.high - candle.open).max(Decimal::ZERO);
                 candle.open + band * factor
             }
             Side::Sell => {
-                let band = (candle.open - candle.low).max(0.0);
+                let band = (candle.open - candle.low).max(Decimal::ZERO);
                 candle.open - band * factor
             }
         };
-        let slippage_rate = self.config.execution.slippage_bps / 10_000.0;
-        if slippage_rate > 0.0 {
-            price *= match order.request.side {
-                Side::Buy => 1.0 + slippage_rate,
-                Side::Sell => 1.0 - slippage_rate,
+        let slippage_rate = Decimal::from_f64(self.config.execution.slippage_bps / 10_000.0)
+            .unwrap_or(Decimal::ZERO);
+        if slippage_rate > Decimal::ZERO {
+            let multiplier = match order.request.side {
+                Side::Buy => Decimal::ONE + slippage_rate,
+                Side::Sell => Decimal::ONE - slippage_rate,
             };
+            price *= multiplier;
         }
-        let fee_rate = self.config.execution.fee_bps / 10_000.0;
+        let fee_rate =
+            Decimal::from_f64(self.config.execution.fee_bps / 10_000.0).unwrap_or(Decimal::ZERO);
         let notional = price * order.request.quantity.abs();
-        let fee = if fee_rate > 0.0 {
+        let fee = if fee_rate > Decimal::ZERO {
             Some(notional * fee_rate)
         } else {
             None
@@ -273,7 +289,7 @@ impl Backtester {
             .matching_engine
             .clone()
             .ok_or_else(|| anyhow!("tick mode requires a matching engine"))?;
-        let mut equity_curve = Vec::new();
+        let mut equity_curve: Vec<(DateTime<Utc>, f64)> = Vec::new();
         let mut all_fills = Vec::new();
         let mut last_trade_price: Option<Price> = None;
 
@@ -307,7 +323,8 @@ impl Backtester {
             self.process_signals_tick(last_trade_price.or_else(|| matching.mid_price()))
                 .await?;
             self.consume_matching_fills(&mut all_fills).await?;
-            equity_curve.push((event.timestamp, self.portfolio.equity()));
+            let equity = decimal_to_f64(self.portfolio.equity(), "portfolio equity")?;
+            equity_curve.push((event.timestamp, equity));
         }
 
         let reporter = Reporter::new(self.config.initial_equity, equity_curve, all_fills);
@@ -320,7 +337,7 @@ impl Backtester {
             let reference_price = self
                 .last_tick_price(&signal.symbol)
                 .or(fallback_price)
-                .unwrap_or(0.0);
+                .unwrap_or(Decimal::ZERO);
             let ctx = RiskContext {
                 signed_position_qty: self.portfolio.signed_position_qty(&signal.symbol),
                 portfolio_equity: self.portfolio.equity(),
