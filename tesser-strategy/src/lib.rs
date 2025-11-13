@@ -8,7 +8,10 @@ pub use toml::Value;
 use chrono::Duration;
 use once_cell::sync::Lazy;
 use rust_decimal::MathematicalOps;
-use rust_decimal::{prelude::FromPrimitive, Decimal};
+use rust_decimal::{
+    prelude::{FromPrimitive, ToPrimitive},
+    Decimal,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -310,7 +313,7 @@ fn collect_symbol_closes(candles: &VecDeque<Candle>, symbol: &str, limit: usize)
         .rev()
         .filter(|c| c.symbol == symbol)
         .take(limit)
-        .map(|c| c.close)
+        .filter_map(|c| c.close.to_f64())
         .collect();
     values.reverse();
     values
@@ -393,8 +396,8 @@ impl TryFrom<toml::Value> for SmaCrossConfig {
 pub struct SmaCross {
     cfg: SmaCrossConfig,
     signals: Vec<Signal>,
-    fast_ma: Sma<f64>,
-    slow_ma: Sma<f64>,
+    fast_ma: Sma,
+    slow_ma: Sma,
     fast_prev: Option<Decimal>,
     fast_last: Option<Decimal>,
     slow_prev: Option<Decimal>,
@@ -458,7 +461,8 @@ impl SmaCross {
         ) {
             if fast_prev <= slow_prev && fast_curr > slow_curr {
                 let mut signal = Signal::new(self.cfg.symbol.clone(), SignalKind::EnterLong, 0.75);
-                signal.stop_loss = Some(candle.low * 0.98);
+                let stop_loss_factor = Decimal::new(98, 2); // 0.98
+                signal.stop_loss = Some(candle.low * stop_loss_factor);
                 if let Some(duration_secs) = self.cfg.vwap_duration_secs.filter(|v| *v > 0) {
                     let duration = Duration::seconds(duration_secs);
                     let participation = self
@@ -552,7 +556,7 @@ impl Default for RsiReversionConfig {
 pub struct RsiReversion {
     cfg: RsiReversionConfig,
     signals: Vec<Signal>,
-    rsi: Rsi<f64>,
+    rsi: Rsi,
     oversold_level: Decimal,
     overbought_level: Decimal,
     samples: usize,
@@ -683,7 +687,7 @@ impl Default for BollingerBreakoutConfig {
 pub struct BollingerBreakout {
     cfg: BollingerBreakoutConfig,
     signals: Vec<Signal>,
-    bands: BollingerBands<f64>,
+    bands: BollingerBands,
     std_multiplier: Decimal,
     neutral_band: Decimal,
     samples: usize,
@@ -735,7 +739,7 @@ impl BollingerBreakout {
         if self.samples < self.cfg.lookback {
             return Ok(());
         }
-        let price = decimal_from_f64_config(candle.close, "close price")?;
+        let price = candle.close;
         if price > bands.upper {
             self.signals.push(Signal::new(
                 self.cfg.symbol.clone(),
@@ -1182,24 +1186,26 @@ impl Strategy for OrderBookImbalance {
             return Ok(());
         }
         if let Some(imbalance) = book.imbalance(self.cfg.depth) {
-            if imbalance >= self.cfg.long_threshold {
-                self.signals.push(Signal::new(
-                    self.cfg.symbol.clone(),
-                    SignalKind::EnterLong,
-                    0.9,
-                ));
-            } else if imbalance <= self.cfg.short_threshold {
-                self.signals.push(Signal::new(
-                    self.cfg.symbol.clone(),
-                    SignalKind::EnterShort,
-                    0.9,
-                ));
-            } else if imbalance.abs() <= self.cfg.neutral_zone {
-                self.signals.push(Signal::new(
-                    self.cfg.symbol.clone(),
-                    SignalKind::Flatten,
-                    0.6,
-                ));
+            if let Some(imbalance_f64) = imbalance.to_f64() {
+                if imbalance_f64 >= self.cfg.long_threshold {
+                    self.signals.push(Signal::new(
+                        self.cfg.symbol.clone(),
+                        SignalKind::EnterLong,
+                        0.9,
+                    ));
+                } else if imbalance_f64 <= self.cfg.short_threshold {
+                    self.signals.push(Signal::new(
+                        self.cfg.symbol.clone(),
+                        SignalKind::EnterShort,
+                        0.9,
+                    ));
+                } else if imbalance_f64.abs() <= self.cfg.neutral_zone {
+                    self.signals.push(Signal::new(
+                        self.cfg.symbol.clone(),
+                        SignalKind::Flatten,
+                        0.6,
+                    ));
+                }
             }
         }
         Ok(())

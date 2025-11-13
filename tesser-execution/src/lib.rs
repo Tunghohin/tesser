@@ -29,8 +29,8 @@ pub trait OrderSizer: Send + Sync {
     fn size(
         &self,
         signal: &Signal,
-        portfolio_equity: f64,
-        last_price: f64,
+        portfolio_equity: Price,
+        last_price: Price,
     ) -> anyhow::Result<Quantity>;
 }
 
@@ -43,8 +43,8 @@ impl OrderSizer for FixedOrderSizer {
     fn size(
         &self,
         _signal: &Signal,
-        _portfolio_equity: f64,
-        _last_price: f64,
+        _portfolio_equity: Price,
+        _last_price: Price,
     ) -> anyhow::Result<Quantity> {
         Ok(self.quantity)
     }
@@ -60,21 +60,18 @@ impl OrderSizer for PortfolioPercentSizer {
     fn size(
         &self,
         _signal: &Signal,
-        portfolio_equity: f64,
-        last_price: f64,
+        portfolio_equity: Price,
+        last_price: Price,
     ) -> anyhow::Result<Quantity> {
-        let price = decimal_from_f64(last_price, "last price")?;
-        if price <= Decimal::ZERO {
+        if last_price <= Decimal::ZERO {
             bail!("cannot size order with zero or negative price");
         }
-        let equity = decimal_from_f64(portfolio_equity, "portfolio equity")?;
         let percent = decimal_from_f64(self.percent, "allocation percent")?;
         if percent <= Decimal::ZERO {
-            return Ok(0.0);
+            return Ok(Decimal::ZERO);
         }
-        let notional = equity * percent;
-        let quantity = notional / price;
-        quantity_from_decimal(quantity, "order quantity")
+        let notional = portfolio_equity * percent;
+        Ok(notional / last_price)
     }
 }
 
@@ -89,27 +86,24 @@ impl OrderSizer for RiskAdjustedSizer {
     fn size(
         &self,
         _signal: &Signal,
-        portfolio_equity: f64,
-        last_price: f64,
+        portfolio_equity: Price,
+        last_price: Price,
     ) -> anyhow::Result<Quantity> {
-        let price = decimal_from_f64(last_price, "last price")?;
-        if price <= Decimal::ZERO {
+        if last_price <= Decimal::ZERO {
             bail!("cannot size order with zero or negative price");
         }
-        let equity = decimal_from_f64(portfolio_equity, "portfolio equity")?;
         let risk_fraction = decimal_from_f64(self.risk_fraction, "risk fraction")?;
         if risk_fraction <= Decimal::ZERO {
-            return Ok(0.0);
+            return Ok(Decimal::ZERO);
         }
         // Placeholder volatility; replace with instrument-specific estimator.
         let volatility = Decimal::from_f64(0.02).expect("0.02 should convert to Decimal");
-        let denom = price * volatility;
+        let denom = last_price * volatility;
         if denom <= Decimal::ZERO {
             bail!("volatility multiplier produced an invalid denominator");
         }
-        let dollars_at_risk = equity * risk_fraction;
-        let quantity = dollars_at_risk / denom;
-        quantity_from_decimal(quantity, "risk-adjusted quantity")
+        let dollars_at_risk = portfolio_equity * risk_fraction;
+        Ok(dollars_at_risk / denom)
     }
 }
 
@@ -117,7 +111,7 @@ impl OrderSizer for RiskAdjustedSizer {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RiskContext {
     /// Signed quantity of the current open position (long positive, short negative).
-    pub signed_position_qty: f64,
+    pub signed_position_qty: Quantity,
     /// Total current portfolio equity.
     pub portfolio_equity: Price,
     /// Last known price for the signal's symbol.
@@ -175,9 +169,10 @@ impl BasicRiskChecker {
 impl PreTradeRiskChecker for BasicRiskChecker {
     fn check(&self, request: &OrderRequest, ctx: &RiskContext) -> Result<(), RiskError> {
         let qty = request.quantity.abs();
-        if self.limits.max_order_quantity > 0.0 && qty > self.limits.max_order_quantity {
+        let max_order = Decimal::from_f64(self.limits.max_order_quantity).unwrap_or(Decimal::ZERO);
+        if max_order > Decimal::ZERO && qty > max_order {
             return Err(RiskError::MaxOrderSize {
-                quantity: qty,
+                quantity: qty.to_f64().unwrap_or(f64::MAX),
                 limit: self.limits.max_order_quantity,
             });
         }
@@ -187,26 +182,32 @@ impl PreTradeRiskChecker for BasicRiskChecker {
             Side::Sell => ctx.signed_position_qty - qty,
         };
 
-        if self.limits.max_position_quantity > 0.0
-            && projected_position.abs() > self.limits.max_position_quantity
-        {
+        let max_position =
+            Decimal::from_f64(self.limits.max_position_quantity).unwrap_or(Decimal::ZERO);
+        if max_position > Decimal::ZERO && projected_position.abs() > max_position {
             return Err(RiskError::MaxPositionExposure {
-                projected: projected_position,
+                projected: projected_position.to_f64().unwrap_or_else(|| {
+                    if projected_position.is_sign_positive() {
+                        f64::MAX
+                    } else {
+                        f64::MIN
+                    }
+                }),
                 limit: self.limits.max_position_quantity,
             });
         }
 
         if ctx.liquidate_only {
             let position = ctx.signed_position_qty;
-            if position.abs() < f64::EPSILON {
+            if position.is_zero() {
                 return Err(RiskError::LiquidateOnly);
             }
-            let reduces = (position > 0.0 && request.side == Side::Sell)
-                || (position < 0.0 && request.side == Side::Buy);
+            let reduces = (position > Decimal::ZERO && request.side == Side::Sell)
+                || (position < Decimal::ZERO && request.side == Side::Buy);
             if !reduces {
                 return Err(RiskError::LiquidateOnly);
             }
-            if qty > position.abs() + f64::EPSILON {
+            if qty > position.abs() {
                 return Err(RiskError::LiquidateOnly);
             }
         }
@@ -224,10 +225,10 @@ fn decimal_from_f64(value: f64, label: &str) -> anyhow::Result<Decimal> {
         .ok_or_else(|| anyhow!("failed to convert {label} ({value}) into Decimal"))
 }
 
-fn quantity_from_decimal(value: Decimal, label: &str) -> anyhow::Result<Quantity> {
+pub(crate) fn decimal_to_f64(value: Decimal, label: &str) -> anyhow::Result<f64> {
     value
         .to_f64()
-        .ok_or_else(|| anyhow!("failed to convert {label} ({value}) into f64"))
+        .ok_or_else(|| anyhow!("failed to represent {label} ({value}) as f64"))
 }
 
 #[cfg(test)]
@@ -243,8 +244,10 @@ mod tests {
     fn portfolio_percent_sizer_matches_decimal_math() {
         let signal = dummy_signal();
         let sizer = PortfolioPercentSizer { percent: 0.05 };
-        let qty = sizer.size(&signal, 25_000.0, 50_000.0).unwrap();
-        assert!((qty - 0.025).abs() < f64::EPSILON);
+        let qty = sizer
+            .size(&signal, Decimal::from(25_000), Decimal::from(50_000))
+            .unwrap();
+        assert_eq!(qty, Decimal::new(25, 3)); // 0.025
     }
 
     #[test]
@@ -253,7 +256,9 @@ mod tests {
         let sizer = RiskAdjustedSizer {
             risk_fraction: 0.01,
         };
-        let err = sizer.size(&signal, 10_000.0, 0.0).unwrap_err();
+        let err = sizer
+            .size(&signal, Decimal::from(10_000), Decimal::ZERO)
+            .unwrap_err();
         assert!(
             err.to_string().contains("zero or negative price"),
             "unexpected error: {err}"
@@ -305,7 +310,7 @@ impl ExecutionEngine {
             .context("failed to determine order size")
             .map_err(|err| BrokerError::Other(err.to_string()))?;
 
-        if qty <= 0.0 {
+        if qty <= Decimal::ZERO {
             warn!(signal = ?signal.id, "order size is zero, skipping");
             return Ok(None);
         }
@@ -414,7 +419,11 @@ impl ExecutionEngine {
             .check(&request, ctx)
             .map_err(|err| BrokerError::InvalidRequest(err.to_string()))?;
         let order = self.client.place_order(request).await?;
-        info!(order_id = %order.id, qty = order.request.quantity, "order sent to broker");
+        info!(
+            order_id = %order.id,
+            qty = %order.request.quantity,
+            "order sent to broker"
+        );
         Ok(order)
     }
 
