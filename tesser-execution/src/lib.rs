@@ -1,7 +1,5 @@
 //! Order management and signal execution helpers.
 
-use std::sync::Arc;
-
 pub mod algorithm;
 pub mod orchestrator;
 pub mod repository;
@@ -11,7 +9,12 @@ pub use algorithm::{AlgoStatus, ChildOrderRequest, ExecutionAlgorithm};
 pub use orchestrator::OrderOrchestrator;
 pub use repository::{AlgoStateRepository, SqliteAlgoStateRepository};
 
-use anyhow::Context;
+use anyhow::{anyhow, bail, Context};
+use rust_decimal::{
+    prelude::{FromPrimitive, ToPrimitive},
+    Decimal,
+};
+use std::sync::Arc;
 use tesser_broker::{BrokerError, BrokerResult, ExecutionClient};
 use tesser_bybit::{BybitClient, BybitCredentials};
 use tesser_core::{
@@ -60,11 +63,18 @@ impl OrderSizer for PortfolioPercentSizer {
         portfolio_equity: f64,
         last_price: f64,
     ) -> anyhow::Result<Quantity> {
-        if last_price <= 0.0 {
-            anyhow::bail!("cannot size order with zero or negative price");
+        let price = decimal_from_f64(last_price, "last price")?;
+        if price <= Decimal::ZERO {
+            bail!("cannot size order with zero or negative price");
         }
-        let notional = portfolio_equity * self.percent;
-        Ok(notional / last_price)
+        let equity = decimal_from_f64(portfolio_equity, "portfolio equity")?;
+        let percent = decimal_from_f64(self.percent, "allocation percent")?;
+        if percent <= Decimal::ZERO {
+            return Ok(0.0);
+        }
+        let notional = equity * percent;
+        let quantity = notional / price;
+        quantity_from_decimal(quantity, "order quantity")
     }
 }
 
@@ -82,12 +92,24 @@ impl OrderSizer for RiskAdjustedSizer {
         portfolio_equity: f64,
         last_price: f64,
     ) -> anyhow::Result<Quantity> {
-        // In a real implementation, you would calculate the instrument's volatility here.
-        // For now, we'll use a fixed placeholder volatility of 2%.
-        let volatility = 0.02; // Placeholder
-        let dollars_at_risk = portfolio_equity * self.risk_fraction;
-        let quantity = dollars_at_risk / (last_price * volatility);
-        Ok(quantity)
+        let price = decimal_from_f64(last_price, "last price")?;
+        if price <= Decimal::ZERO {
+            bail!("cannot size order with zero or negative price");
+        }
+        let equity = decimal_from_f64(portfolio_equity, "portfolio equity")?;
+        let risk_fraction = decimal_from_f64(self.risk_fraction, "risk fraction")?;
+        if risk_fraction <= Decimal::ZERO {
+            return Ok(0.0);
+        }
+        // Placeholder volatility; replace with instrument-specific estimator.
+        let volatility = Decimal::from_f64(0.02).expect("0.02 should convert to Decimal");
+        let denom = price * volatility;
+        if denom <= Decimal::ZERO {
+            bail!("volatility multiplier produced an invalid denominator");
+        }
+        let dollars_at_risk = equity * risk_fraction;
+        let quantity = dollars_at_risk / denom;
+        quantity_from_decimal(quantity, "risk-adjusted quantity")
     }
 }
 
@@ -190,6 +212,52 @@ impl PreTradeRiskChecker for BasicRiskChecker {
         }
 
         Ok(())
+    }
+}
+
+fn decimal_from_f64(value: f64, label: &str) -> anyhow::Result<Decimal> {
+    if !value.is_finite() {
+        bail!("{label} must be finite (got {value})");
+    }
+    Decimal::from_f64(value)
+        .or_else(|| Decimal::from_f64_retain(value))
+        .ok_or_else(|| anyhow!("failed to convert {label} ({value}) into Decimal"))
+}
+
+fn quantity_from_decimal(value: Decimal, label: &str) -> anyhow::Result<Quantity> {
+    value
+        .to_f64()
+        .ok_or_else(|| anyhow!("failed to convert {label} ({value}) into f64"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tesser_core::SignalKind;
+
+    fn dummy_signal() -> Signal {
+        Signal::new("BTCUSDT", SignalKind::EnterLong, 1.0)
+    }
+
+    #[test]
+    fn portfolio_percent_sizer_matches_decimal_math() {
+        let signal = dummy_signal();
+        let sizer = PortfolioPercentSizer { percent: 0.05 };
+        let qty = sizer.size(&signal, 25_000.0, 50_000.0).unwrap();
+        assert!((qty - 0.025).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn risk_adjusted_sizer_respects_zero_price_guard() {
+        let signal = dummy_signal();
+        let sizer = RiskAdjustedSizer {
+            risk_fraction: 0.01,
+        };
+        let err = sizer.size(&signal, 10_000.0, 0.0).unwrap_err();
+        assert!(
+            err.to_string().contains("zero or negative price"),
+            "unexpected error: {err}"
+        );
     }
 }
 

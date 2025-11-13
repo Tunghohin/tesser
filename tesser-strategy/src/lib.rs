@@ -7,6 +7,7 @@ pub use toml::Value;
 
 use chrono::Duration;
 use once_cell::sync::Lazy;
+use rust_decimal::MathematicalOps;
 use rust_decimal::{prelude::FromPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -315,6 +316,10 @@ fn collect_symbol_closes(candles: &VecDeque<Candle>, symbol: &str, limit: usize)
     values
 }
 
+fn decimal_from_price(value: f64) -> Option<Decimal> {
+    Decimal::from_f64(value).or_else(|| Decimal::from_f64_retain(value))
+}
+
 fn decimal_from_f64_config(value: f64, field: &str) -> StrategyResult<Decimal> {
     Decimal::from_f64(value).ok_or_else(|| {
         StrategyError::InvalidConfig(format!(
@@ -323,25 +328,26 @@ fn decimal_from_f64_config(value: f64, field: &str) -> StrategyResult<Decimal> {
     })
 }
 
-fn z_score(values: &[f64]) -> Option<f64> {
+fn z_score(values: &[Decimal]) -> Option<Decimal> {
     if values.is_empty() {
         return None;
     }
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let len = Decimal::from_usize(values.len())?;
+    let mean = values.iter().copied().sum::<Decimal>() / len;
     let variance = values
         .iter()
         .map(|value| {
-            let diff = value - mean;
+            let diff = *value - mean;
             diff * diff
         })
-        .sum::<f64>()
-        / values.len() as f64;
-    let std = variance.sqrt();
-    if std.abs() < f64::EPSILON {
-        None
-    } else {
-        Some((values.last().copied().unwrap_or(mean) - mean) / std)
+        .sum::<Decimal>()
+        / len;
+    let std = variance.sqrt()?;
+    if std.is_zero() {
+        return None;
     }
+    let last = *values.last()?;
+    Some((last - mean) / std)
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -958,14 +964,44 @@ impl Default for PairsTradingConfig {
     }
 }
 
-#[derive(Default)]
 pub struct PairsTradingArbitrage {
     cfg: PairsTradingConfig,
     signals: Vec<Signal>,
+    entry_z_level: Decimal,
+    exit_z_level: Decimal,
+}
+
+impl Default for PairsTradingArbitrage {
+    fn default() -> Self {
+        Self::from_config(PairsTradingConfig::default())
+            .expect("default pairs trading config should be valid")
+    }
 }
 
 impl PairsTradingArbitrage {
-    fn spreads(&self, ctx: &StrategyContext) -> Option<Vec<f64>> {
+    fn from_config(cfg: PairsTradingConfig) -> StrategyResult<Self> {
+        let mut strategy = Self {
+            cfg,
+            signals: Vec::new(),
+            entry_z_level: Decimal::ZERO,
+            exit_z_level: Decimal::ZERO,
+        };
+        strategy.rebuild_thresholds()?;
+        Ok(strategy)
+    }
+
+    fn rebuild_thresholds(&mut self) -> StrategyResult<()> {
+        self.entry_z_level = decimal_from_f64_config(self.cfg.entry_z, "pairs_trading.entry_z")?;
+        self.exit_z_level = decimal_from_f64_config(self.cfg.exit_z, "pairs_trading.exit_z")?;
+        if self.entry_z_level <= self.exit_z_level {
+            return Err(StrategyError::InvalidConfig(
+                "`entry_z` must be greater than `exit_z`".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn spreads(&self, ctx: &StrategyContext) -> Option<Vec<Decimal>> {
         let closes_a =
             collect_symbol_closes(ctx.candles(), &self.cfg.symbols[0], self.cfg.lookback);
         let closes_b =
@@ -973,13 +1009,16 @@ impl PairsTradingArbitrage {
         if closes_a.len() < self.cfg.lookback || closes_b.len() < self.cfg.lookback {
             return None;
         }
-        Some(
-            closes_a
-                .iter()
-                .zip(closes_b.iter())
-                .map(|(a, b)| (a / b).ln())
-                .collect(),
-        )
+        let mut spreads = Vec::with_capacity(self.cfg.lookback);
+        for (a, b) in closes_a.iter().zip(closes_b.iter()) {
+            let dec_a = decimal_from_price(*a)?;
+            let dec_b = decimal_from_price(*b)?;
+            if dec_b.is_zero() {
+                return None;
+            }
+            spreads.push((dec_a / dec_b).ln());
+        }
+        Some(spreads)
     }
 }
 
@@ -1008,7 +1047,7 @@ impl Strategy for PairsTradingArbitrage {
             ));
         }
         self.cfg = cfg;
-        Ok(())
+        self.rebuild_thresholds()
     }
 
     fn on_tick(&mut self, _ctx: &StrategyContext, _tick: &Tick) -> StrategyResult<()> {
@@ -1019,7 +1058,7 @@ impl Strategy for PairsTradingArbitrage {
         if self.cfg.symbols.contains(&candle.symbol) {
             if let Some(spreads) = self.spreads(ctx) {
                 if let Some(z) = z_score(&spreads) {
-                    if z >= self.cfg.entry_z {
+                    if z >= self.entry_z_level {
                         // Asset A rich: short A, long B.
                         self.signals.push(Signal::new(
                             self.cfg.symbols[0].clone(),
@@ -1031,7 +1070,7 @@ impl Strategy for PairsTradingArbitrage {
                             SignalKind::EnterLong,
                             0.8,
                         ));
-                    } else if z <= -self.cfg.entry_z {
+                    } else if z <= -self.entry_z_level {
                         // Asset B rich: long A, short B.
                         self.signals.push(Signal::new(
                             self.cfg.symbols[0].clone(),
@@ -1043,7 +1082,7 @@ impl Strategy for PairsTradingArbitrage {
                             SignalKind::EnterShort,
                             0.8,
                         ));
-                    } else if z.abs() <= self.cfg.exit_z {
+                    } else if z.abs() <= self.exit_z_level {
                         for symbol in &self.cfg.symbols {
                             self.signals.push(Signal::new(
                                 symbol.clone(),

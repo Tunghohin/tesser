@@ -2188,6 +2188,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "rusqlite",
+ "rust_decimal",
  "serde",
  "serde_json",
  "tempfile",
