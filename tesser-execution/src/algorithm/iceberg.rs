@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use rust_decimal::{prelude::FromPrimitive, Decimal};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tesser_core::{
     Order, OrderRequest, OrderType, Price, Quantity, Side, Signal, Tick, TimeInForce,
@@ -23,7 +23,7 @@ struct IcebergState {
     filled_quantity: Quantity,
     display_quantity: Quantity,
     limit_price: Price,
-    limit_offset_bps: Option<f64>,
+    limit_offset_bps: Option<Decimal>,
     next_child_seq: u32,
     active_child: Option<ActiveChild>,
 }
@@ -38,7 +38,7 @@ impl IcebergAlgorithm {
         total_quantity: Quantity,
         display_quantity: Quantity,
         limit_price: Price,
-        limit_offset_bps: Option<f64>,
+        limit_offset_bps: Option<Decimal>,
     ) -> Result<Self> {
         if total_quantity <= Decimal::ZERO {
             bail!("iceberg total quantity must be positive");
@@ -95,8 +95,11 @@ impl IcebergAlgorithm {
 
     fn adjusted_limit_price(&self) -> Price {
         let base = self.state.limit_price;
-        let offset = Decimal::from_f64(self.state.limit_offset_bps.unwrap_or(0.0).max(0.0))
+        let offset = self
+            .state
+            .limit_offset_bps
             .unwrap_or(Decimal::ZERO)
+            .max(Decimal::ZERO)
             / Decimal::from(10_000);
         match self.state.parent_signal.kind.side() {
             Side::Buy => base * (Decimal::ONE + offset),

@@ -63,8 +63,8 @@ pub struct LiveSessionSettings {
     pub category: PublicChannel,
     pub interval: Interval,
     pub quantity: Quantity,
-    pub slippage_bps: f64,
-    pub fee_bps: f64,
+    pub slippage_bps: Decimal,
+    pub fee_bps: Decimal,
     pub history: usize,
     pub metrics_addr: SocketAddr,
     pub state_path: PathBuf,
@@ -77,8 +77,8 @@ pub struct LiveSessionSettings {
 impl LiveSessionSettings {
     fn risk_limits(&self) -> RiskLimits {
         RiskLimits {
-            max_order_quantity: self.risk.max_order_quantity.max(0.0),
-            max_position_quantity: self.risk.max_position_quantity.max(0.0),
+            max_order_quantity: self.risk.max_order_quantity.max(Decimal::ZERO),
+            max_position_quantity: self.risk.max_position_quantity.max(Decimal::ZERO),
         }
     }
 }
@@ -777,10 +777,11 @@ impl LiveRuntime {
         self.strategy
             .on_fill(&self.strategy_ctx, &fill)
             .context("Strategy failed on real fill event")?;
-        if let Some(equity) = self.portfolio.equity().to_f64() {
-            self.metrics.update_equity(equity);
-            self.alerts.update_equity(equity).await;
+        let equity = self.portfolio.equity();
+        if let Some(value) = equity.to_f64() {
+            self.metrics.update_equity(value);
         }
+        self.alerts.update_equity(equity).await;
         self.metrics.inc_order(); // Count the fill as a completed order
         self.alerts
             .notify(

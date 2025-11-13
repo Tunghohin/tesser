@@ -9,11 +9,8 @@ pub use algorithm::{AlgoStatus, ChildOrderRequest, ExecutionAlgorithm};
 pub use orchestrator::OrderOrchestrator;
 pub use repository::{AlgoStateRepository, SqliteAlgoStateRepository};
 
-use anyhow::{anyhow, bail, Context};
-use rust_decimal::{
-    prelude::{FromPrimitive, ToPrimitive},
-    Decimal,
-};
+use anyhow::{bail, Context};
+use rust_decimal::Decimal;
 use std::sync::Arc;
 use tesser_broker::{BrokerError, BrokerResult, ExecutionClient};
 use tesser_bybit::{BybitClient, BybitCredentials};
@@ -53,7 +50,7 @@ impl OrderSizer for FixedOrderSizer {
 /// Sizes orders based on a fixed percentage of portfolio equity.
 pub struct PortfolioPercentSizer {
     /// The fraction of equity to allocate per trade (e.g., 0.02 for 2%).
-    pub percent: f64,
+    pub percent: Decimal,
 }
 
 impl OrderSizer for PortfolioPercentSizer {
@@ -66,11 +63,10 @@ impl OrderSizer for PortfolioPercentSizer {
         if last_price <= Decimal::ZERO {
             bail!("cannot size order with zero or negative price");
         }
-        let percent = decimal_from_f64(self.percent, "allocation percent")?;
-        if percent <= Decimal::ZERO {
+        if self.percent <= Decimal::ZERO {
             return Ok(Decimal::ZERO);
         }
-        let notional = portfolio_equity * percent;
+        let notional = portfolio_equity * self.percent;
         Ok(notional / last_price)
     }
 }
@@ -79,7 +75,7 @@ impl OrderSizer for PortfolioPercentSizer {
 #[derive(Default)]
 pub struct RiskAdjustedSizer {
     /// Target risk contribution per trade, as a fraction of equity (e.g., 0.002 for 0.2%).
-    pub risk_fraction: f64,
+    pub risk_fraction: Decimal,
 }
 
 impl OrderSizer for RiskAdjustedSizer {
@@ -92,17 +88,16 @@ impl OrderSizer for RiskAdjustedSizer {
         if last_price <= Decimal::ZERO {
             bail!("cannot size order with zero or negative price");
         }
-        let risk_fraction = decimal_from_f64(self.risk_fraction, "risk fraction")?;
-        if risk_fraction <= Decimal::ZERO {
+        if self.risk_fraction <= Decimal::ZERO {
             return Ok(Decimal::ZERO);
         }
         // Placeholder volatility; replace with instrument-specific estimator.
-        let volatility = Decimal::from_f64(0.02).expect("0.02 should convert to Decimal");
+        let volatility = Decimal::new(2, 2); // 0.02
         let denom = last_price * volatility;
         if denom <= Decimal::ZERO {
             bail!("volatility multiplier produced an invalid denominator");
         }
-        let dollars_at_risk = portfolio_equity * risk_fraction;
+        let dollars_at_risk = portfolio_equity * self.risk_fraction;
         Ok(dollars_at_risk / denom)
     }
 }
@@ -138,16 +133,16 @@ impl PreTradeRiskChecker for NoopRiskChecker {
 /// Upper bounds enforced by the [`BasicRiskChecker`].
 #[derive(Clone, Copy, Debug)]
 pub struct RiskLimits {
-    pub max_order_quantity: f64,
-    pub max_position_quantity: f64,
+    pub max_order_quantity: Quantity,
+    pub max_position_quantity: Quantity,
 }
 
 impl RiskLimits {
     /// Ensure limits are non-negative and default to zero (disabled) when NaN.
     pub fn sanitized(self) -> Self {
         Self {
-            max_order_quantity: self.max_order_quantity.max(0.0),
-            max_position_quantity: self.max_position_quantity.max(0.0),
+            max_order_quantity: self.max_order_quantity.max(Decimal::ZERO),
+            max_position_quantity: self.max_position_quantity.max(Decimal::ZERO),
         }
     }
 }
@@ -169,11 +164,11 @@ impl BasicRiskChecker {
 impl PreTradeRiskChecker for BasicRiskChecker {
     fn check(&self, request: &OrderRequest, ctx: &RiskContext) -> Result<(), RiskError> {
         let qty = request.quantity.abs();
-        let max_order = Decimal::from_f64(self.limits.max_order_quantity).unwrap_or(Decimal::ZERO);
+        let max_order = self.limits.max_order_quantity;
         if max_order > Decimal::ZERO && qty > max_order {
             return Err(RiskError::MaxOrderSize {
-                quantity: qty.to_f64().unwrap_or(f64::MAX),
-                limit: self.limits.max_order_quantity,
+                quantity: qty,
+                limit: max_order,
             });
         }
 
@@ -182,18 +177,11 @@ impl PreTradeRiskChecker for BasicRiskChecker {
             Side::Sell => ctx.signed_position_qty - qty,
         };
 
-        let max_position =
-            Decimal::from_f64(self.limits.max_position_quantity).unwrap_or(Decimal::ZERO);
+        let max_position = self.limits.max_position_quantity;
         if max_position > Decimal::ZERO && projected_position.abs() > max_position {
             return Err(RiskError::MaxPositionExposure {
-                projected: projected_position.to_f64().unwrap_or_else(|| {
-                    if projected_position.is_sign_positive() {
-                        f64::MAX
-                    } else {
-                        f64::MIN
-                    }
-                }),
-                limit: self.limits.max_position_quantity,
+                projected: projected_position,
+                limit: max_position,
             });
         }
 
@@ -216,15 +204,6 @@ impl PreTradeRiskChecker for BasicRiskChecker {
     }
 }
 
-fn decimal_from_f64(value: f64, label: &str) -> anyhow::Result<Decimal> {
-    if !value.is_finite() {
-        bail!("{label} must be finite (got {value})");
-    }
-    Decimal::from_f64(value)
-        .or_else(|| Decimal::from_f64_retain(value))
-        .ok_or_else(|| anyhow!("failed to convert {label} ({value}) into Decimal"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,7 +216,9 @@ mod tests {
     #[test]
     fn portfolio_percent_sizer_matches_decimal_math() {
         let signal = dummy_signal();
-        let sizer = PortfolioPercentSizer { percent: 0.05 };
+        let sizer = PortfolioPercentSizer {
+            percent: Decimal::new(5, 2),
+        };
         let qty = sizer
             .size(&signal, Decimal::from(25_000), Decimal::from(50_000))
             .unwrap();
@@ -248,7 +229,7 @@ mod tests {
     fn risk_adjusted_sizer_respects_zero_price_guard() {
         let signal = dummy_signal();
         let sizer = RiskAdjustedSizer {
-            risk_fraction: 0.01,
+            risk_fraction: Decimal::new(1, 2),
         };
         let err = sizer
             .size(&signal, Decimal::from(10_000), Decimal::ZERO)
@@ -263,10 +244,13 @@ mod tests {
 /// Errors surfaced by pre-trade risk checks.
 #[derive(Debug, Error)]
 pub enum RiskError {
-    #[error("order quantity {quantity:.4} exceeds limit {limit:.4}")]
-    MaxOrderSize { quantity: f64, limit: f64 },
-    #[error("projected position {projected:.4} exceeds limit {limit:.4}")]
-    MaxPositionExposure { projected: f64, limit: f64 },
+    #[error("order quantity {quantity} exceeds limit {limit}")]
+    MaxOrderSize { quantity: Quantity, limit: Quantity },
+    #[error("projected position {projected} exceeds limit {limit}")]
+    MaxPositionExposure {
+        projected: Quantity,
+        limit: Quantity,
+    },
     #[error("liquidate-only mode active")]
     LiquidateOnly,
 }

@@ -7,10 +7,7 @@ use std::{collections::VecDeque, sync::Arc};
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
 use reporting::{PerformanceReport, Reporter};
-use rust_decimal::{
-    prelude::{FromPrimitive, ToPrimitive},
-    Decimal,
-};
+use rust_decimal::Decimal;
 use tesser_core::{
     Candle, DepthUpdate, Fill, Order, OrderBook, Price, Quantity, Side, Symbol, Tick,
 };
@@ -27,15 +24,9 @@ pub struct BacktestConfig {
     pub lob_events: Vec<MarketEvent>,
     pub order_quantity: Quantity,
     pub history: usize,
-    pub initial_equity: f64,
+    pub initial_equity: Decimal,
     pub execution: ExecutionModel,
     pub mode: BacktestMode,
-}
-
-fn decimal_to_f64(value: Price, label: &str) -> anyhow::Result<f64> {
-    value
-        .to_f64()
-        .ok_or_else(|| anyhow!("{} ({}) is out of range for f64", label, value))
 }
 
 impl BacktestConfig {
@@ -47,7 +38,7 @@ impl BacktestConfig {
             lob_events: Vec::new(),
             order_quantity: Decimal::ONE,
             history: 512,
-            initial_equity: 10_000.0,
+            initial_equity: Decimal::new(10_000, 0),
             execution: ExecutionModel::default(),
             mode: BacktestMode::Candle,
         }
@@ -60,21 +51,21 @@ pub struct ExecutionModel {
     /// Number of candles to wait before an order is eligible for execution (minimum 1).
     pub latency_candles: usize,
     /// Symmetric slippage applied in basis points (1 bp = 0.01%).
-    pub slippage_bps: f64,
+    pub slippage_bps: Decimal,
     /// Trading fee in basis points applied to notional.
-    pub fee_bps: f64,
+    pub fee_bps: Decimal,
     /// Pessimism factor within the OHLC range when simulating fills (0.0-1.0).
     /// For buys, simulate closer to the high; for sells, closer to the low.
-    pub pessimism_factor: f64,
+    pub pessimism_factor: Decimal,
 }
 
 impl Default for ExecutionModel {
     fn default() -> Self {
         Self {
             latency_candles: 1,
-            slippage_bps: 0.0,
-            fee_bps: 0.0,
-            pessimism_factor: 0.25,
+            slippage_bps: Decimal::ZERO,
+            fee_bps: Decimal::ZERO,
+            pessimism_factor: Decimal::new(25, 2), // 0.25
         }
     }
 }
@@ -135,8 +126,7 @@ impl Backtester {
         matching_engine: Option<Arc<MatchingEngine>>,
     ) -> Self {
         let portfolio_config = PortfolioConfig {
-            initial_equity: Decimal::from_f64(config.initial_equity)
-                .expect("finite initial equity"),
+            initial_equity: config.initial_equity,
             max_drawdown: None, // Disable liquidate-only for backtests for now
         };
         Self {
@@ -159,7 +149,7 @@ impl Backtester {
     }
 
     async fn run_candle(&mut self) -> anyhow::Result<PerformanceReport> {
-        let mut equity_curve: Vec<(DateTime<Utc>, f64)> = Vec::new();
+        let mut equity_curve: Vec<(DateTime<Utc>, Decimal)> = Vec::new();
         let mut all_fills = Vec::new();
 
         for idx in 0..self.config.candles.len() {
@@ -215,7 +205,7 @@ impl Backtester {
                 }
             }
 
-            let equity = decimal_to_f64(self.portfolio.equity(), "portfolio equity")?;
+            let equity = self.portfolio.equity();
             equity_curve.push((candle.timestamp, equity));
         }
 
@@ -244,8 +234,12 @@ impl Backtester {
 
     fn build_fill(&self, order: &Order, candle: &Candle) -> Fill {
         // Price within the candle's OHLC band, biased pessimistically
-        let factor = Decimal::from_f64(self.config.execution.pessimism_factor.clamp(0.0, 1.0))
-            .unwrap_or(Decimal::ZERO);
+        let factor = self
+            .config
+            .execution
+            .pessimism_factor
+            .max(Decimal::ZERO)
+            .min(Decimal::ONE);
         let mut price = match order.request.side {
             Side::Buy => {
                 let band = (candle.high - candle.open).max(Decimal::ZERO);
@@ -256,8 +250,8 @@ impl Backtester {
                 candle.open - band * factor
             }
         };
-        let slippage_rate = Decimal::from_f64(self.config.execution.slippage_bps / 10_000.0)
-            .unwrap_or(Decimal::ZERO);
+        let slippage_rate =
+            self.config.execution.slippage_bps.max(Decimal::ZERO) / Decimal::from(10_000);
         if slippage_rate > Decimal::ZERO {
             let multiplier = match order.request.side {
                 Side::Buy => Decimal::ONE + slippage_rate,
@@ -265,8 +259,7 @@ impl Backtester {
             };
             price *= multiplier;
         }
-        let fee_rate =
-            Decimal::from_f64(self.config.execution.fee_bps / 10_000.0).unwrap_or(Decimal::ZERO);
+        let fee_rate = self.config.execution.fee_bps.max(Decimal::ZERO) / Decimal::from(10_000);
         let notional = price * order.request.quantity.abs();
         let fee = if fee_rate > Decimal::ZERO {
             Some(notional * fee_rate)
@@ -289,7 +282,7 @@ impl Backtester {
             .matching_engine
             .clone()
             .ok_or_else(|| anyhow!("tick mode requires a matching engine"))?;
-        let mut equity_curve: Vec<(DateTime<Utc>, f64)> = Vec::new();
+        let mut equity_curve: Vec<(DateTime<Utc>, Decimal)> = Vec::new();
         let mut all_fills = Vec::new();
         let mut last_trade_price: Option<Price> = None;
 
@@ -323,7 +316,7 @@ impl Backtester {
             self.process_signals_tick(last_trade_price.or_else(|| matching.mid_price()))
                 .await?;
             self.consume_matching_fills(&mut all_fills).await?;
-            let equity = decimal_to_f64(self.portfolio.equity(), "portfolio equity")?;
+            let equity = self.portfolio.equity();
             equity_curve.push((event.timestamp, equity));
         }
 

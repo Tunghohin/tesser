@@ -223,8 +223,12 @@ fn ensure_single_symbol(candles: &[Candle]) -> Result<Symbol> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::prelude::FromPrimitive;
+    use rust_decimal::Decimal;
 
     fn candle_at(minute: i64, close: f64, volume: f64) -> Candle {
+        let close = Decimal::from_f64(close).expect("close convertible");
+        let volume = Decimal::from_f64(volume).expect("volume convertible");
         Candle {
             symbol: "BTCUSDT".to_string(),
             interval: Interval::OneMinute,

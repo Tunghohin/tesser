@@ -8,7 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rust_decimal::{prelude::FromPrimitive, Decimal};
+use rust_decimal::Decimal;
 use tesser_broker::{BrokerError, BrokerInfo, BrokerResult, ExecutionClient, MarketStream};
 use tesser_core::{
     AccountBalance, Candle, DepthUpdate, Fill, LocalOrderBook, Order, OrderBook, OrderId,
@@ -17,10 +17,6 @@ use tesser_core::{
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
 use uuid::Uuid;
-
-fn bps_to_decimal(value: f64) -> Decimal {
-    Decimal::from_f64(value).unwrap_or(Decimal::ZERO) / Decimal::from(10_000)
-}
 
 /// In-memory execution client that fills orders immediately at the provided limit (or last) price.
 #[derive(Clone)]
@@ -33,19 +29,29 @@ pub struct PaperExecutionClient {
     /// Latest market prices for each symbol
     last_prices: Arc<Mutex<HashMap<Symbol, Price>>>,
     /// Simulation parameters
-    slippage_bps: f64,
-    fee_bps: f64,
+    slippage_bps: Decimal,
+    fee_bps: Decimal,
 }
 
 impl Default for PaperExecutionClient {
     fn default() -> Self {
-        Self::new("paper".into(), vec!["BTCUSDT".into()], 0.0, 0.0)
+        Self::new(
+            "paper".into(),
+            vec!["BTCUSDT".into()],
+            Decimal::ZERO,
+            Decimal::ZERO,
+        )
     }
 }
 
 impl PaperExecutionClient {
     /// Create a new paper execution client configurable with instrument metadata.
-    pub fn new(name: String, markets: Vec<String>, slippage_bps: f64, fee_bps: f64) -> Self {
+    pub fn new(
+        name: String,
+        markets: Vec<String>,
+        slippage_bps: Decimal,
+        fee_bps: Decimal,
+    ) -> Self {
         Self {
             info: BrokerInfo {
                 name,
@@ -80,8 +86,8 @@ impl PaperExecutionClient {
         fill_price: Price,
         timestamp: DateTime<Utc>,
     ) -> Fill {
-        let fee = if self.fee_bps > 0.0 {
-            let fee_rate = bps_to_decimal(self.fee_bps);
+        let fee = if self.fee_bps > Decimal::ZERO {
+            let fee_rate = (self.fee_bps.max(Decimal::ZERO)) / Decimal::from(10_000);
             Some(fill_price.abs() * order.request.quantity.abs() * fee_rate)
         } else {
             None
@@ -133,8 +139,8 @@ impl PaperExecutionClient {
         };
 
         // Apply slippage
-        let slippage_rate = if self.slippage_bps > 0.0 {
-            Some(bps_to_decimal(self.slippage_bps))
+        let slippage_rate = if self.slippage_bps > Decimal::ZERO {
+            Some((self.slippage_bps.max(Decimal::ZERO)) / Decimal::from(10_000))
         } else {
             None
         };
@@ -694,11 +700,11 @@ impl ExecutionClient for PaperExecutionClient {
                 self.orders.lock().await.push(order.clone());
 
                 // Calculate fee if applicable
-                let fee = if self.fee_bps > 0.0 {
-                    order.avg_fill_price.map(|fill_price| {
-                        let fee_rate = bps_to_decimal(self.fee_bps);
-                        fill_price * order.request.quantity.abs() * fee_rate
-                    })
+                let fee = if self.fee_bps > Decimal::ZERO {
+                    let rate = self.fee_bps.max(Decimal::ZERO) / Decimal::from(10_000);
+                    order
+                        .avg_fill_price
+                        .map(|fill_price| fill_price * order.request.quantity.abs() * rate)
                 } else {
                     None
                 };

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
-use rust_decimal::{prelude::FromPrimitive, Decimal};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tesser_core::{AccountBalance, Fill, Order, Position, Price, Quantity, Side, Symbol};
 use thiserror::Error;
@@ -30,7 +30,7 @@ pub enum PortfolioError {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PortfolioConfig {
     pub initial_equity: Price,
-    pub max_drawdown: Option<f64>,
+    pub max_drawdown: Option<Decimal>,
 }
 
 impl Default for PortfolioConfig {
@@ -56,10 +56,7 @@ pub struct Portfolio {
 impl Portfolio {
     /// Instantiate a new portfolio with default configuration.
     pub fn new(config: PortfolioConfig) -> Self {
-        let limit = config
-            .max_drawdown
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .and_then(Decimal::from_f64);
+        let limit = config.max_drawdown.filter(|value| *value > Decimal::ZERO);
         Self {
             cash: config.initial_equity,
             positions: HashMap::new(),
@@ -77,10 +74,7 @@ impl Portfolio {
         balances: Vec<AccountBalance>,
         config: PortfolioConfig,
     ) -> Self {
-        let drawdown_limit = config
-            .max_drawdown
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .and_then(Decimal::from_f64);
+        let drawdown_limit = config.max_drawdown.filter(|value| *value > Decimal::ZERO);
         let mut position_map = HashMap::new();
         for position in positions.into_iter() {
             if position.quantity.is_zero() {
@@ -252,8 +246,7 @@ impl Portfolio {
     pub fn from_state(state: PortfolioState, config: PortfolioConfig) -> Self {
         let drawdown_limit = config
             .max_drawdown
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .and_then(Decimal::from_f64)
+            .filter(|value| *value > Decimal::ZERO)
             .or(state.drawdown_limit);
         let peak_against_state = cmp::max(state.peak_equity, state.initial_equity);
         let mut portfolio = Self {
@@ -430,11 +423,7 @@ mod tests {
     #[test]
     fn portfolio_updates_equity() {
         let mut portfolio = Portfolio::new(PortfolioConfig::default());
-        let buy = sample_fill(
-            Side::Buy,
-            Decimal::from(50_000),
-            Decimal::from_f64(0.1).unwrap(),
-        );
+        let buy = sample_fill(Side::Buy, Decimal::from(50_000), Decimal::new(1, 1));
         portfolio.apply_fill(&buy).unwrap();
         assert!(portfolio.cash() < Decimal::from(10_000));
     }

@@ -240,7 +240,7 @@ impl OrderOrchestrator {
         &self,
         signal: Signal,
         duration: Duration,
-        participation_rate: Option<f64>,
+        participation_rate: Option<Decimal>,
         ctx: &RiskContext,
     ) -> Result<()> {
         self.update_risk_context(signal.symbol.clone(), *ctx);
@@ -278,7 +278,7 @@ impl OrderOrchestrator {
         &self,
         signal: Signal,
         display_size: Quantity,
-        limit_offset_bps: Option<f64>,
+        limit_offset_bps: Option<Decimal>,
         ctx: &RiskContext,
     ) -> Result<()> {
         self.update_risk_context(signal.symbol.clone(), *ctx);

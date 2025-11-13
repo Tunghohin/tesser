@@ -307,28 +307,16 @@ fn normalize_name(name: &str) -> String {
 // Helpers
 // -------------------------------------------------------------------------------------------------
 
-fn collect_symbol_closes(candles: &VecDeque<Candle>, symbol: &str, limit: usize) -> Vec<f64> {
-    let mut values: Vec<f64> = candles
+fn collect_symbol_closes(candles: &VecDeque<Candle>, symbol: &str, limit: usize) -> Vec<Decimal> {
+    let mut values: Vec<Decimal> = candles
         .iter()
         .rev()
         .filter(|c| c.symbol == symbol)
         .take(limit)
-        .filter_map(|c| c.close.to_f64())
+        .map(|c| c.close)
         .collect();
     values.reverse();
     values
-}
-
-fn decimal_from_price(value: f64) -> Option<Decimal> {
-    Decimal::from_f64(value).or_else(|| Decimal::from_f64_retain(value))
-}
-
-fn decimal_from_f64_config(value: f64, field: &str) -> StrategyResult<Decimal> {
-    Decimal::from_f64(value).ok_or_else(|| {
-        StrategyError::InvalidConfig(format!(
-            "unable to represent {field}={value} as a high-precision decimal"
-        ))
-    })
 }
 
 fn z_score(values: &[Decimal]) -> Option<Decimal> {
@@ -366,7 +354,7 @@ pub struct SmaCrossConfig {
     pub slow_period: usize,
     pub min_samples: usize,
     pub vwap_duration_secs: Option<i64>,
-    pub vwap_participation: Option<f64>,
+    pub vwap_participation: Option<Decimal>,
 }
 
 impl Default for SmaCrossConfig {
@@ -468,7 +456,7 @@ impl SmaCross {
                     let participation = self
                         .cfg
                         .vwap_participation
-                        .map(|value| value.clamp(0.0, 1.0));
+                        .map(|value| value.max(Decimal::ZERO).min(Decimal::ONE));
                     signal.execution_hint = Some(ExecutionHint::Vwap {
                         duration,
                         participation_rate: participation,
@@ -536,8 +524,8 @@ register_strategy!(SmaCross, "SmaCross");
 pub struct RsiReversionConfig {
     pub symbol: Symbol,
     pub period: usize,
-    pub oversold: f64,
-    pub overbought: f64,
+    pub oversold: Decimal,
+    pub overbought: Decimal,
     pub lookback: usize,
 }
 
@@ -546,8 +534,8 @@ impl Default for RsiReversionConfig {
         Self {
             symbol: "BTCUSDT".to_string(),
             period: 14,
-            oversold: 30.0,
-            overbought: 70.0,
+            oversold: Decimal::from(30),
+            overbought: Decimal::from(70),
             lookback: 200,
         }
     }
@@ -572,8 +560,8 @@ impl RsiReversion {
     /// Instantiate the strategy with the provided configuration.
     pub fn new(cfg: RsiReversionConfig) -> Self {
         let rsi = Rsi::new(cfg.period).expect("period must be positive");
-        let oversold_level = Decimal::from_f64(cfg.oversold).expect("finite oversold");
-        let overbought_level = Decimal::from_f64(cfg.overbought).expect("finite overbought");
+        let oversold_level = cfg.oversold;
+        let overbought_level = cfg.overbought;
         Self {
             cfg,
             signals: Vec::new(),
@@ -587,9 +575,8 @@ impl RsiReversion {
     fn rebuild_indicator(&mut self) -> StrategyResult<()> {
         self.rsi = Rsi::new(self.cfg.period)
             .map_err(|err| StrategyError::InvalidConfig(err.to_string()))?;
-        self.oversold_level = decimal_from_f64_config(self.cfg.oversold, "oversold threshold")?;
-        self.overbought_level =
-            decimal_from_f64_config(self.cfg.overbought, "overbought threshold")?;
+        self.oversold_level = self.cfg.oversold;
+        self.overbought_level = self.cfg.overbought;
         self.samples = 0;
         Ok(())
     }
@@ -669,7 +656,7 @@ register_strategy!(RsiReversion, "RsiReversion");
 pub struct BollingerBreakoutConfig {
     pub symbol: Symbol,
     pub period: usize,
-    pub std_multiplier: f64,
+    pub std_multiplier: Decimal,
     pub lookback: usize,
 }
 
@@ -678,7 +665,7 @@ impl Default for BollingerBreakoutConfig {
         Self {
             symbol: "BTCUSDT".to_string(),
             period: 20,
-            std_multiplier: 2.0,
+            std_multiplier: Decimal::from(2),
             lookback: 200,
         }
     }
@@ -702,9 +689,8 @@ impl Default for BollingerBreakout {
 impl BollingerBreakout {
     /// Instantiate the strategy with the provided configuration.
     pub fn new(cfg: BollingerBreakoutConfig) -> Self {
-        let std_multiplier = Decimal::from_f64(cfg.std_multiplier).expect("finite multiplier");
-        let neutral_band =
-            std_multiplier * Decimal::from_f64(0.25).expect("0.25 should convert to Decimal");
+        let std_multiplier = cfg.std_multiplier;
+        let neutral_band = std_multiplier * Decimal::new(25, 2); // 0.25
         let bands = BollingerBands::new(cfg.period, std_multiplier)
             .expect("period and multiplier must be valid");
         Self {
@@ -718,9 +704,8 @@ impl BollingerBreakout {
     }
 
     fn rebuild_indicator(&mut self) -> StrategyResult<()> {
-        self.std_multiplier = decimal_from_f64_config(self.cfg.std_multiplier, "std_multiplier")?;
-        self.neutral_band =
-            self.std_multiplier * Decimal::from_f64(0.25).expect("0.25 should convert");
+        self.std_multiplier = self.cfg.std_multiplier;
+        self.neutral_band = self.std_multiplier * Decimal::new(25, 2);
         self.bands = BollingerBands::new(self.cfg.period, self.std_multiplier)
             .map_err(|err| StrategyError::InvalidConfig(err.to_string()))?;
         self.samples = 0;
@@ -850,9 +835,14 @@ pub struct MlClassifier {
 impl MlClassifier {
     fn score(&self, ctx: &StrategyContext) -> Option<f64> {
         let model = self.model.as_ref()?;
-        let closes = collect_symbol_closes(ctx.candles(), &self.cfg.symbol, self.cfg.lookback + 1);
-        if closes.len() < self.cfg.lookback + 1 {
+        let raw_closes =
+            collect_symbol_closes(ctx.candles(), &self.cfg.symbol, self.cfg.lookback + 1);
+        if raw_closes.len() < self.cfg.lookback + 1 {
             return None;
+        }
+        let mut closes = Vec::with_capacity(raw_closes.len());
+        for value in raw_closes {
+            closes.push(value.to_f64()?);
         }
         let mut features = Vec::with_capacity(self.cfg.lookback);
         for window in closes.windows(2) {
@@ -953,8 +943,8 @@ register_strategy!(MlClassifier, "MlClassifier");
 pub struct PairsTradingConfig {
     pub symbols: [Symbol; 2],
     pub lookback: usize,
-    pub entry_z: f64,
-    pub exit_z: f64,
+    pub entry_z: Decimal,
+    pub exit_z: Decimal,
 }
 
 impl Default for PairsTradingConfig {
@@ -962,8 +952,8 @@ impl Default for PairsTradingConfig {
         Self {
             symbols: ["BTCUSDT".to_string(), "ETHUSDT".to_string()],
             lookback: 200,
-            entry_z: 2.0,
-            exit_z: 0.5,
+            entry_z: Decimal::from(2),
+            exit_z: Decimal::new(5, 1),
         }
     }
 }
@@ -995,8 +985,8 @@ impl PairsTradingArbitrage {
     }
 
     fn rebuild_thresholds(&mut self) -> StrategyResult<()> {
-        self.entry_z_level = decimal_from_f64_config(self.cfg.entry_z, "pairs_trading.entry_z")?;
-        self.exit_z_level = decimal_from_f64_config(self.cfg.exit_z, "pairs_trading.exit_z")?;
+        self.entry_z_level = self.cfg.entry_z;
+        self.exit_z_level = self.cfg.exit_z;
         if self.entry_z_level <= self.exit_z_level {
             return Err(StrategyError::InvalidConfig(
                 "`entry_z` must be greater than `exit_z`".into(),
@@ -1015,12 +1005,10 @@ impl PairsTradingArbitrage {
         }
         let mut spreads = Vec::with_capacity(self.cfg.lookback);
         for (a, b) in closes_a.iter().zip(closes_b.iter()) {
-            let dec_a = decimal_from_price(*a)?;
-            let dec_b = decimal_from_price(*b)?;
-            if dec_b.is_zero() {
+            if b.is_zero() {
                 return None;
             }
-            spreads.push((dec_a / dec_b).ln());
+            spreads.push((*a / *b).ln());
         }
         Some(spreads)
     }

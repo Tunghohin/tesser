@@ -52,6 +52,7 @@ struct Cli {
     command: Commands,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     /// Data engineering tasks
@@ -334,14 +335,14 @@ struct BacktestRunArgs {
     data_paths: Vec<PathBuf>,
     #[arg(long, default_value_t = 500)]
     candles: usize,
-    #[arg(long, default_value_t = 0.01)]
-    quantity: f64,
+    #[arg(long, default_value = "0.01")]
+    quantity: Decimal,
     /// Symmetric slippage in basis points (1 bp = 0.01%) applied to fills
-    #[arg(long, default_value_t = 0.0)]
-    slippage_bps: f64,
+    #[arg(long, default_value = "0")]
+    slippage_bps: Decimal,
     /// Trading fees in basis points applied to notional
-    #[arg(long, default_value_t = 0.0)]
-    fee_bps: f64,
+    #[arg(long, default_value = "0")]
+    fee_bps: Decimal,
     /// Number of candles between signal and execution
     #[arg(long, default_value_t = 1)]
     latency_candles: usize,
@@ -364,17 +365,17 @@ struct BacktestBatchArgs {
     /// Candle CSVs available to every strategy
     #[arg(long = "data", value_name = "PATH", num_args = 1.., action = clap::ArgAction::Append)]
     data_paths: Vec<PathBuf>,
-    #[arg(long, default_value_t = 0.01)]
-    quantity: f64,
+    #[arg(long, default_value = "0.01")]
+    quantity: Decimal,
     /// Optional output CSV summarizing results
     #[arg(long)]
     output: Option<PathBuf>,
     /// Symmetric slippage in basis points (1 bp = 0.01%) applied to fills
-    #[arg(long, default_value_t = 0.0)]
-    slippage_bps: f64,
+    #[arg(long, default_value = "0")]
+    slippage_bps: Decimal,
     /// Trading fees in basis points applied to notional
-    #[arg(long, default_value_t = 0.0)]
-    fee_bps: f64,
+    #[arg(long, default_value = "0")]
+    fee_bps: Decimal,
     /// Number of candles between signal and execution
     #[arg(long, default_value_t = 1)]
     latency_candles: usize,
@@ -393,8 +394,8 @@ struct LiveRunArgs {
     category: String,
     #[arg(long, default_value = "1m")]
     interval: String,
-    #[arg(long, default_value_t = 1.0)]
-    quantity: f64,
+    #[arg(long, default_value = "1")]
+    quantity: Decimal,
     /// Selects which execution backend to use (`paper` or `bybit`)
     #[arg(
         long = "exec",
@@ -410,11 +411,11 @@ struct LiveRunArgs {
     #[arg(long)]
     log_path: Option<PathBuf>,
     #[arg(long)]
-    initial_equity: Option<f64>,
-    #[arg(long, default_value_t = 0.0)]
-    slippage_bps: f64,
-    #[arg(long, default_value_t = 0.0)]
-    fee_bps: f64,
+    initial_equity: Option<Decimal>,
+    #[arg(long, default_value = "0")]
+    slippage_bps: Decimal,
+    #[arg(long, default_value = "0")]
+    fee_bps: Decimal,
     #[arg(long, default_value_t = 0)]
     latency_ms: u64,
     #[arg(long, default_value_t = 512)]
@@ -426,13 +427,13 @@ struct LiveRunArgs {
     #[arg(long)]
     alert_max_order_failures: Option<u32>,
     #[arg(long)]
-    alert_max_drawdown: Option<f64>,
+    alert_max_drawdown: Option<Decimal>,
     #[arg(long)]
-    risk_max_order_qty: Option<f64>,
+    risk_max_order_qty: Option<Decimal>,
     #[arg(long)]
-    risk_max_position_qty: Option<f64>,
+    risk_max_position_qty: Option<Decimal>,
     #[arg(long)]
-    risk_max_drawdown: Option<f64>,
+    risk_max_drawdown: Option<Decimal>,
     /// Bybit orderbook depth to subscribe to (e.g., 1, 25, 50)
     #[arg(long)]
     orderbook_depth: Option<usize>,
@@ -463,10 +464,10 @@ impl LiveRunArgs {
             .with_context(|| format!("invalid metrics address '{addr}'"))
     }
 
-    fn resolved_initial_equity(&self, config: &AppConfig) -> f64 {
+    fn resolved_initial_equity(&self, config: &AppConfig) -> Decimal {
         self.initial_equity
             .unwrap_or(config.backtest.initial_equity)
-            .max(0.0)
+            .max(Decimal::ZERO)
     }
 
     fn build_alerting(&self, config: &AppConfig) -> tesser_config::AlertingConfig {
@@ -483,7 +484,7 @@ impl LiveRunArgs {
             alerting.max_order_failures = limit;
         }
         if let Some(limit) = self.alert_max_drawdown {
-            alerting.max_drawdown = limit.max(0.0);
+            alerting.max_drawdown = limit.max(Decimal::ZERO);
         }
         alerting
     }
@@ -491,13 +492,13 @@ impl LiveRunArgs {
     fn build_risk_config(&self, config: &AppConfig) -> RiskManagementConfig {
         let mut risk = config.risk_management.clone();
         if let Some(limit) = self.risk_max_order_qty {
-            risk.max_order_quantity = limit.max(0.0);
+            risk.max_order_quantity = limit.max(Decimal::ZERO);
         }
         if let Some(limit) = self.risk_max_position_qty {
-            risk.max_position_quantity = limit.max(0.0);
+            risk.max_position_quantity = limit.max(Decimal::ZERO);
         }
         if let Some(limit) = self.risk_max_drawdown {
-            risk.max_drawdown = limit.max(0.0);
+            risk.max_drawdown = limit.max(Decimal::ZERO);
         }
         risk
     }
@@ -646,8 +647,7 @@ impl BacktestRunArgs {
                 let engine = Arc::new(MatchingEngine::new(
                     "matching-engine",
                     symbols.clone(),
-                    Decimal::from_f64(config.backtest.initial_equity)
-                        .unwrap_or_else(|| Decimal::from_i64(10_000).unwrap()),
+                    config.backtest.initial_equity,
                 ));
                 (
                     Vec::new(),
@@ -659,16 +659,15 @@ impl BacktestRunArgs {
         };
 
         let sizer = parse_sizer(&self.sizer, Some(self.quantity))?;
-        let order_quantity =
-            Decimal::from_f64(self.quantity).ok_or_else(|| anyhow!("invalid --quantity value"))?;
+        let order_quantity = self.quantity;
         let execution = ExecutionEngine::new(execution_client, sizer, Arc::new(NoopRiskChecker));
 
         let mut cfg = BacktestConfig::new(symbols[0].clone(), candles);
         cfg.lob_events = lob_events;
         cfg.order_quantity = order_quantity;
         cfg.initial_equity = config.backtest.initial_equity;
-        cfg.execution.slippage_bps = self.slippage_bps.max(0.0);
-        cfg.execution.fee_bps = self.fee_bps.max(0.0);
+        cfg.execution.slippage_bps = self.slippage_bps.max(Decimal::ZERO);
+        cfg.execution.fee_bps = self.fee_bps.max(Decimal::ZERO);
         cfg.execution.latency_candles = self.latency_candles.max(1);
         cfg.mode = mode;
 
@@ -699,8 +698,7 @@ impl BacktestBatchArgs {
             let strategy = load_strategy(&def.name, def.params)
                 .with_context(|| format!("failed to configure strategy {}", def.name))?;
             let sizer = parse_sizer(&self.sizer, Some(self.quantity))?;
-            let order_quantity = Decimal::from_f64(self.quantity)
-                .ok_or_else(|| anyhow!("invalid --quantity value"))?;
+            let order_quantity = self.quantity;
             let mut candles = load_candles_from_paths(&self.data_paths)?;
             candles.sort_by_key(|c| c.timestamp);
             let execution_client: Arc<dyn ExecutionClient> =
@@ -710,8 +708,8 @@ impl BacktestBatchArgs {
             let mut cfg = BacktestConfig::new(strategy.symbol().to_string(), candles);
             cfg.order_quantity = order_quantity;
             cfg.initial_equity = config.backtest.initial_equity;
-            cfg.execution.slippage_bps = self.slippage_bps.max(0.0);
-            cfg.execution.fee_bps = self.fee_bps.max(0.0);
+            cfg.execution.slippage_bps = self.slippage_bps.max(Decimal::ZERO);
+            cfg.execution.fee_bps = self.fee_bps.max(Decimal::ZERO);
             cfg.execution.latency_candles = self.latency_candles.max(1);
 
             let report = Backtester::new(cfg, strategy, execution, None)
@@ -756,16 +754,11 @@ impl LiveRunArgs {
         if symbols.is_empty() {
             bail!("strategy did not declare any subscriptions");
         }
-        if self.quantity <= 0.0 {
+        if self.quantity <= Decimal::ZERO {
             bail!("--quantity must be greater than zero");
         }
-        let quantity =
-            Decimal::from_f64(self.quantity).ok_or_else(|| anyhow!("--quantity must be finite"))?;
-        if quantity <= Decimal::ZERO {
-            bail!("--quantity must be greater than zero");
-        }
-        let initial_equity = Decimal::from_f64(self.resolved_initial_equity(config))
-            .ok_or_else(|| anyhow!("initial equity must be finite"))?;
+        let quantity = self.quantity;
+        let initial_equity = self.resolved_initial_equity(config);
 
         let interval: Interval = self.interval.parse().map_err(|err: String| anyhow!(err))?;
         let category =
@@ -779,8 +772,8 @@ impl LiveRunArgs {
             category,
             interval,
             quantity,
-            slippage_bps: self.slippage_bps,
-            fee_bps: self.fee_bps,
+            slippage_bps: self.slippage_bps.max(Decimal::ZERO),
+            fee_bps: self.fee_bps.max(Decimal::ZERO),
             history,
             metrics_addr,
             state_path,
@@ -1239,28 +1232,31 @@ fn write_batch_report(path: &Path, rows: &[BatchRow]) -> Result<()> {
     Ok(())
 }
 
-fn parse_sizer(value: &str, cli_quantity: Option<f64>) -> Result<Box<dyn OrderSizer>> {
+fn parse_sizer(value: &str, cli_quantity: Option<Decimal>) -> Result<Box<dyn OrderSizer>> {
     let parts: Vec<_> = value.split(':').collect();
     match parts.as_slice() {
         ["fixed", val] => {
-            let quantity = val.parse::<f64>().context("invalid fixed sizer quantity")?;
-            let qty = Decimal::from_f64(quantity)
-                .ok_or_else(|| anyhow!("invalid fixed sizer quantity"))?;
-            Ok(Box::new(FixedOrderSizer { quantity: qty }))
+            let quantity =
+                Decimal::from_str(val).context("invalid fixed sizer quantity (use decimals)")?;
+            Ok(Box::new(FixedOrderSizer { quantity }))
         }
         ["fixed"] => {
-            let quantity = cli_quantity.unwrap_or(1.0);
-            let qty = Decimal::from_f64(quantity)
-                .ok_or_else(|| anyhow!("invalid CLI quantity for fixed sizer"))?;
-            Ok(Box::new(FixedOrderSizer { quantity: qty }))
+            let quantity = cli_quantity.unwrap_or(Decimal::ONE);
+            Ok(Box::new(FixedOrderSizer { quantity }))
         }
         ["percent", val] => {
-            let percent = val.parse::<f64>().context("invalid percent sizer value")?;
-            Ok(Box::new(PortfolioPercentSizer { percent }))
+            let percent =
+                Decimal::from_str(val).context("invalid percent sizer value (use decimals)")?;
+            Ok(Box::new(PortfolioPercentSizer {
+                percent: percent.max(Decimal::ZERO),
+            }))
         }
         ["risk-adjusted", val] => {
-            let risk_fraction = val.parse::<f64>().context("invalid risk fraction value")?;
-            Ok(Box::new(RiskAdjustedSizer { risk_fraction }))
+            let risk_fraction = Decimal::from_str(val)
+                .context("invalid risk fraction value (use decimals)")?;
+            Ok(Box::new(RiskAdjustedSizer {
+                risk_fraction: risk_fraction.max(Decimal::ZERO),
+            }))
         }
         _ => Err(anyhow!(
             "invalid sizer format, expected 'fixed:value', 'percent:value', or 'risk-adjusted:value'"

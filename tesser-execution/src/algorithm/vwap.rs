@@ -14,7 +14,7 @@ struct VwapState {
     status: String,
     total_quantity: Quantity,
     filled_quantity: Quantity,
-    participation_rate: Option<f64>,
+    participation_rate: Option<Decimal>,
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
     observed_volume: Quantity,
@@ -31,7 +31,7 @@ impl VwapAlgorithm {
         signal: Signal,
         total_quantity: Quantity,
         duration: Duration,
-        participation_rate: Option<f64>,
+        participation_rate: Option<Decimal>,
     ) -> Result<Self> {
         if total_quantity <= Decimal::ZERO {
             bail!("VWAP total quantity must be positive");
@@ -41,9 +41,7 @@ impl VwapAlgorithm {
         }
 
         let now = Utc::now();
-        let min_slice = (total_quantity
-            * Decimal::from_f64(0.05).expect("0.05 must convert to Decimal"))
-        .max(Decimal::from_f64(0.001).expect("0.001 must convert"));
+        let min_slice = (total_quantity * Decimal::new(5, 2)).max(Decimal::new(1, 3));
         Ok(Self {
             state: VwapState {
                 id: Uuid::new_v4(),
@@ -84,8 +82,8 @@ impl VwapAlgorithm {
         }
         let mut target = self.state.total_quantity * progress;
         if let Some(rate) = self.state.participation_rate {
-            let rate_dec = Decimal::from_f64(rate.max(0.0)).unwrap_or(Decimal::ZERO);
-            target = target.min(self.state.observed_volume * rate_dec);
+            let clamped = rate.max(Decimal::ZERO);
+            target = target.min(self.state.observed_volume * clamped);
         }
         target.min(self.state.total_quantity)
     }

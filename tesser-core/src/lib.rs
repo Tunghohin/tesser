@@ -28,13 +28,13 @@ pub enum ExecutionHint {
     Vwap {
         duration: Duration,
         #[serde(default)]
-        participation_rate: Option<f64>,
+        participation_rate: Option<Decimal>,
     },
     /// Iceberg order (simulated in software).
     IcebergSimulated {
         display_size: Quantity,
         #[serde(default)]
-        limit_offset_bps: Option<f64>,
+        limit_offset_bps: Option<Decimal>,
     },
 }
 
