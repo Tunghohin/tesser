@@ -433,7 +433,7 @@ fn spawn_fill_plan(
             .request
             .price
             .or(template.request.trigger_price)
-            .unwrap_or_else(|| Decimal::ONE);
+            .unwrap_or(Decimal::ONE);
         for step in steps {
             sleep(step.after).await;
             let price = step.price.unwrap_or(default_price);
@@ -482,7 +482,7 @@ fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
     value
         .parse::<i64>()
         .ok()
-        .and_then(|millis| DateTime::<Utc>::from_timestamp_millis(millis))
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
 }
 
 async fn authenticate(
@@ -492,12 +492,16 @@ async fn authenticate(
     state: &MockExchangeState,
 ) -> Result<String, Response<Body>> {
     let headers = &parts.headers;
-    let api_key = header_str(headers, "X-BAPI-API-KEY")?;
-    let signature = header_str(headers, "X-BAPI-SIGN")?;
-    let timestamp: i64 = header_str(headers, "X-BAPI-TIMESTAMP")?
+    let api_key = header_str(headers, "X-BAPI-API-KEY")
+        .ok_or_else(|| bad_request("missing X-BAPI-API-KEY header"))?;
+    let signature = header_str(headers, "X-BAPI-SIGN")
+        .ok_or_else(|| bad_request("missing X-BAPI-SIGN header"))?;
+    let timestamp: i64 = header_str(headers, "X-BAPI-TIMESTAMP")
+        .ok_or_else(|| bad_request("missing X-BAPI-TIMESTAMP header"))?
         .parse()
         .map_err(|_| bad_request("invalid X-BAPI-TIMESTAMP header"))?;
-    let recv_window: u64 = header_str(headers, "X-BAPI-RECV-WINDOW")?
+    let recv_window: u64 = header_str(headers, "X-BAPI-RECV-WINDOW")
+        .ok_or_else(|| bad_request("missing X-BAPI-RECV-WINDOW header"))?
         .parse()
         .map_err(|_| bad_request("invalid X-BAPI-RECV-WINDOW header"))?;
     let payload = if method == Method::GET {
@@ -524,14 +528,8 @@ async fn authenticate(
     Ok(api_key.to_string())
 }
 
-fn header_str<'a>(
-    headers: &'a hyper::HeaderMap,
-    name: &'static str,
-) -> Result<&'a str, Response<Body>> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| bad_request(format!("missing {name} header")))
+fn header_str<'a>(headers: &'a hyper::HeaderMap, name: &'static str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 fn create_envelope(result: Value, ret_code: i64, ret_msg: &str) -> Value {

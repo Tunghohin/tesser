@@ -875,3 +875,9 @@ impl ShutdownSignal {
         }
     }
 }
+
+impl Default for ShutdownSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -83,14 +83,10 @@ impl ScenarioManager {
     /// Drains and returns the first scenario matching the trigger.
     pub async fn take_for(&self, trigger: ScenarioTrigger) -> Option<ScenarioAction> {
         let mut guard = self.inner.lock().await;
-        if let Some(idx) = guard
+        guard
             .iter()
             .position(|scenario| scenario.trigger == trigger)
-        {
-            Some(guard.remove(idx).action)
-        } else {
-            None
-        }
+            .map(|idx| guard.remove(idx).action)
     }
 
     /// Clears all registered scenarios.
