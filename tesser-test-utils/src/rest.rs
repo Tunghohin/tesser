@@ -114,6 +114,7 @@ async fn route(req: Request<Body>, state: MockExchangeState) -> Response<Body> {
         (Method::GET, "/v5/position/list") => handle_positions(parts, state).await,
         (Method::GET, "/v5/account/wallet-balance") => handle_wallet_balance(parts, state).await,
         (Method::GET, "/v5/execution/list") => handle_execution_list(parts, state).await,
+        (Method::GET, "/v5/order/realtime") => handle_open_orders(parts, state).await,
         _ => not_found(),
     }
 }
@@ -323,6 +324,48 @@ async fn handle_execution_list(
                 "list": list,
                 "nextPageCursor": Value::Null,
             }))
+        }
+        Err(err) => bad_request(err.to_string()),
+    }
+}
+
+async fn handle_open_orders(
+    parts: http::request::Parts,
+    state: MockExchangeState,
+) -> Response<Body> {
+    let api_key = match authenticate(&parts, &Bytes::new(), Method::GET, &state).await {
+        Ok(api_key) => api_key,
+        Err(resp) => return resp,
+    };
+    let params = parse_query(parts.uri.query());
+    let symbol = params.get("symbol").cloned();
+
+    match state.open_orders(&api_key, symbol.as_deref()).await {
+        Ok(orders) => {
+            let list: Vec<Value> = orders
+                .into_iter()
+                .map(|order| {
+                    json!({
+                        "orderId": order.id,
+                        "orderLinkId": order.request.client_order_id.clone().unwrap_or_default(),
+                        "symbol": order.request.symbol,
+                        "price": order.request.price.map(decimal_to_string).unwrap_or_else(|| "0".into()),
+                        "qty": decimal_to_string(order.request.quantity),
+                        "side": map_side(order.request.side),
+                        "orderStatus": map_order_status(order.status),
+                        "orderType": map_order_type(order.request.order_type),
+                        "triggerPrice": order.request.trigger_price.map(decimal_to_string),
+                        "cumExecQty": decimal_to_string(order.filled_quantity),
+                        "avgPrice": order
+                            .avg_fill_price
+                            .map(decimal_to_string)
+                            .unwrap_or_else(|| "0".into()),
+                        "createdTime": order.created_at.timestamp_millis().to_string(),
+                        "updatedTime": order.updated_at.timestamp_millis().to_string(),
+                    })
+                })
+                .collect();
+            ok_response(json!({ "list": list }))
         }
         Err(err) => bad_request(err.to_string()),
     }

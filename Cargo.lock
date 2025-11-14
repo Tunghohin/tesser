@@ -2116,6 +2116,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "tempfile",
  "tesser-backtester",
  "tesser-broker",
  "tesser-bybit",

@@ -200,6 +200,23 @@ impl AccountState {
         self.positions.values().cloned().collect()
     }
 
+    pub fn open_orders_snapshot(&self, symbol: Option<&str>) -> Vec<Order> {
+        self.orders
+            .values()
+            .filter(|order| {
+                let active = !matches!(
+                    order.status,
+                    OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected
+                );
+                let symbol_matches = symbol
+                    .map(|value| order.request.symbol == value)
+                    .unwrap_or(true);
+                active && symbol_matches
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn executions_in_range(
         &self,
         start: DateTime<Utc>,
@@ -527,6 +544,11 @@ impl MockExchangeState {
 
     pub async fn account_positions(&self, api_key: &str) -> Result<Vec<Position>> {
         self.with_account(api_key, |account| Ok(account.positions_snapshot()))
+            .await
+    }
+
+    pub async fn open_orders(&self, api_key: &str, symbol: Option<&str>) -> Result<Vec<Order>> {
+        self.with_account(api_key, |account| Ok(account.open_orders_snapshot(symbol)))
             .await
     }
 

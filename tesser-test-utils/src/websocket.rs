@@ -14,7 +14,6 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::warn;
-use uuid::Uuid;
 
 use tesser_core::Side;
 
@@ -241,15 +240,15 @@ async fn stream_trades(
         }
         let payload = json!({
             "topic": topic,
+            "_topic": topic,
             "type": "snapshot",
             "ts": tick.exchange_timestamp.timestamp_millis(),
             "data": [{
-                "tradeId": Uuid::new_v4().to_string(),
-                "symbol": tick.symbol,
-                "side": match tick.side { Side::Buy => "Buy", Side::Sell => "Sell" },
-                "price": decimal_to_string(tick.price),
-                "size": decimal_to_string(tick.size),
-                "tradeTimeMs": tick.exchange_timestamp.timestamp_millis(),
+                "T": tick.exchange_timestamp.timestamp_millis(),
+                "s": tick.symbol,
+                "S": match tick.side { Side::Buy => "Buy", Side::Sell => "Sell" },
+                "v": decimal_to_string(tick.size),
+                "p": decimal_to_string(tick.price),
             }]
         });
         if tx.send(Message::Text(payload.to_string())).is_err() {
@@ -272,21 +271,20 @@ async fn stream_klines(
         }
         let payload = json!({
             "topic": topic,
+            "_topic": topic,
             "type": "snapshot",
             "ts": candle.timestamp.timestamp_millis(),
             "data": [{
-                "symbol": candle.symbol,
+                "_start": candle.timestamp.timestamp_millis(),
+                "_end": candle.timestamp.timestamp_millis(),
                 "interval": interval,
-                "start": candle.timestamp.timestamp_millis().to_string(),
-                "end": candle.timestamp.timestamp_millis().to_string(),
                 "open": decimal_to_string(candle.open),
                 "high": decimal_to_string(candle.high),
                 "low": decimal_to_string(candle.low),
                 "close": decimal_to_string(candle.close),
                 "volume": decimal_to_string(candle.volume),
-                "turnover": "0",
                 "confirm": true,
-                "timestamp": candle.timestamp.timestamp_millis().to_string(),
+                "timestamp": candle.timestamp.timestamp_millis(),
             }]
         });
         if tx.send(Message::Text(payload.to_string())).is_err() {
@@ -306,6 +304,7 @@ async fn send_orderbook_snapshot(
     let asks = vec![["10001".to_string(), "1".to_string()]];
     let payload = json!({
         "topic": topic,
+        "_topic": topic,
         "type": "snapshot",
         "ts": Utc::now().timestamp_millis(),
         "data": {
