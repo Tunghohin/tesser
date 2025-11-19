@@ -1,7 +1,11 @@
 import Link from 'next/link';
 import { ArrowRight, BarChart3, ShieldCheck, Zap, Layers, Cpu, Globe } from 'lucide-react';
+import { getWorkspaceVersion } from '@/lib/version';
 
 export default function HomePage() {
+  const version = getWorkspaceVersion();
+  const releaseLabel = `v${version} Stable Release`;
+
   return (
     <main className="flex flex-col min-h-screen bg-white dark:bg-black transition-colors duration-300">
       {/* Hero Section */}
@@ -10,7 +14,7 @@ export default function HomePage() {
           {/* Badge */}
           <div className="inline-flex items-center gap-2 rounded-full border border-zinc-200 bg-zinc-50/80 px-3 py-1 text-sm text-zinc-600 mb-8 backdrop-blur-sm dark:border-zinc-800 dark:bg-zinc-900/50 dark:text-zinc-400">
             <span className="flex h-2 w-2 rounded-full bg-green-500 animate-pulse"></span>
-            v0.2.3 Stable Release
+            {releaseLabel}
           </div>
           
           {/* Headline */}

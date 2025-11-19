@@ -1,4 +1,5 @@
 import Image from 'next/image';
+import Link from 'next/link';
 import type { BaseLayoutProps } from 'fumadocs-ui/layouts/shared';
 import { SITE_NAME } from './metadata';
 
@@ -7,6 +8,14 @@ export function baseOptions(): BaseLayoutProps {
     nav: {
       title: <NavLogo />,
       url: '/',
+      children: (
+        <Link
+          href="/docs"
+          className="hidden text-sm font-medium text-fd-muted-foreground ring-offset-background transition-colors hover:text-fd-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fd-primary focus-visible:ring-offset-2 md:inline-flex"
+        >
+          Docs
+        </Link>
+      ),
     },
     themeSwitch: {
       enabled: true,
