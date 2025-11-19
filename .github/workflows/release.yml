@@ -19,15 +19,6 @@ on:
           # Promote pre-release to official (e.g., 1.0.0-rc.1 -> 1.0.0)
           - release
         default: patch
-      rerun_release:
-        description: 'Reuse an existing tag (skip version bump)'
-        required: true
-        type: boolean
-        default: false
-      existing_tag:
-        description: 'Existing tag (required when rerun_release=true)'
-        required: false
-        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,7 +29,7 @@ jobs:
   check-dry-run:
     name: Verify and Dry Run
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event.inputs.rerun_release != 'true'
+    if: github.ref == 'refs/heads/main'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -61,7 +52,6 @@ jobs:
   # 2. State Mutation Phase
   tag-and-push:
     name: Bump Version and Tag
-    if: github.event.inputs.rerun_release != 'true'
     needs: check-dry-run
     runs-on: ubuntu-latest
     permissions:
@@ -136,60 +126,11 @@ jobs:
       - name: Push changes
         run: git push origin HEAD:refs/heads/main --tags
 
-  reuse-tag:
-    name: Reuse Existing Tag
-    if: github.event.inputs.rerun_release == 'true'
-    runs-on: ubuntu-latest
-    outputs:
-      tag_name: ${{ steps.emit.outputs.tag_name }}
-      is_prerelease: ${{ steps.emit.outputs.is_prerelease }}
-      changelog: ${{ steps.changelog.outputs.body }}
-    steps:
-      - name: Validate inputs
-        run: |
-          if [ -z "${{ github.event.inputs.existing_tag }}" ]; then
-            echo "::error::existing_tag is required when rerun_release=true"
-            exit 1
-          fi
-      - name: Checkout existing tag
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.inputs.existing_tag }}
-      - name: Emit tag metadata
-        id: emit
-        run: |
-          TAG="${{ github.event.inputs.existing_tag }}"
-          VERSION="${TAG#v}"
-          if [[ "$VERSION" == "$TAG" ]]; then
-            echo "::error::existing_tag must begin with 'v'"
-            exit 1
-          fi
-          if [[ "$VERSION" == *"-"* ]]; then
-            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
-          fi
-          echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
-      - name: Regenerate changelog
-        id: changelog
-        run: |
-          git-cliff --latest --strip all > RELEASE_NOTES.md
-          {
-            echo 'body<<EOF'
-            cat RELEASE_NOTES.md
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
-
   # 3. Build Phase
   build-artifacts:
     name: Build Artifacts
-    needs:
-      - tag-and-push
-      - reuse-tag
+    needs: tag-and-push
     runs-on: ${{ matrix.os }}
-    env:
-      RELEASE_TAG: ${{ needs.tag-and-push.outputs.tag_name || needs.reuse-tag.outputs.tag_name }}
     strategy:
       fail-fast: true
       matrix:
@@ -210,7 +151,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.tag-and-push.outputs.tag_name }}
 
       - name: Install musl-tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -234,7 +175,7 @@ jobs:
             CLI_NAME="${{ env.PACKAGE_NAME }}.exe"
           fi
           
-          ARTIFACT_NAME="${{ env.PACKAGE_NAME }}-${{ env.RELEASE_TAG }}-${{ matrix.target }}"
+          ARTIFACT_NAME="${{ env.PACKAGE_NAME }}-${{ needs.tag-and-push.outputs.tag_name }}-${{ matrix.target }}"
           mkdir -p "$ARTIFACT_NAME"
           
           cp "target/${{ matrix.target }}/release/${CLI_NAME}" "$ARTIFACT_NAME/"
@@ -259,22 +200,15 @@ jobs:
   # 4. Publication Phase
   publish-final:
     name: Publish to Registry and GitHub
-    needs:
-      - tag-and-push
-      - reuse-tag
-      - build-artifacts
+    needs: [tag-and-push, build-artifacts]
     runs-on: ubuntu-latest
-    env:
-      RELEASE_TAG: ${{ needs.tag-and-push.outputs.tag_name || needs.reuse-tag.outputs.tag_name }}
-      RELEASE_NOTES: ${{ needs.tag-and-push.outputs.changelog || needs.reuse-tag.outputs.changelog }}
-      RELEASE_IS_PRERELEASE: ${{ needs.tag-and-push.outputs.is_prerelease || needs.reuse-tag.outputs.is_prerelease }}
     permissions:
       contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.tag-and-push.outputs.tag_name }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -289,13 +223,13 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: ${{ env.RELEASE_TAG }}
-          body: ${{ env.RELEASE_NOTES }}
+          tag_name: ${{ needs.tag-and-push.outputs.tag_name }}
+          name: ${{ needs.tag-and-push.outputs.tag_name }}
+          body: ${{ needs.tag-and-push.outputs.changelog }}
           files: dist/*
           draft: false
           # Automatically check the "Prerelease" box if it is alpha/beta/rc
-          prerelease: ${{ env.RELEASE_IS_PRERELEASE }}
+          prerelease: ${{ needs.tag-and-push.outputs.is_prerelease }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Compute publish order
