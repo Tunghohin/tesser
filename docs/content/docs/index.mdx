@@ -1,0 +1,29 @@
+---
+title: Introduction
+description: Tesser is a modular, high-performance quantitative trading framework written in Rust.
+---
+
+Tesser addresses the gap between rigid, retail-grade trading bots and expensive, proprietary institutional systems. It provides a flexible foundation for building sophisticated strategies that run reliably 24/7.
+
+## Core Philosophy
+
+1.  **Correctness over Convenience**: Financial software must be reliable. We use `rust_decimal` for all calculations, enforce strict state reconciliation, and use SQLite for durable persistence.
+2.  **Modularity**: The core trading logic (`tesser-strategy`) knows nothing about the exchange (`tesser-bybit`). This allows you to swap execution backends (e.g., from Paper to Binance to Bybit) without rewriting strategies.
+3.  **Observability**: Real-time metrics (Prometheus), structured logging (JSON), and alerting (Webhooks) are first-class citizens, not afterthoughts.
+
+## Key Capabilities
+
+<Cards>
+  <Card title="Live Trading" href="/docs/04-operations/live-trading" icon="Zap">
+    Resilient WebSocket streams, automatic reconnection, and state recovery.
+  </Card>
+  <Card title="Backtesting" href="/docs/04-operations/backtesting" icon="BarChart">
+    Event-driven engine supporting both candle and tick-level granularity.
+  </Card>
+  <Card title="Strategy SDK" href="/docs/03-strategy-lab/writing-strategies" icon="Code">
+    Trait-based API with a suite of high-performance indicators.
+  </Card>
+  <Card title="Risk Engine" href="/docs/04-operations/risk-management" icon="Shield">
+    Pre-trade checks and portfolio-level drawdown protection.
+  </Card>
+</Cards>

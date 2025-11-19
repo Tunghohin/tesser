@@ -1,0 +1,41 @@
+---
+title: Getting Started
+description: How to install Tesser and run your first backtest.
+---
+
+## Prerequisites
+
+- **Rust Toolchain**: Install via [rustup.rs](https://rustup.rs).
+- **Git**: To clone the repository.
+
+## Installation
+
+Clone the repository and build the workspace:
+
+```bash
+git clone https://github.com/tesserspace/tesser.git
+cd tesser
+cargo build --release
+```
+
+## Running Your First Backtest
+
+Tesser comes with sample data and strategies so you can verify your setup immediately.
+
+Run the `SmaCross` strategy against the sample Bitcoin data:
+
+```bash
+cargo run -p tesser-cli -- \
+    backtest run \
+    --strategy-config examples/strategies/sma_cross.toml \
+    --data examples/data/btcusdt_1m_sample.csv \
+    --quantity 0.01
+```
+
+You should see a performance report printed to the console, including Total Return, Sharpe Ratio, and Max Drawdown.
+
+## Next Steps
+
+- Explore the **[Strategy Guide](/docs/03-strategy-lab/writing-strategies)** to write your own logic.
+- Learn how to **[Download Data](/docs/04-operations/data-engineering)** for other symbols.
+- Configure **[Live Trading](/docs/04-operations/live-trading)** when you are ready.
