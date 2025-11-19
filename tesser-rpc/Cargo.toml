@@ -15,15 +15,19 @@ prost-types = "0.12"
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tesser-core.workspace = true
-tesser-strategy.workspace = true
-tesser-strategy-macros.workspace = true
+tesser-core = { version = "0.2.3", path = "../tesser-core" }
+tesser-strategy = { version = "0.2.3", path = "../tesser-strategy" }
+tesser-strategy-macros = { version = "0.2.3", path = "../tesser-strategy-macros" }
 thiserror.workspace = true
 tokio.workspace = true
 tonic = "0.11"
 tracing.workspace = true
 uuid.workspace = true
 toml.workspace = true
+ctor = "0.2"
 
 [build-dependencies]
 tonic-build = "0.11"
+
+[dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }

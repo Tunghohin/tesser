@@ -1,31 +1,29 @@
-use async_trait::async_trait;
-use anyhow::Result;
 use crate::proto::{
-    InitRequest, InitResponse, TickRequest, CandleRequest, 
-    SignalList, OrderBookRequest, FillRequest
+    CandleRequest, FillRequest, InitRequest, InitResponse, OrderBookRequest, SignalList,
+    TickRequest,
 };
+use anyhow::Result;
 
 /// Transport-agnostic interface for communicating with external strategies.
-/// 
+///
 /// This allows swapping gRPC for Shared Memory, ZeroMQ, or other transports
 /// without changing the core RpcStrategy logic.
-#[async_trait]
 pub trait RemoteStrategyClient: Send + Sync {
     /// Establishes the connection to the remote strategy.
-    async fn connect(&mut self) -> Result<()>;
-    
+    fn connect(&mut self) -> Result<()>;
+
     /// Performs the initial handshake and configuration.
-    async fn initialize(&mut self, req: InitRequest) -> Result<InitResponse>;
+    fn initialize(&mut self, req: InitRequest) -> Result<InitResponse>;
 
     /// Pushes a tick event.
-    async fn on_tick(&self, req: TickRequest) -> Result<SignalList>;
-    
+    fn on_tick(&mut self, req: TickRequest) -> Result<SignalList>;
+
     /// Pushes a candle event.
-    async fn on_candle(&self, req: CandleRequest) -> Result<SignalList>;
-    
+    fn on_candle(&mut self, req: CandleRequest) -> Result<SignalList>;
+
     /// Pushes an order book snapshot.
-    async fn on_order_book(&self, req: OrderBookRequest) -> Result<SignalList>;
-    
+    fn on_order_book(&mut self, req: OrderBookRequest) -> Result<SignalList>;
+
     /// Pushes an execution fill.
-    async fn on_fill(&self, req: FillRequest) -> Result<SignalList>;
+    fn on_fill(&mut self, req: FillRequest) -> Result<SignalList>;
 }
