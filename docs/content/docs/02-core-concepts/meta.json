@@ -2,6 +2,8 @@
   "title": "Core Concepts",
   "pages": [
     "architecture",
+    "financial-concepts",
+    "market-microstructure", 
     "event-loop",
     "exchange-abstraction"
   ]

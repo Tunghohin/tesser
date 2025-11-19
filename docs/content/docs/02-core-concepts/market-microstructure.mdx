@@ -1,0 +1,189 @@
+---
+title: Deep Dive: Microstructure
+description: Understanding the internal mechanics of exchanges and quant systems.
+---
+
+This page bridges the gap between "using an API" and "understanding the machine." Before you dive into heavy academic textbooks, this guide explains the computer science behind financial markets.
+---
+title: Deep Dive: Microstructure
+description: Understanding the internal mechanics of exchanges and quant systems.
+---
+
+This page bridges the gap between "using an API" and "understanding the machine." Before you dive into heavy academic textbooks, this guide explains the computer science behind financial markets.
+
+## 1. The Exchange Matching Engine
+
+To a developer, an exchange is essentially a massive, high-concurrency **State Machine**.
+
+### Price-Time Priority (FIFO)
+Most modern crypto and equity exchanges use a **Central Limit Order Book (CLOB)** with a matching algorithm based on Price-Time Priority.
+
+1.  **Price Priority**: Better prices execute first. (Highest Buy, Lowest Sell).
+2.  **Time Priority**: If prices are equal, the order that arrived *first* executes first.
+
+<Callout title="Developer Analogy">
+  Think of the Order Book as two `PriorityQueues`.
+  *   **Bids (Buys)**: Max-Heap (sorted by Price DESC, Time ASC).
+  *   **Asks (Sells)**: Min-Heap (sorted by Price ASC, Time ASC).
+  
+  When you send a Market Order, you are `pop()`ing items off the opposing queue. When you send a Limit Order, you are `push()`ing an item into a queue.
+</Callout>
+
+### Latency & Colocation
+Since Time Priority determines who gets the fill, **Speed is Alpha**.
+*   **Network Latency**: Time from your server to the exchange gateway. Institutional HFT firms put servers in the same data center as the exchange (**Colocation**).
+*   **Internal Latency**: Time for the exchange to process the TCP packet and update the Matching Engine.
+
+## 2. Order Types & Visibility
+
+Beyond simple Market/Limit orders, execution logic can be complex.
+
+### Iceberg Orders
+Large orders hidden from the public order book.
+*   **Mechanism**: A trader wants to buy 100 BTC but only shows 1 BTC at a time. As soon as the visible 1 BTC is filled, the matching engine automatically refills it from the hidden reserve.
+*   **Why**: To prevent "Market Impact" (scaring other traders away).
+*   **Tesser Support**: `tesser-execution` supports simulated Icebergs via the `ExecutionAlgorithm` trait.
+
+### Post-Only
+A limit order that is guaranteed to be a **Maker**.
+*   **Mechanism**: If the order would execute immediately (crossing the spread), the exchange **rejects** it or adjusts its price instead of filling it as a Taker.
+*   **Why**: To ensure you earn the Maker Rebate (negative fee) and don't pay Taker fees.
+
+## 3. Execution Algorithms (Smart Routing)
+
+When moving large size, you don't just dump it. You use algorithms to slice it up.
+
+### TWAP (Time-Weighted Average Price)
+*   **Logic**: "Buy 10 BTC over the next hour." -> "Buy 0.16 BTC every minute."
+*   **Goal**: Minimize impact, achieve the average price of the time window.
+
+### VWAP (Volume-Weighted Average Price)
+*   **Logic**: "Buy proportionally to how much everyone else is trading." If the market is quiet, trade less. If volume spikes, trade more.
+*   **Goal**: Hide your tracks inside the crowd.
+
+## 4. Quant Strategy Classifications
+
+Strategies generally fall into mathematical categories.
+
+### Mean Reversion
+*   **Premise**: "Prices fluctuate but eventually return to an average."
+*   **Signal**: Price is 2 Standard Deviations above the Moving Average -> Sell.
+*   **Indicators**: RSI, Bollinger Bands.
+
+### Trend Following (Momentum)
+*   **Premise**: "Newton's Law: Objects in motion stay in motion."
+*   **Signal**: Short-term average crosses above Long-term average -> Buy.
+*   **Indicators**: SMA Cross, MACD.
+
+### Statistical Arbitrage (Stat Arb)
+*   **Premise**: "Asset A and Asset B usually move together. Currently, they are divergent."
+*   **Action**: Long the underperformer, Short the overperformer.
+*   **Tesser Example**: The `PairsTrading` strategy implements this using cointegration concepts.
+
+## 5. Risk Metrics (The Math of Survival)
+
+### Sharpe Ratio
+*   **Formula**: `(Return - RiskFreeRate) / StandardDeviation`
+*   **Meaning**: How much return are you getting per unit of risk? A high return with wild volatility (low Sharpe) is often worse than a moderate return with smooth curves (high Sharpe).
+
+### Kelly Criterion
+*   **Purpose**: Position Sizing. "How much of my bankroll should I bet?"
+*   **Concept**: There is an optimal bet size that maximizes geometric growth. Bet too little, you grow slow. Bet too much, you go bust (Gambler's Ruin).
+
+---
+
+### Recommended "Textbook" Path
+
+If you are still hungry after reading this and using Tesser, here is the sequence to go deeper:
+
+1.  **Market Microstructure**: *Trading and Exchanges* by Larry Harris. (The bible of how exchanges work).
+2.  **Active Portfolio Management**: *Active Portfolio Management* by Grinold & Kahn. (The bible of quant factors).
+3.  **Machine Learning**: *Advances in Financial Machine Learning* by Marcos Lopez de Prado. (Modern, difficult, but essential for ML).
+## 1. The Exchange Matching Engine
+
+To a developer, an exchange is essentially a massive, high-concurrency **State Machine**.
+
+### Price-Time Priority (FIFO)
+Most modern crypto and equity exchanges use a **Central Limit Order Book (CLOB)** with a matching algorithm based on Price-Time Priority.
+
+1.  **Price Priority**: Better prices execute first. (Highest Buy, Lowest Sell).
+2.  **Time Priority**: If prices are equal, the order that arrived *first* executes first.
+
+<Callout title="Developer Analogy">
+  Think of the Order Book as two `PriorityQueues`.
+  *   **Bids (Buys)**: Max-Heap (sorted by Price DESC, Time ASC).
+  *   **Asks (Sells)**: Min-Heap (sorted by Price ASC, Time ASC).
+  
+  When you send a Market Order, you are `pop()`ing items off the opposing queue. When you send a Limit Order, you are `push()`ing an item into a queue.
+</Callout>
+
+### Latency & Colocation
+Since Time Priority determines who gets the fill, **Speed is Alpha**.
+*   **Network Latency**: Time from your server to the exchange gateway. Institutional HFT firms put servers in the same data center as the exchange (**Colocation**).
+*   **Internal Latency**: Time for the exchange to process the TCP packet and update the Matching Engine.
+
+## 2. Order Types & Visibility
+
+Beyond simple Market/Limit orders, execution logic can be complex.
+
+### Iceberg Orders
+Large orders hidden from the public order book.
+*   **Mechanism**: A trader wants to buy 100 BTC but only shows 1 BTC at a time. As soon as the visible 1 BTC is filled, the matching engine automatically refills it from the hidden reserve.
+*   **Why**: To prevent "Market Impact" (scaring other traders away).
+*   **Tesser Support**: `tesser-execution` supports simulated Icebergs via the `ExecutionAlgorithm` trait.
+
+### Post-Only
+A limit order that is guaranteed to be a **Maker**.
+*   **Mechanism**: If the order would execute immediately (crossing the spread), the exchange **rejects** it or adjusts its price instead of filling it as a Taker.
+*   **Why**: To ensure you earn the Maker Rebate (negative fee) and don't pay Taker fees.
+
+## 3. Execution Algorithms (Smart Routing)
+
+When moving large size, you don't just dump it. You use algorithms to slice it up.
+
+### TWAP (Time-Weighted Average Price)
+*   **Logic**: "Buy 10 BTC over the next hour." -> "Buy 0.16 BTC every minute."
+*   **Goal**: Minimize impact, achieve the average price of the time window.
+
+### VWAP (Volume-Weighted Average Price)
+*   **Logic**: "Buy proportionally to how much everyone else is trading." If the market is quiet, trade less. If volume spikes, trade more.
+*   **Goal**: Hide your tracks inside the crowd.
+
+## 4. Quant Strategy Classifications
+
+Strategies generally fall into mathematical categories.
+
+### Mean Reversion
+*   **Premise**: "Prices fluctuate but eventually return to an average."
+*   **Signal**: Price is 2 Standard Deviations above the Moving Average -> Sell.
+*   **Indicators**: RSI, Bollinger Bands.
+
+### Trend Following (Momentum)
+*   **Premise**: "Newton's Law: Objects in motion stay in motion."
+*   **Signal**: Short-term average crosses above Long-term average -> Buy.
+*   **Indicators**: SMA Cross, MACD.
+
+### Statistical Arbitrage (Stat Arb)
+*   **Premise**: "Asset A and Asset B usually move together. Currently, they are divergent."
+*   **Action**: Long the underperformer, Short the overperformer.
+*   **Tesser Example**: The `PairsTrading` strategy implements this using cointegration concepts.
+
+## 5. Risk Metrics (The Math of Survival)
+
+### Sharpe Ratio
+*   **Formula**: `(Return - RiskFreeRate) / StandardDeviation`
+*   **Meaning**: How much return are you getting per unit of risk? A high return with wild volatility (low Sharpe) is often worse than a moderate return with smooth curves (high Sharpe).
+
+### Kelly Criterion
+*   **Purpose**: Position Sizing. "How much of my bankroll should I bet?"
+*   **Concept**: There is an optimal bet size that maximizes geometric growth. Bet too little, you grow slow. Bet too much, you go bust (Gambler's Ruin).
+
+---
+
+### Recommended "Textbook" Path
+
+If you are still hungry after reading this and using Tesser, here is the sequence to go deeper:
+
+1.  **Market Microstructure**: *Trading and Exchanges* by Larry Harris. (The bible of how exchanges work).
+2.  **Active Portfolio Management**: *Active Portfolio Management* by Grinold & Kahn. (The bible of quant factors).
+3.  **Machine Learning**: *Advances in Financial Machine Learning* by Marcos Lopez de Prado. (Modern, difficult, but essential for ML).

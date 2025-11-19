@@ -1,0 +1,89 @@
+---
+title: Financial Concepts
+description: A pragmatic glossary mapping trading terminology to Tesser code structures.
+---
+
+If you are a developer coming from a non-finance background, the terminology can be overwhelming. 
+
+**Don't panic.** You don't need a PhD in Finance to run a bot. 
+
+<Callout type="info" title="Learning Advice">
+  **Avoid "Systematic Learning" traps.** Trading knowledge is a bottomless pit. Do not try to read textbooks from cover to cover before writing code.
+  
+  Instead, treat this page as a mapping layer: **Financial Term <-> Rust Type**. Learn only what you need to implement the specific logic you are working on. If you get stuck, ask an AI: *"Explain [Term] in the context of a crypto perpetual futures trading bot."*
+</Callout>
+
+## Market Data (The Inputs)
+
+These concepts map directly to types in `tesser-core` and `tesser-data`.
+
+### Order Book (L2 Data)
+A real-time list of buy and sell orders organized by price level.
+*   **Bids**: Buyers wanting to buy low.
+*   **Asks**: Sellers wanting to sell high.
+*   **Spread**: The gap between the highest Bid and the lowest Ask.
+*   **Tesser Type**: `OrderBook`, `OrderBookLevel`.
+
+### Tick
+An individual trade that happened on the exchange. It tells you the "truth" of what price was actually transacted.
+*   **Tesser Type**: `Tick` (contains price, size, side, timestamp).
+
+### OHLCV (Candles/Klines)
+Aggregated data. Instead of streaming millions of ticks, we group them into time buckets (e.g., 1 minute).
+*   **Open/High/Low/Close**: The price movement within that time window.
+*   **Volume**: How much asset was traded.
+*   **Tesser Type**: `Candle`.
+
+## Execution (The Actions)
+
+These concepts map to `tesser-execution` and `tesser-broker`.
+
+### Maker vs. Taker
+*   **Maker (Passive)**: You place a Limit Order that doesn't fill immediately. It sits in the order book, providing liquidity. usually pays lower fees (or gets a rebate).
+*   **Taker (Aggressive)**: You place an order (Market or Limit) that fills immediately against an existing order. You "take" liquidity and pay higher fees.
+*   **Tesser Logic**: If you use `OrderType::Limit` inside the spread, you are a Maker. If you use `OrderType::Market`, you are a Taker.
+
+### Slippage
+The difference between the price you *expected* to get and the price you *actually* got.
+*   **Cause**: In the milliseconds it takes your order to reach the exchange, prices moved; or your order was too big for the available liquidity at the top of the book.
+*   **Tesser Context**: Configured in `BacktestConfig` via `slippage_bps` to simulate this cost realistically.
+
+### Time in Force (TIF)
+Instructions on how long an order should remain active.
+*   **GTC (Good Til Canceled)**: Stays open until filled or you cancel it. (Default).
+*   **IOC (Immediate Or Cancel)**: Fill what you can immediately, cancel the rest.
+*   **FOK (Fill Or Kill)**: Fill the entire order immediately or cancel the whole thing.
+*   **Tesser Type**: `TimeInForce` enum.
+
+## Portfolio & Risk (The State)
+
+These concepts map to `tesser-portfolio`.
+
+### Long vs. Short
+*   **Long**: You buy expecting the price to go up. `Position.quantity` is positive.
+*   **Short**: You sell (borrowed asset) expecting price to go down. `Position.quantity` is negative (in Tesser's internal accounting).
+*   **Tesser Type**: `Side::Buy` (Long entry/Short exit) vs `Side::Sell` (Short entry/Long exit).
+
+### PnL (Profit and Loss)
+*   **Unrealized PnL**: "Paper profits". The value of your open position if you were to close it right now at the market price.
+*   **Realized PnL**: Actual money made or lost after closing a position.
+*   **Tesser Context**: The `Portfolio` struct tracks `unrealized_pnl` on every tick update.
+
+### Drawdown
+The percentage drop from the highest point (Peak Equity) your portfolio has ever reached.
+*   **Why it matters**: Deep drawdowns are hard to recover from (a 50% loss requires a 100% gain to break even).
+*   **Tesser Context**: `risk_max_drawdown` in config triggers "Liquidate Only" mode to stop a bleeding strategy.
+
+## Derivatives Specifics
+
+Since Tesser defaults to Bybit Linear Perpetuals (Crypto Futures), these are crucial:
+
+### Perpetual Contract
+A future contract that never expires. To keep the price tethered to the spot price, exchanges use a **Funding Rate**.
+*   **Positive Funding**: Longs pay Shorts.
+*   **Negative Funding**: Shorts pay Longs.
+
+### Margin
+The collateral (usually USDT) you put up to open a position. 
+*   **Leverage**: Using borrowed money. If you have 100 USDT and open a 1000 USDT position, you are at 10x leverage.
+*   **Liquidation**: If your margin isn't enough to cover Unrealized PnL losses, the exchange forcibly closes your position and takes your collateral.
