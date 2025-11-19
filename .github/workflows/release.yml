@@ -20,9 +20,11 @@ jobs:
   prepare-release:
     name: Prepare release artifacts
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
     outputs:
       tag_name: ${{ steps.tag.outputs.tag_name }}
-      checkout_ref: ${{ steps.tag.outputs.checkout_ref }}
       changelog: ${{ steps.changelog.outputs.body }}
     steps:
       - name: Checkout repository
@@ -34,9 +36,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install release tooling
-        run: |
-          cargo install cargo-release --locked
-          cargo install git-cliff --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-release, git-cliff
 
       - name: Configure Git author
         run: |
@@ -49,14 +51,9 @@ jobs:
       - name: Determine tag name
         id: tag
         run: |
-          TAG=$(bash .github/scripts/get_release_tag.sh)
-          if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
-            CHECKOUT_REF="$TAG"
-          else
-            CHECKOUT_REF=$(git rev-parse HEAD)
-          fi
+          TAG=$(git describe --tags --abbrev=0)
           echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
-          echo "checkout_ref=$CHECKOUT_REF" >> "$GITHUB_OUTPUT"
+          echo "Detected tag: $TAG"
 
       - name: Generate release notes
         id: changelog
@@ -71,34 +68,12 @@ jobs:
       - name: Push release commit and tag
         run: git push origin HEAD --follow-tags
 
-  create-github-release:
-    name: Create draft release
-    runs-on: ubuntu-latest
-    needs: prepare-release
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      release_id: ${{ steps.create_release.outputs.id }}
-    permissions:
-      contents: write
-    steps:
-      - name: Create GitHub release draft
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ needs.prepare-release.outputs.tag_name }}
-          release_name: ${{ needs.prepare-release.outputs.tag_name }}
-          body: ${{ needs.prepare-release.outputs.changelog }}
-          draft: true
-          prerelease: false
-
   build-and-upload:
     name: Build and upload binaries
     runs-on: ${{ matrix.os }}
-    needs:
-      - prepare-release
-      - create-github-release
+    needs: prepare-release
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -119,7 +94,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare-release.outputs.checkout_ref }}
+          ref: ${{ needs.prepare-release.outputs.tag_name }}
+
+      - name: Install musl-tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -137,41 +116,41 @@ jobs:
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             CLI_NAME="tesser-cli.exe"
           fi
+          
           ARTIFACT_NAME="tesser-cli-${{ needs.prepare-release.outputs.tag_name }}-${{ matrix.target }}"
-          ARTIFACT_DIR="$ARTIFACT_NAME"
-          mkdir -p "$ARTIFACT_DIR"
-          cp "target/${{ matrix.target }}/release/${CLI_NAME}" "$ARTIFACT_DIR/"
+          mkdir -p "$ARTIFACT_NAME"
+          cp "target/${{ matrix.target }}/release/${CLI_NAME}" "$ARTIFACT_NAME/"
+          
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
             ARCHIVE_PATH="${ARTIFACT_NAME}.zip"
-            7z a "$ARCHIVE_PATH" "./$ARTIFACT_DIR/*" >/dev/null
+            7z a "$ARCHIVE_PATH" "./$ARTIFACT_NAME/*" >/dev/null
           else
             ARCHIVE_PATH="${ARTIFACT_NAME}.tar.gz"
-            tar -czf "$ARCHIVE_PATH" -C "$ARTIFACT_DIR" .
+            tar -czf "$ARCHIVE_PATH" -C "$ARTIFACT_NAME" .
           fi
+          
           echo "ASSET_PATH=$ARCHIVE_PATH" >> "$GITHUB_ENV"
-          echo "ASSET_NAME=$ARCHIVE_PATH" >> "$GITHUB_ENV"
 
       - name: Upload release asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v1
         with:
-          upload_url: ${{ needs.create-github-release.outputs.upload_url }}
-          asset_path: ${{ env.ASSET_PATH }}
-          asset_name: ${{ env.ASSET_NAME }}
-          asset_content_type: application/octet-stream
+          tag_name: ${{ needs.prepare-release.outputs.tag_name }}
+          name: ${{ needs.prepare-release.outputs.tag_name }}
+          body: ${{ needs.prepare-release.outputs.changelog }}
+          files: ${{ env.ASSET_PATH }}
+          draft: true
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   publish-crates:
     name: Publish crates.io packages
     runs-on: ubuntu-latest
-    needs:
-      - prepare-release
-      - create-github-release
+    needs: prepare-release
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare-release.outputs.checkout_ref }}
+          ref: ${{ needs.prepare-release.outputs.tag_name }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -209,18 +188,13 @@ jobs:
     needs:
       - build-and-upload
       - publish-crates
-      - create-github-release
+      - prepare-release
     permissions:
       contents: write
     steps:
-      - name: Publish draft release
-        uses: actions/github-script@v7
+      - name: Make release public
+        uses: softprops/action-gh-release@v1
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            await github.rest.repos.updateRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              release_id: ${{ needs.create-github-release.outputs.release_id }},
-              draft: false
-            });
+          tag_name: ${{ needs.prepare-release.outputs.tag_name }}
+          draft: false
+          token: ${{ secrets.GITHUB_TOKEN }}
