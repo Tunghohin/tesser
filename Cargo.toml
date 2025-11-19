@@ -81,4 +81,4 @@ pre-release-commit-message = "chore(release): v{{version}}"
 tag-message = "chore(release): v{{version}}"
 publish = false
 push = false
-dependent-version = "workspace"
+dependent-version = "upgrade"
