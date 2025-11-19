@@ -1,13 +1,42 @@
 ---
-title: Hello World
-description: Your first document
+title: Overview
+description: Understand the goals of the Tesser trading framework and how the pieces fit together.
 ---
 
-Welcome to the docs! You can start writing documents in `/content/docs`.
+Tesser is a Rust-native trading framework that bundles everything required to run systematic strategies.
 
-## What is Next?
+- **CLI** – orchestrates data downloads, backtests, live sessions, and persistence.
+- **Strategy SDK** – traits, macros, and helper crates so you can focus on signals, not plumbing.
+- **Execution + Portfolio** – risk-aware order routing, PnL tracking, drawdown guardrails, and alerting.
+
+The documentation is served from [`tesser.space/docs`](https://tesser.space/docs) in production.
+
+## Architecture
+
+| Component | Purpose |
+| --- | --- |
+| `tesser-cli` | User-facing interface for running backtests and live sessions. |
+| `tesser` facade | Re-exports the ecosystem and provides `run_cli()` so your own crate can host the CLI. |
+| `tesser-strategy` | Strategy traits, context helpers, and built-in reference bots. |
+| Connectors | Exchange adapters (Bybit, Paper, etc.) that plug into the orchestrator. |
+
+## Durable Live Trading
+
+- Strategies persist custom state through `snapshot()` / `restore()`.
+- Live runtime snapshots portfolio state, open orders, and strategy blobs to SQLite.
+- Alerting hooks ensure drawdowns or connectivity issues raise notifications immediately.
+
+```bash
+# Inspect registered strategies
+cargo run --bin tesser-cli -- strategies
+
+# Start a live session from the CLI
+tesser -- live run --strategy-config config/strategies/example.toml
+```
+
+## Choose Your Adventure
 
 <Cards>
-  <Card title="Learn more about Next.js" href="https://nextjs.org/docs" />
-  <Card title="Learn more about Fumadocs" href="https://fumadocs.dev" />
+  <Card title="Getting Started" href="/docs/getting-started" />
+  <Card title="GitHub Repository" href="https://github.com/tesserspace/tesser" />
 </Cards>
