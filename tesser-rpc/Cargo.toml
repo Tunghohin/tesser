@@ -25,6 +25,7 @@ tracing.workspace = true
 uuid.workspace = true
 toml.workspace = true
 ctor = "0.2"
+url = "2.5"
 
 [build-dependencies]
 tonic-build = "0.11"
