@@ -1,10 +1,16 @@
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tesser_core::{Candle, Fill, OrderBook, Signal, Symbol, Tick};
 use tesser_strategy::{
     register_strategy, Strategy, StrategyContext, StrategyError, StrategyResult,
 };
-use tracing::{error, info};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinHandle;
+use tokio::time::{interval, MissedTickBehavior};
+use tracing::{error, info, warn};
 
 use crate::client::RemoteStrategyClient;
 use crate::proto::{CandleRequest, FillRequest, InitRequest, OrderBookRequest, TickRequest};
@@ -26,14 +32,23 @@ fn default_timeout_ms() -> u64 {
     500
 }
 
+type SharedClient = Arc<AsyncMutex<Box<dyn RemoteStrategyClient>>>;
+
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(5_000);
+const MAX_HEARTBEAT_FAILURES: u32 = 3;
+
 /// A strategy adapter that delegates decision making to an external service via a pluggable transport.
 pub struct RpcStrategy {
-    client: Option<Box<dyn RemoteStrategyClient>>,
+    client: Option<SharedClient>,
     transport_config: Option<TransportConfig>,
     config_payload: String,
     subscriptions: Vec<String>,
     pending_signals: Vec<Signal>,
     symbol: String, // Primary symbol fallback
+    health: Arc<AtomicBool>,
+    heartbeat_handle: Option<JoinHandle<()>>,
+    heartbeat_interval: Duration,
+    max_heartbeat_failures: u32,
 }
 
 impl Default for RpcStrategy {
@@ -45,6 +60,10 @@ impl Default for RpcStrategy {
             subscriptions: vec![],
             pending_signals: vec![],
             symbol: "UNKNOWN".to_string(),
+            health: Arc::new(AtomicBool::new(true)),
+            heartbeat_handle: None,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            max_heartbeat_failures: MAX_HEARTBEAT_FAILURES,
         }
     }
 }
@@ -62,7 +81,69 @@ impl RpcStrategy {
         }
     }
 
-    async fn ensure_client(&mut self) -> StrategyResult<&mut (dyn RemoteStrategyClient + '_)> {
+    fn teardown_client(&mut self) {
+        if let Some(handle) = self.heartbeat_handle.take() {
+            handle.abort();
+        }
+        self.client = None;
+        self.health.store(false, Ordering::Relaxed);
+    }
+
+    fn spawn_heartbeat(&mut self, client: SharedClient) {
+        if let Some(handle) = self.heartbeat_handle.take() {
+            handle.abort();
+        }
+        let interval_duration = self.heartbeat_interval;
+        let max_failures = self.max_heartbeat_failures;
+        let health = self.health.clone();
+        self.heartbeat_handle = Some(tokio::spawn(async move {
+            let mut ticker = interval(interval_duration);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut failures = 0u32;
+            loop {
+                ticker.tick().await;
+                let mut guard = client.lock().await;
+                match guard.heartbeat().await {
+                    Ok(resp) if resp.healthy => {
+                        health.store(true, Ordering::Relaxed);
+                        failures = 0;
+                    }
+                    Ok(resp) => {
+                        warn!(
+                            target: "rpc",
+                            status = %resp.status_msg,
+                            "heartbeat reported unhealthy"
+                        );
+                        failures += 1;
+                        health.store(false, Ordering::Relaxed);
+                    }
+                    Err(err) => {
+                        warn!(target: "rpc", %err, "heartbeat failure");
+                        failures += 1;
+                        health.store(false, Ordering::Relaxed);
+                    }
+                }
+
+                if failures >= max_failures {
+                    error!(
+                        target: "rpc",
+                        failures,
+                        "heartbeat exceeded failure threshold"
+                    );
+                    break;
+                }
+            }
+        }));
+    }
+
+    async fn ensure_client(&mut self) -> StrategyResult<SharedClient> {
+        if let Some(handle) = &self.client {
+            if self.health.load(Ordering::Relaxed) {
+                return Ok(handle.clone());
+            }
+            self.teardown_client();
+        }
+
         if self.client.is_none() {
             let config = self
                 .transport_config
@@ -93,13 +174,17 @@ impl RpcStrategy {
 
             self.apply_remote_metadata(response.symbols);
             info!(target: "rpc", symbols = ?self.subscriptions, "RPC strategy initialized");
-            self.client = Some(client);
+            self.health.store(true, Ordering::Relaxed);
+            let shared = Arc::new(AsyncMutex::new(client));
+            self.spawn_heartbeat(shared.clone());
+            self.client = Some(shared.clone());
+            return Ok(shared);
         }
 
-        match self.client.as_deref_mut() {
-            Some(client) => Ok(client),
-            None => Err(StrategyError::Internal("RPC client not initialized".into())),
-        }
+        self.client
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| StrategyError::Internal("RPC client not initialized".into()))
     }
 
     fn apply_remote_metadata(&mut self, mut symbols: Vec<String>) {
@@ -143,7 +228,7 @@ impl Strategy for RpcStrategy {
         })?;
 
         self.transport_config = Some(config);
-        self.client = None;
+        self.teardown_client();
         self.subscriptions.clear();
         self.symbol = "UNKNOWN".to_string();
         self.pending_signals.clear();
@@ -158,7 +243,8 @@ impl Strategy for RpcStrategy {
         };
 
         let client = self.ensure_client().await?;
-        match client.on_tick(request).await {
+        let mut transport = client.lock().await;
+        match transport.on_tick(request).await {
             Ok(response) => self.handle_signals(response.signals),
             Err(e) => error!("RPC OnTick error: {}", e),
         }
@@ -172,7 +258,8 @@ impl Strategy for RpcStrategy {
         };
 
         let client = self.ensure_client().await?;
-        match client.on_candle(request).await {
+        let mut transport = client.lock().await;
+        match transport.on_candle(request).await {
             Ok(response) => self.handle_signals(response.signals),
             Err(e) => error!("RPC OnCandle error: {}", e),
         }
@@ -186,7 +273,8 @@ impl Strategy for RpcStrategy {
         };
 
         let client = self.ensure_client().await?;
-        match client.on_fill(request).await {
+        let mut transport = client.lock().await;
+        match transport.on_fill(request).await {
             Ok(response) => self.handle_signals(response.signals),
             Err(e) => error!("RPC OnFill error: {}", e),
         }
@@ -204,7 +292,8 @@ impl Strategy for RpcStrategy {
         };
 
         let client = self.ensure_client().await?;
-        match client.on_order_book(request).await {
+        let mut transport = client.lock().await;
+        match transport.on_order_book(request).await {
             Ok(response) => self.handle_signals(response.signals),
             Err(e) => error!("RPC OnOrderBook error: {}", e),
         }
@@ -217,3 +306,9 @@ impl Strategy for RpcStrategy {
 }
 
 register_strategy!(RpcStrategy, "RpcStrategy");
+
+impl Drop for RpcStrategy {
+    fn drop(&mut self) {
+        self.teardown_client();
+    }
+}

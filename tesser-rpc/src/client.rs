@@ -1,6 +1,6 @@
 use crate::proto::{
-    CandleRequest, FillRequest, InitRequest, InitResponse, OrderBookRequest, SignalList,
-    TickRequest,
+    CandleRequest, FillRequest, HeartbeatResponse, InitRequest, InitResponse, OrderBookRequest,
+    SignalList, TickRequest,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -25,4 +25,7 @@ pub trait RemoteStrategyClient: Send + Sync {
 
     /// Pushes an execution fill.
     async fn on_fill(&mut self, req: FillRequest) -> Result<SignalList>;
+
+    /// Heartbeat to verify the remote strategy is still reachable.
+    async fn heartbeat(&mut self) -> Result<HeartbeatResponse>;
 }
