@@ -1,0 +1,27 @@
+---
+title: Architecture
+description: Understanding the crate structure and data flow.
+---
+
+Tesser is designed as a workspace of loosely coupled crates. This enforces separation of concerns and makes the system easier to test.
+
+## Crate Responsibilities
+
+| Crate | Responsibility |
+| :--- | :--- |
+| `tesser-core` | Common types (`Order`, `Trade`, `Candle`) used by everyone. |
+| `tesser-broker` | Traits defining the interface for Exchanges (`ExecutionClient`, `MarketStream`). |
+| `tesser-strategy` | The `Strategy` trait and reference implementations. |
+| `tesser-execution` | The Order Management System (OMS). Handles sizing and routing. |
+| `tesser-portfolio` | The "Accountant". Tracks PnL, positions, and risk limits. |
+| `connectors/*` | Specific exchange implementations (e.g., `tesser-bybit`). |
+
+## Data Flow (Live Trading)
+
+1.  **Market Data**: `tesser-bybit` receives a WebSocket tick.
+2.  **Event Bus**: The tick is published to the internal `EventBus`.
+3.  **Strategy**: The strategy receives the tick, updates indicators, and emits a `Signal`.
+4.  **Execution**: `tesser-execution` receives the `Signal`, calculates order size (Risk Check), and sends an `OrderRequest`.
+5.  **Broker**: `tesser-bybit` signs the request and sends it to the REST API.
+6.  **Feedback**: The exchange sends an execution report via WebSocket private stream.
+7.  **Portfolio**: `tesser-portfolio` receives the `Fill`, updates cash/positions, and recalculates Equity.

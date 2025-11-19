@@ -1,42 +1,29 @@
 ---
-title: Overview
-description: Understand the goals of the Tesser trading framework and how the pieces fit together.
+title: Introduction
+description: Tesser is a modular, high-performance quantitative trading framework written in Rust.
 ---
 
-Tesser is a Rust-native trading framework that bundles everything required to run systematic strategies.
+Tesser addresses the gap between rigid, retail-grade trading bots and expensive, proprietary institutional systems. It provides a flexible foundation for building sophisticated strategies that run reliably 24/7.
 
-- **CLI** – orchestrates data downloads, backtests, live sessions, and persistence.
-- **Strategy SDK** – traits, macros, and helper crates so you can focus on signals, not plumbing.
-- **Execution + Portfolio** – risk-aware order routing, PnL tracking, drawdown guardrails, and alerting.
+## Core Philosophy
 
-The documentation is served from [`tesser.space/docs`](https://tesser.space/docs) in production.
+1.  **Correctness over Convenience**: Financial software must be reliable. We use `rust_decimal` for all calculations, enforce strict state reconciliation, and use SQLite for durable persistence.
+2.  **Modularity**: The core trading logic (`tesser-strategy`) knows nothing about the exchange (`tesser-bybit`). This allows you to swap execution backends (e.g., from Paper to Binance to Bybit) without rewriting strategies.
+3.  **Observability**: Real-time metrics (Prometheus), structured logging (JSON), and alerting (Webhooks) are first-class citizens, not afterthoughts.
 
-## Architecture
-
-| Component | Purpose |
-| --- | --- |
-| `tesser-cli` | User-facing interface for running backtests and live sessions. |
-| `tesser` facade | Re-exports the ecosystem and provides `run_cli()` so your own crate can host the CLI. |
-| `tesser-strategy` | Strategy traits, context helpers, and built-in reference bots. |
-| Connectors | Exchange adapters (Bybit, Paper, etc.) that plug into the orchestrator. |
-
-## Durable Live Trading
-
-- Strategies persist custom state through `snapshot()` / `restore()`.
-- Live runtime snapshots portfolio state, open orders, and strategy blobs to SQLite.
-- Alerting hooks ensure drawdowns or connectivity issues raise notifications immediately.
-
-```bash
-# Inspect registered strategies
-cargo run --bin tesser-cli -- strategies
-
-# Start a live session from the CLI
-tesser -- live run --strategy-config config/strategies/example.toml
-```
-
-## Choose Your Adventure
+## Key Capabilities
 
 <Cards>
-  <Card title="Getting Started" href="/docs/getting-started" />
-  <Card title="GitHub Repository" href="https://github.com/tesserspace/tesser" />
+  <Card title="Live Trading" href="/docs/live-trading" icon="Zap">
+    Resilient WebSocket streams, automatic reconnection, and state recovery.
+  </Card>
+  <Card title="Backtesting" href="/docs/backtesting" icon="BarChart">
+    Event-driven engine supporting both candle and tick-level granularity.
+  </Card>
+  <Card title="Strategy SDK" href="/docs/strategies" icon="Code">
+    Trait-based API with a suite of high-performance indicators.
+  </Card>
+  <Card title="Risk Engine" href="/docs/risk" icon="Shield">
+    Pre-trade checks and portfolio-level drawdown protection.
+  </Card>
 </Cards>
