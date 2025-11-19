@@ -1,178 +1,362 @@
+'use client';
+
 import Link from 'next/link';
-import { ArrowRight, BarChart3, ShieldCheck, Zap, Layers, Cpu, Globe } from 'lucide-react';
-import { getWorkspaceVersion } from '@/lib/version';
+import { useEffect, useState, useRef } from 'react';
+import { 
+  ArrowRight, BarChart3, ShieldCheck, Zap, Layers, Cpu, Globe, 
+  Terminal, Activity, Lock, ChevronRight, Github 
+} from 'lucide-react';
+import { motion, useScroll, useTransform, useInView } from 'framer-motion';
+import { cn } from '@/lib/utils';
 
-export default function HomePage() {
-  const version = getWorkspaceVersion();
-  const releaseLabel = `v${version} Stable Release`;
+// --- Components ---
 
+function HeroSection() {
   return (
-    <main className="flex flex-col min-h-screen bg-white dark:bg-black transition-colors duration-300">
-      {/* Hero Section */}
-      <section className="relative py-24 md:py-32 overflow-hidden border-b border-zinc-200 dark:border-zinc-800">
-        <div className="container mx-auto px-4 text-center z-10 relative">
-          {/* Badge */}
-          <div className="inline-flex items-center gap-2 rounded-full border border-zinc-200 bg-zinc-50/80 px-3 py-1 text-sm text-zinc-600 mb-8 backdrop-blur-sm dark:border-zinc-800 dark:bg-zinc-900/50 dark:text-zinc-400">
-            <span className="flex h-2 w-2 rounded-full bg-green-500 animate-pulse"></span>
-            {releaseLabel}
-          </div>
+    <section className="relative pt-32 pb-20 md:pt-48 md:pb-32 overflow-hidden">
+      <div className="container mx-auto px-4 relative z-10">
+        <div className="flex flex-col items-center text-center">
+          <motion.div 
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.5 }}
+            className="inline-flex items-center gap-2 rounded-full border border-blue-500/20 bg-blue-500/10 px-3 py-1 text-sm text-blue-600 dark:text-blue-400 mb-8 backdrop-blur-md"
+          >
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500"></span>
+            </span>
+            v0.2.3 Stable Release
+          </motion.div>
           
-          {/* Headline */}
-          <h1 className="text-5xl md:text-7xl font-bold tracking-tight text-zinc-900 mb-6 dark:text-transparent dark:bg-clip-text dark:bg-gradient-to-b dark:from-white dark:to-white/60">
-            Institutional-Grade <br />
-            <span className="text-blue-600 dark:text-blue-500">Quantitative Trading</span>
-          </h1>
+          <motion.h1 
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.5, delay: 0.1 }}
+            className="text-5xl md:text-8xl font-bold tracking-tight text-zinc-900 dark:text-white mb-6"
+          >
+            Quantitative Trading <br />
+            <span className="text-transparent bg-clip-text bg-gradient-to-r from-blue-600 to-cyan-500 dark:from-blue-400 dark:to-cyan-300">
+              Reimagined in Rust
+            </span>
+          </motion.h1>
           
-          {/* Subheadline */}
-          <p className="text-lg md:text-xl text-zinc-600 max-w-2xl mx-auto mb-10 leading-relaxed dark:text-zinc-400">
-            Tesser is a Rust-native framework designed for high-frequency reliability. 
-            We decouple execution logic from market connectivity, enabling 
-            <strong className="text-zinc-900 dark:text-zinc-200 font-semibold"> zero-cost abstractions</strong> and 
-            <strong className="text-zinc-900 dark:text-zinc-200 font-semibold"> robust risk management</strong>.
-          </p>
+          <motion.p 
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.5, delay: 0.2 }}
+            className="text-xl text-zinc-600 dark:text-zinc-400 max-w-2xl mx-auto mb-10 leading-relaxed"
+          >
+            The institutional-grade framework for high-frequency reliability.
+            Decoupled architecture, zero-cost abstractions, and robust risk guards.
+          </motion.p>
           
-          {/* CTA Buttons */}
-          <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
+          <motion.div 
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.5, delay: 0.3 }}
+            className="flex flex-col sm:flex-row items-center gap-4"
+          >
             <Link
               href="/docs"
-              className="flex items-center gap-2 rounded-full bg-blue-600 px-8 py-3 text-sm font-semibold text-white hover:bg-blue-700 transition-all shadow-lg shadow-blue-600/20 dark:bg-blue-600 dark:hover:bg-blue-500 dark:shadow-blue-900/20"
+              className="flex items-center gap-2 rounded-full bg-zinc-900 dark:bg-white px-8 py-4 text-base font-semibold text-white dark:text-black hover:opacity-90 transition-all shadow-xl shadow-blue-500/10"
             >
-              Get Started <ArrowRight className="size-4" />
+              Start Building <ArrowRight className="size-4" />
             </Link>
             <Link
               href="https://github.com/tesserspace/tesser"
               target="_blank"
-              className="flex items-center gap-2 rounded-full border border-zinc-200 bg-white px-8 py-3 text-sm font-semibold text-zinc-700 hover:bg-zinc-50 hover:text-zinc-900 transition-all dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+              className="flex items-center gap-2 rounded-full border border-zinc-200 dark:border-zinc-800 bg-white/50 dark:bg-zinc-900/50 px-8 py-4 text-base font-semibold text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-all backdrop-blur-sm"
             >
-              View Source
+              <Github className="size-4" /> GitHub
             </Link>
-          </div>
+          </motion.div>
         </div>
-        
-        {/* Light Mode Background Grid (Subtle) */}
-        <div className="absolute inset-0 bg-[linear-gradient(to_right,#80808012_1px,transparent_1px),linear-gradient(to_bottom,#80808012_1px,transparent_1px)] bg-[size:24px_24px] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_0%,#000_70%,transparent_100%)] pointer-events-none dark:opacity-0" />
+      </div>
 
-        {/* Dark Mode Gradient Effect (Blue Glow) */}
-        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-[1000px] h-[400px] bg-blue-500/10 blur-[100px] rounded-full pointer-events-none -z-10 opacity-0 dark:opacity-100" />
-      </section>
+      {/* Background Effects */}
+      <div className="absolute top-0 inset-x-0 h-[600px] bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-blue-500/10 via-transparent to-transparent opacity-50 pointer-events-none dark:from-blue-500/20" />
+      <div className="absolute inset-0 bg-[url('/grid.svg')] bg-center [mask-image:linear-gradient(180deg,white,rgba(255,255,255,0))]" />
+    </section>
+  );
+}
 
-      {/* Value Proposition Grid */}
-      <section className="py-24 bg-zinc-50 dark:bg-zinc-950/30">
-        <div className="container mx-auto px-4">
-          <div className="text-center mb-16">
-            <h2 className="text-3xl font-bold text-zinc-900 mb-4 dark:text-white">Why Tesser?</h2>
-            <p className="text-zinc-600 dark:text-zinc-400 max-w-2xl mx-auto">
-              Built for traders who demand the performance of low-level systems with the safety of modern software engineering.
+function TerminalSimulation() {
+  const [lines, setLines] = useState<string[]>([
+    "Initializing Tesser v0.2.3...",
+    "Loading strategy configuration...",
+    "Connecting to Bybit Linear (WebSocket)...",
+  ]);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const sequence = [
+      { text: "✓ Market stream connected: BTCUSDT", delay: 800 },
+      { text: "✓ Execution engine ready (Live Mode)", delay: 1600 },
+      { text: "INFO [Strategy] SmaCross initialized (fast=8, slow=21)", delay: 2400 },
+      { text: "INFO [Risk] Pre-trade checks active (max_drawdown=5%)", delay: 3000 },
+      { text: "WARN [Market] High volatility detected, adjusting spreads", delay: 4500 },
+      { text: "EXEC [Order] SUBMIT LIMIT BUY 1.5 BTC @ 64200.50", delay: 6000 },
+      { text: "EXEC [Fill] FILLED 1.5 BTC @ 64200.50 (12ms latency)", delay: 7500 },
+      { text: "INFO [Portfolio] Position updated: +1.5 BTC (PnL: +0.05%)", delay: 8200 },
+    ];
+
+    let timeouts: NodeJS.Timeout[] = [];
+
+    sequence.forEach(({ text, delay }) => {
+      const timeout = setTimeout(() => {
+        setLines(prev => [...prev.slice(-7), text]); // Keep last 8 lines
+      }, delay);
+      timeouts.push(timeout);
+    });
+
+    return () => timeouts.forEach(clearTimeout);
+  }, []);
+
+  return (
+    <section className="py-20 bg-zinc-50 dark:bg-[#050505] border-y border-zinc-200 dark:border-zinc-800">
+      <div className="container mx-auto px-4">
+        <div className="flex flex-col lg:flex-row items-center gap-16">
+          <div className="flex-1 space-y-8">
+            <h2 className="text-3xl md:text-4xl font-bold text-zinc-900 dark:text-white">
+              Feel the power of <br/>
+              <span className="text-blue-600 dark:text-blue-500">Systematic Execution</span>
+            </h2>
+            <p className="text-lg text-zinc-600 dark:text-zinc-400 leading-relaxed">
+              Tesser isn't just a library; it's a runtime environment. Watch your strategies react to market data in microseconds, with full observability into every decision, order, and fill.
             </p>
-          </div>
-          
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
-            <FeatureCard 
-              icon={<Zap className="size-6 text-amber-500" />}
-              title="Rust Performance"
-              description="Leverage Rust's zero-cost abstractions. Handle high-frequency ticks and order book deltas with minimal latency and no garbage collection pauses."
-            />
-            <FeatureCard 
-              icon={<ShieldCheck className="size-6 text-emerald-500" />}
-              title="Safety & Reconciliation"
-              description="Built-in state persistence and real-time reconciliation prevent portfolio drift. The system automatically enters 'liquidate-only' mode if discrepancies are detected."
-            />
-            <FeatureCard 
-              icon={<Layers className="size-6 text-purple-500" />}
-              title="Modular Architecture"
-              description="Strict decoupling between strategies and exchanges. Switch from Paper Trading to Bybit Live execution without changing a single line of strategy code."
-            />
-            <FeatureCard 
-              icon={<BarChart3 className="size-6 text-blue-500" />}
-              title="Accurate Backtesting"
-              description="Event-driven engine supports both candle and tick-level simulations (L2/L3 data), accurately modeling latency, slippage, and maker/taker fees."
-            />
-            <FeatureCard 
-              icon={<Cpu className="size-6 text-rose-500" />}
-              title="WASM Plugins (Roadmap)"
-              description="Future-proof design allows dynamic loading of strategies via WebAssembly, enabling hot-reloading and multi-language strategy development."
-            />
-            <FeatureCard 
-              icon={<Globe className="size-6 text-cyan-500" />}
-              title="Unified API"
-              description="A normalized trait system handles the complexity of REST and WebSocket APIs across exchanges, providing a consistent interface for your algorithms."
-            />
-          </div>
-        </div>
-      </section>
-
-      {/* Technical Preview */}
-      <section className="py-24 bg-white dark:bg-black border-t border-zinc-200 dark:border-zinc-800">
-        <div className="container mx-auto px-4">
-          <div className="flex flex-col lg:flex-row items-center gap-16">
-            <div className="flex-1 space-y-8">
-              <h3 className="text-3xl font-bold text-zinc-900 dark:text-white">Developer Experience First</h3>
-              <p className="text-zinc-600 dark:text-zinc-400 leading-relaxed text-lg">
-                We believe powerful tools shouldn't be painful to use. Tesser provides a declarative TOML configuration system, a robust CLI for operations, and a type-safe SDK for strategy authoring.
-              </p>
-              <ul className="space-y-4">
-                <li className="flex items-center gap-3">
-                  <div className="flex items-center justify-center w-6 h-6 rounded-full bg-blue-100 dark:bg-blue-900/30">
-                    <div className="h-2 w-2 rounded-full bg-blue-600 dark:bg-blue-500" />
-                  </div>
-                  <span className="text-zinc-700 dark:text-zinc-300">Type-safe <code className="text-xs bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 px-1.5 py-0.5 rounded text-zinc-900 dark:text-zinc-200 font-mono">rust_decimal</code> for financial precision</span>
-                </li>
-                <li className="flex items-center gap-3">
-                  <div className="flex items-center justify-center w-6 h-6 rounded-full bg-blue-100 dark:bg-blue-900/30">
-                    <div className="h-2 w-2 rounded-full bg-blue-600 dark:bg-blue-500" />
-                  </div>
-                  <span className="text-zinc-700 dark:text-zinc-300">Built-in technical indicators (RSI, MACD, Bollinger)</span>
-                </li>
-                <li className="flex items-center gap-3">
-                  <div className="flex items-center justify-center w-6 h-6 rounded-full bg-blue-100 dark:bg-blue-900/30">
-                    <div className="h-2 w-2 rounded-full bg-blue-600 dark:bg-blue-500" />
-                  </div>
-                  <span className="text-zinc-700 dark:text-zinc-300">Multi-process architecture for isolation</span>
-                </li>
-              </ul>
+            <div className="grid grid-cols-2 gap-6">
+              <div>
+                <h4 className="text-2xl font-bold text-zinc-900 dark:text-white mb-1">~15<span className="text-sm text-zinc-500 ml-1">μs</span></h4>
+                <p className="text-sm text-zinc-500">Internal Latency</p>
+              </div>
+              <div>
+                <h4 className="text-2xl font-bold text-zinc-900 dark:text-white mb-1">100<span className="text-sm text-zinc-500 ml-1">%</span></h4>
+                <p className="text-sm text-zinc-500">Rust Safety</p>
+              </div>
             </div>
-            
-            {/* Code Window - Keep dark even in light mode for contrast/IDE feel */}
-            <div className="flex-1 w-full max-w-lg rounded-xl overflow-hidden shadow-2xl border border-zinc-200 dark:border-zinc-800 bg-[#0d1117] dark:bg-zinc-900">
-              <div className="flex items-center gap-2 px-4 py-3 border-b border-zinc-800 bg-zinc-900/50">
+          </div>
+
+          <div className="flex-1 w-full">
+            <div className="relative rounded-xl overflow-hidden bg-[#0d1117] border border-zinc-800 shadow-2xl">
+              <div className="flex items-center gap-2 px-4 py-3 bg-white/5 border-b border-white/5">
                 <div className="flex gap-1.5">
                   <div className="w-3 h-3 rounded-full bg-red-500/20 border border-red-500/50" />
                   <div className="w-3 h-3 rounded-full bg-yellow-500/20 border border-yellow-500/50" />
                   <div className="w-3 h-3 rounded-full bg-green-500/20 border border-green-500/50" />
                 </div>
-                <span className="text-xs text-zinc-500 font-mono ml-2">strategies/sma_cross.toml</span>
+                <div className="ml-4 text-xs font-mono text-zinc-500 flex items-center gap-2">
+                  <Terminal className="size-3" /> tesser-cli live run --exec live
+                </div>
               </div>
-              <div className="p-6 overflow-x-auto">
-                <pre className="text-sm font-mono text-zinc-300 leading-relaxed">
-                  <code>{`strategy_name = "SmaCross"
-
-[params]
-symbol = "BTCUSDT"
-fast_period = 8
-slow_period = 21
-min_samples = 48
-
-# Risk Guardrails
-vwap_duration_secs = 600
-vwap_participation = 0.2`}</code>
-                </pre>
+              <div ref={containerRef} className="p-6 font-mono text-sm h-[300px] overflow-hidden flex flex-col justify-end">
+                {lines.map((line, i) => (
+                  <motion.div 
+                    key={i}
+                    initial={{ opacity: 0, x: -10 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    className={cn(
+                      "mb-2",
+                      line.includes("WARN") ? "text-yellow-400" :
+                      line.includes("EXEC") ? "text-blue-400" :
+                      line.includes("✓") ? "text-green-400" :
+                      "text-zinc-400"
+                    )}
+                  >
+                    <span className="text-zinc-600 mr-3">{new Date().toLocaleTimeString()}</span>
+                    {line}
+                  </motion.div>
+                ))}
+                <div className="w-2 h-4 bg-blue-500 animate-pulse mt-1" />
               </div>
+              {/* Glass overlay effect */}
+              <div className="absolute inset-0 bg-gradient-to-t from-blue-500/5 to-transparent pointer-events-none" />
             </div>
           </div>
         </div>
-      </section>
-    </main>
+      </div>
+    </section>
   );
 }
 
-function FeatureCard({ icon, title, description }: { icon: React.ReactNode, title: string, description: string }) {
+function BentoGrid() {
   return (
-    <div className="group p-6 rounded-2xl border border-zinc-200 bg-white shadow-sm hover:shadow-md hover:border-zinc-300 transition-all dark:border-zinc-800 dark:bg-zinc-900/20 dark:hover:bg-zinc-900/40 dark:hover:border-zinc-700 dark:shadow-none">
-      <div className="mb-4 p-3 rounded-lg bg-zinc-50 border border-zinc-100 inline-block group-hover:bg-white transition-colors dark:bg-zinc-900 dark:border-zinc-800 dark:group-hover:border-zinc-700">
-        {icon}
+    <section className="py-24 bg-white dark:bg-black">
+      <div className="container mx-auto px-4">
+        <div className="text-center max-w-3xl mx-auto mb-16">
+          <h2 className="text-3xl md:text-4xl font-bold text-zinc-900 dark:text-white mb-4">
+            Architecture that scales with your AUM
+          </h2>
+          <p className="text-zinc-600 dark:text-zinc-400">
+            Move from backtesting on your laptop to high-frequency trading on the cloud without changing your strategy code.
+          </p>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 h-auto md:h-[600px]">
+          {/* Large item */}
+          <BentoItem 
+            className="md:col-span-2 md:row-span-1" 
+            title="Unified Event Loop"
+            description="A single, high-performance event loop handles market data ingestion, signal processing, and order execution. This ensures deterministic behavior between backtesting and live trading."
+            icon={<Activity className="size-8 text-blue-500" />}
+            bgImage="/grid.svg" // Placeholder
+          >
+          </BentoItem>
+
+          <BentoItem 
+            title="Risk Engine" 
+            description="Pre-trade checks and portfolio-level drawdown protection prevent catastrophic losses."
+            icon={<ShieldCheck className="size-6 text-green-500" />}
+          />
+          <BentoItem 
+            title="Extensible Connectors" 
+            description="Write once, trade anywhere. Implement simple traits to support new exchanges."
+            icon={<Globe className="size-6 text-purple-500" />}
+          />
+          <BentoItem 
+            title="State Persistence" 
+            description="SQLite-backed state management ensures you can recover from process restarts."
+            icon={<Layers className="size-6 text-amber-500" />}
+          />
+        </div>
       </div>
-      <h3 className="text-xl font-semibold mb-3 text-zinc-900 dark:text-zinc-100">{title}</h3>
-      <p className="text-zinc-600 text-sm leading-relaxed dark:text-zinc-400">{description}</p>
-    </div>
+    </section>
+  );
+}
+
+function BentoItem({ 
+  className, title, description, icon, children, bgImage 
+}: { 
+  className?: string, title: string, description: string, icon: React.ReactNode, children?: React.ReactNode, bgImage?: string 
+}) {
+  return (
+    <motion.div 
+      whileHover={{ y: -5 }}
+      className={cn(
+        "group relative overflow-hidden rounded-3xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/50 p-8 flex flex-col justify-between hover:border-zinc-300 dark:hover:border-zinc-700 transition-all",
+        className
+      )}
+    >
+      {bgImage && <div className="absolute inset-0 opacity-5 dark:opacity-10 bg-[url('/grid.svg')] bg-center pointer-events-none" />}
+      
+      <div>
+        <div className="mb-4 inline-flex p-3 rounded-xl bg-white dark:bg-zinc-800 shadow-sm border border-zinc-100 dark:border-zinc-700">
+          {icon}
+        </div>
+        <h3 className="text-xl font-bold text-zinc-900 dark:text-white mb-2">{title}</h3>
+        <p className="text-zinc-600 dark:text-zinc-400 leading-relaxed">{description}</p>
+      </div>
+      {children}
+    </motion.div>
+  );
+}
+function RoadmapSection() {
+  const items = [
+    { status: "done", title: "Core Engine", desc: "Event loop, Backtester, Paper Trading" },
+    { status: "done", title: "Bybit Connector", desc: "Linear Perpetuals, WebSocket Streams" },
+    { status: "current", title: "Live Trading CLI", desc: "TUI, Prometheus Metrics, Webhooks" },
+    { status: "future", title: "WASM Plugins", desc: "Hot-reload strategies, Multi-language support" },
+    { status: "future", title: "Cloud Orchestrator", desc: "Kubernetes operator for massive scale" },
+  ];
+
+  return (
+    <section className="py-24 border-t border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-950">
+      <div className="container mx-auto px-4">
+        <div className="mb-16 text-center">
+          <h2 className="text-3xl font-bold text-zinc-900 dark:text-white">The Roadmap</h2>
+          <p className="text-zinc-500 mt-2">We are building the future of open-source quant infrastructure.</p>
+        </div>
+        
+        <div className="relative max-w-4xl mx-auto">
+          {/* Vertical Line */}
+          <div className="absolute left-8 top-0 bottom-0 w-px bg-zinc-200 dark:bg-zinc-800 md:left-1/2" />
+          
+          <div className="space-y-12">
+            {items.map((item, i) => (
+              <motion.div 
+                key={i}
+                initial={{ opacity: 0, y: 20 }}
+                whileInView={{ opacity: 1, y: 0 }}
+                viewport={{ once: true }}
+                transition={{ delay: i * 0.1 }}
+                className={cn(
+                  "relative flex items-center md:justify-between",
+                  i % 2 === 0 ? "md:flex-row-reverse" : ""
+                )}
+              >
+                <div className="absolute left-8 md:left-1/2 -translate-x-1/2 w-4 h-4 rounded-full border-4 border-zinc-50 dark:border-black z-10 bg-white dark:bg-zinc-800">
+                   <div className={cn(
+                     "w-full h-full rounded-full",
+                     item.status === "done" ? "bg-green-500" :
+                     item.status === "current" ? "bg-blue-500 animate-pulse" : "bg-zinc-300 dark:bg-zinc-700"
+                   )} />
+                </div>
+                
+                <div className="pl-20 md:pl-0 md:w-[45%]">
+                  <div className="p-6 rounded-2xl bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 shadow-sm hover:shadow-md transition-shadow">
+                    <div className="flex items-center gap-2 mb-2">
+                      {item.status === 'current' && (
+                        <span className="px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 text-[10px] font-bold uppercase tracking-wider border border-blue-500/20">
+                          Current Focus
+                        </span>
+                      )}
+                    </div>
+                    <h3 className="text-lg font-bold text-zinc-900 dark:text-white">{item.title}</h3>
+                    <p className="text-zinc-600 dark:text-zinc-400 text-sm mt-1">{item.desc}</p>
+                  </div>
+                </div>
+              </motion.div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function CTASection() {
+  return (
+    <section className="py-32 relative overflow-hidden">
+      <div className="absolute inset-0 bg-blue-600 dark:bg-blue-950">
+         <div className="absolute inset-0 bg-[url('/grid.svg')] opacity-10" />
+         <div className="absolute -top-24 -right-24 w-96 h-96 bg-blue-400/30 blur-3xl rounded-full" />
+         <div className="absolute -bottom-24 -left-24 w-96 h-96 bg-purple-400/30 blur-3xl rounded-full" />
+      </div>
+      
+      <div className="container mx-auto px-4 relative z-10 text-center">
+        <h2 className="text-4xl md:text-5xl font-bold text-white mb-6">
+          Ready to professionalize your trading?
+        </h2>
+        <p className="text-blue-100 text-lg max-w-2xl mx-auto mb-10">
+          Join the community of quants building the next generation of trading infrastructure with Tesser.
+        </p>
+        <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
+          <Link 
+            href="/docs"
+            className="px-8 py-4 rounded-full bg-white text-blue-900 font-bold text-lg hover:bg-blue-50 transition-colors shadow-lg"
+          >
+            Get Started Now
+          </Link>
+          <Link 
+            href="/docs/getting-started"
+            className="px-8 py-4 rounded-full border border-white/30 text-white font-semibold text-lg hover:bg-white/10 transition-colors"
+          >
+            Read the Docs
+          </Link>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+export default function HomePage() {
+  return (
+    <main className="flex flex-col min-h-screen bg-white dark:bg-black transition-colors duration-300 font-sans selection:bg-blue-500/30">
+      <HeroSection />
+      <TerminalSimulation />
+      <BentoGrid />
+      <RoadmapSection />
+      <CTASection />
+    </main>
   );
 }
