@@ -11,9 +11,11 @@ readme.workspace = true
 [dependencies]
 anyhow.workspace = true
 ndarray.workspace = true
-ort = { workspace = true, features = ["ndarray"] }
 serde.workspace = true
 tracing.workspace = true
+
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+ort = { workspace = true, features = ["ndarray"] }
 
 [features]
 default = []

@@ -9,6 +9,10 @@
 * **Stateful Inference**: Optimized for time-series models such as LSTM/GRU with efficient warm-up and hidden state management.
 * **Microsecond Latency**: Tuned for CPU cache locality, consistently delivering &lt;25 μs inference latency on commodity hardware.
 
+## Platform Support
+
+ONNX Runtime does not currently publish binaries for musl-based targets. When compiling Tesser for `*-unknown-linux-musl`, the `tesser-cortex` crate builds but returns an error if you attempt to initialize `CortexEngine`. Use a glibc target (e.g., `x86_64-unknown-linux-gnu`) to run Cortex-powered strategies.
+
 ## Usage
 
 ```rust
