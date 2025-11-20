@@ -8,6 +8,11 @@ repository.workspace = true
 description = "Command-line interface for running and operating the Tesser framework"
 readme = "README.md"
 
+[features]
+default = ["bybit", "binance"]
+bybit = ["dep:tesser-bybit"]
+binance = ["dep:tesser-binance"]
+
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
@@ -37,8 +42,8 @@ tesser-markets = { version = "0.4.1", path = "../tesser-markets" }
 tesser-strategy = { version = "0.4.1", path = "../tesser-strategy" }
 tesser-broker = { version = "0.4.1", path = "../tesser-broker" }
 tesser-paper = { version = "0.4.1", path = "../connectors/tesser-paper" }
-tesser-bybit = { version = "0.4.1", path = "../connectors/tesser-bybit" }
-tesser-binance = { version = "0.4.1", path = "../connectors/tesser-binance" }
+tesser-bybit = { version = "0.4.1", path = "../connectors/tesser-bybit", optional = true }
+tesser-binance = { version = "0.4.1", path = "../connectors/tesser-binance", optional = true }
 rust_decimal.workspace = true
 
 [dev-dependencies]

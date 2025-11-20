@@ -254,10 +254,7 @@ where
     T: Send + 'static,
 {
     let response = result.map_err(|err| BrokerError::Transport(err.to_string()))?;
-    response
-        .data()
-        .await
-        .map_err(|err| map_connector_error(err))
+    response.data().await.map_err(map_connector_error)
 }
 
 fn build_order_from_response(response: rest_api::NewOrderResponse, request: OrderRequest) -> Order {
@@ -274,7 +271,7 @@ fn build_order_from_response(response: rest_api::NewOrderResponse, request: Orde
         request,
         status,
         filled_quantity: parse_decimal_opt(response.executed_qty.as_deref())
-            .unwrap_or_else(|| Decimal::ZERO),
+            .unwrap_or(Decimal::ZERO),
         avg_fill_price: parse_decimal_opt(response.avg_price.as_deref()),
         created_at: timestamp_from_ms(response.update_time),
         updated_at: timestamp_from_ms(response.update_time),
@@ -314,8 +311,7 @@ fn order_from_open_order(entry: &rest_api::AllOrdersResponseInner) -> Option<Ord
             .as_deref()
             .map(map_order_status)
             .unwrap_or(OrderStatus::PendingNew),
-        filled_quantity: parse_decimal_opt(entry.executed_qty.as_deref())
-            .unwrap_or_else(|| Decimal::ZERO),
+        filled_quantity: parse_decimal_opt(entry.executed_qty.as_deref()).unwrap_or(Decimal::ZERO),
         avg_fill_price: parse_decimal_opt(entry.avg_price.as_deref()),
         created_at: timestamp_from_ms(entry.time),
         updated_at: timestamp_from_ms(entry.update_time),
@@ -352,7 +348,7 @@ fn position_from_entry(entry: &rest_api::PositionInformationV2ResponseInner) -> 
         quantity: qty.abs(),
         entry_price: parse_decimal_opt(entry.entry_price.as_deref()),
         unrealized_pnl: parse_decimal_opt(entry.un_realized_profit.as_deref())
-            .unwrap_or_else(|| Decimal::ZERO),
+            .unwrap_or(Decimal::ZERO),
         updated_at: timestamp_from_ms(entry.update_time),
     })
 }
@@ -458,7 +454,7 @@ pub fn parse_decimal_opt(value: Option<&str>) -> Option<Decimal> {
 
 pub fn timestamp_from_ms(value: Option<i64>) -> DateTime<Utc> {
     value
-        .and_then(|ms| DateTime::<Utc>::from_timestamp_millis(ms))
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
         .unwrap_or_else(Utc::now)
 }
 
@@ -498,7 +494,7 @@ pub fn order_from_update(order: &websocket_streams::OrderTradeUpdateO) -> Option
             .as_deref()
             .map(map_order_type_from_str)
             .unwrap_or(OrderType::Limit),
-        quantity: parse_decimal_opt(order.q.as_deref()).unwrap_or_else(|| Decimal::ZERO),
+        quantity: parse_decimal_opt(order.q.as_deref()).unwrap_or(Decimal::ZERO),
         price: parse_decimal_opt(order.p.as_deref()),
         trigger_price: parse_decimal_opt(order.sp.as_deref()),
         time_in_force: order.f.as_deref().and_then(map_tif_from_str),
@@ -515,7 +511,7 @@ pub fn order_from_update(order: &websocket_streams::OrderTradeUpdateO) -> Option
             .as_deref()
             .map(map_order_status)
             .unwrap_or(OrderStatus::PendingNew),
-        filled_quantity: parse_decimal_opt(order.z.as_deref()).unwrap_or_else(|| Decimal::ZERO),
+        filled_quantity: parse_decimal_opt(order.z.as_deref()).unwrap_or(Decimal::ZERO),
         avg_fill_price: parse_decimal_opt(order.ap.as_deref()),
         created_at: timestamp_from_ms(order.t_uppercase),
         updated_at: timestamp_from_ms(order.t_uppercase),
@@ -573,7 +569,7 @@ impl BinanceFactory {
 const BINANCE_DEFAULT_DEPTH: usize = 50;
 
 pub fn register_factory() {
-    register_connector_factory(Arc::new(BinanceFactory::default()));
+    register_connector_factory(Arc::new(BinanceFactory));
 }
 
 #[async_trait]

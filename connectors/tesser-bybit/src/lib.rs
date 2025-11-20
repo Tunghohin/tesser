@@ -753,7 +753,7 @@ impl BybitFactory {
 const BYBIT_DEFAULT_DEPTH: usize = 50;
 
 pub fn register_factory() {
-    register_connector_factory(Arc::new(BybitFactory::default()));
+    register_connector_factory(Arc::new(BybitFactory));
 }
 
 #[async_trait]
@@ -838,7 +838,7 @@ impl ConnectorStream for BybitConnectorStream {
             self.inner
                 .subscribe(BybitSubscription::OrderBook {
                     symbol: symbol.clone(),
-                    depth: self.depth.min(200).max(1),
+                    depth: self.depth.clamp(1, 200),
                 })
                 .await?;
         }

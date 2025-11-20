@@ -248,7 +248,7 @@ fn convert_kline(payload: &KlineCandlestickStreamsResponse) -> Option<Candle> {
     let high = parse_decimal_opt(kline.h.as_deref())?;
     let low = parse_decimal_opt(kline.l.as_deref())?;
     let close = parse_decimal_opt(kline.c.as_deref())?;
-    let volume = parse_decimal_opt(kline.v.as_deref()).unwrap_or_else(|| Decimal::ZERO);
+    let volume = parse_decimal_opt(kline.v.as_deref()).unwrap_or(Decimal::ZERO);
     Some(Candle {
         symbol,
         interval,
@@ -273,12 +273,13 @@ fn convert_book(payload: &PartialBookDepthStreamsResponse) -> Option<OrderBook> 
     })
 }
 
-fn parse_levels(levels: &Vec<Vec<String>>) -> Vec<OrderBookLevel> {
+fn parse_levels(levels: &[Vec<String>]) -> Vec<OrderBookLevel> {
     levels
         .iter()
         .filter_map(|level| {
-            let price = level.get(0)?.parse::<Decimal>().ok()?;
-            let size = level.get(1)?.parse::<Decimal>().ok()?;
+            let mut values = level.iter();
+            let price = values.next()?.parse::<Decimal>().ok()?;
+            let size = values.next()?.parse::<Decimal>().ok()?;
             Some(OrderBookLevel { price, size })
         })
         .collect()
@@ -321,9 +322,7 @@ impl BinanceUserDataStream {
     }
 }
 
-pub fn extract_order_update<'a>(
-    event: &'a UserDataStreamEventsResponse,
-) -> Option<&'a OrderTradeUpdateO> {
+pub fn extract_order_update(event: &UserDataStreamEventsResponse) -> Option<&OrderTradeUpdateO> {
     match event {
         UserDataStreamEventsResponse::OrderTradeUpdate(payload) => payload.o.as_deref(),
         _ => None,

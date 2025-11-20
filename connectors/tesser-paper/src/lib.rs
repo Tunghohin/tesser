@@ -1258,6 +1258,7 @@ impl ConnectorStream for LivePaperStream {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_market_generator(
     symbol: Symbol,
     market: PaperMarketConfig,
@@ -1314,6 +1315,7 @@ fn spawn_market_generator(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_random_walk(
     symbol: Symbol,
     start_price: Decimal,
@@ -1369,6 +1371,7 @@ async fn run_random_walk(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_replay(
     symbol: Symbol,
     path: PathBuf,
@@ -1470,7 +1473,7 @@ fn load_replay_samples(path: &PathBuf) -> BrokerResult<Vec<ReplaySample>> {
         let record = result.map_err(|err| BrokerError::InvalidRequest(err.to_string()))?;
         let timestamp = parse_timestamp(&record, &headers)?;
         let price = parse_decimal_field(&record, &headers, "price")?;
-        let size = parse_decimal_field(&record, &headers, "size").unwrap_or_else(|_| Decimal::ONE);
+        let size = parse_decimal_field(&record, &headers, "size").unwrap_or(Decimal::ONE);
         let side = parse_side_field(&record, &headers);
         records.push(ReplaySample {
             timestamp,

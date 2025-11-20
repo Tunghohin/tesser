@@ -291,7 +291,7 @@ fn parse_binance_entry(entry: &[JsonValue], symbol: &str, interval: Interval) ->
     if entry.len() < 6 {
         return None;
     }
-    let ts = entry.get(0)?.as_i64()?;
+    let ts = entry.first()?.as_i64()?;
     let timestamp = DateTime::<Utc>::from_timestamp_millis(ts)?;
     let open = entry.get(1)?.as_str()?.parse::<Decimal>().ok()?;
     let high = entry.get(2)?.as_str()?.parse::<Decimal>().ok()?;

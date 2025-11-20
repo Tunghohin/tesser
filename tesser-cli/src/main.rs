@@ -10,7 +10,9 @@ use tesser_paper::PaperFactory;
 #[tokio::main]
 async fn main() -> Result<()> {
     register_connector_factory(Arc::new(PaperFactory::default()));
+    #[cfg(feature = "bybit")]
     register_bybit_factory();
+    #[cfg(feature = "binance")]
     register_binance_factory();
     app::run().await
 }

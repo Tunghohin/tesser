@@ -1,3 +1,4 @@
+#![cfg(feature = "bybit")]
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -162,6 +163,7 @@ async fn live_run_executes_round_trip() -> Result<()> {
         reconciliation_interval: Duration::from_secs(1),
         reconciliation_threshold: Decimal::new(1, 3),
         driver: "bybit".into(),
+        orderbook_depth: 50,
     };
     let exchange_cfg = ExchangeConfig {
         rest_url: exchange.rest_url(),
@@ -286,6 +288,7 @@ async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
         reconciliation_interval: Duration::from_millis(200),
         reconciliation_threshold: Decimal::new(1, 4),
         driver: "bybit".into(),
+        orderbook_depth: 50,
     };
     let exchange_cfg = ExchangeConfig {
         rest_url: exchange.rest_url(),
@@ -430,6 +433,7 @@ async fn alerts_on_rejected_order() -> Result<()> {
         reconciliation_interval: Duration::from_secs(1),
         reconciliation_threshold: Decimal::new(1, 3),
         driver: "bybit".into(),
+        orderbook_depth: 50,
     };
     let exchange_cfg = ExchangeConfig {
         rest_url: exchange.rest_url(),

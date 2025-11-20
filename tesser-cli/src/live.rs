@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Once,
 };
 use std::time::{Duration, Instant};
 
@@ -18,17 +18,79 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, trace, warn};
 
 use serde_json::{json, Value};
+#[cfg(not(feature = "bybit"))]
+mod fallback_channel {
+    use super::*;
+    use std::str::FromStr;
+    #[derive(Clone, Copy, Debug)]
+    pub enum PublicChannel {
+        Linear,
+        Inverse,
+        Spot,
+        Option,
+        Spread,
+    }
+
+    impl PublicChannel {
+        pub fn as_path(&self) -> &'static str {
+            match self {
+                Self::Linear => "linear",
+                Self::Inverse => "inverse",
+                Self::Spot => "spot",
+                Self::Option => "option",
+                Self::Spread => "spread",
+            }
+        }
+    }
+
+    impl FromStr for PublicChannel {
+        type Err = BrokerError;
+
+        fn from_str(value: &str) -> Result<Self, Self::Err> {
+            match value.to_lowercase().as_str() {
+                "linear" => Ok(Self::Linear),
+                "inverse" => Ok(Self::Inverse),
+                "spot" => Ok(Self::Spot),
+                "option" => Ok(Self::Option),
+                "spread" => Ok(Self::Spread),
+                other => Err(BrokerError::InvalidRequest(format!(
+                    "unsupported Bybit public channel '{other}'"
+                ))),
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "bybit"))]
+use fallback_channel::PublicChannel;
+
+fn ensure_builtin_connectors_registered() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        register_connector_factory(Arc::new(PaperFactory::default()));
+        #[cfg(feature = "bybit")]
+        register_bybit_factory();
+        #[cfg(feature = "binance")]
+        register_binance_factory();
+    });
+}
+
+#[cfg(feature = "binance")]
 use tesser_binance::{
-    fill_from_update, order_from_update,
+    fill_from_update, order_from_update, register_factory as register_binance_factory,
     ws::{extract_order_update, BinanceUserDataStream, UserDataStreamEventsResponse},
     BinanceClient,
 };
 use tesser_broker::{
-    get_connector_factory, BrokerResult, ConnectorFactory, ConnectorStream, ConnectorStreamConfig,
-    ExecutionClient,
+    get_connector_factory, register_connector_factory, BrokerResult, ConnectorFactory,
+    ConnectorStream, ConnectorStreamConfig, ExecutionClient,
 };
+#[cfg(feature = "bybit")]
 use tesser_bybit::ws::{BybitWsExecution, BybitWsOrder, PrivateMessage};
-use tesser_bybit::{BybitClient, BybitCredentials, PublicChannel};
+#[cfg(feature = "bybit")]
+use tesser_bybit::{
+    register_factory as register_bybit_factory, BybitClient, BybitCredentials, PublicChannel,
+};
 use tesser_config::{AlertingConfig, ExchangeConfig, RiskManagementConfig};
 use tesser_core::{
     Candle, Fill, Interval, Order, OrderBook, OrderStatus, Position, Price, Quantity, Side, Signal,
@@ -43,7 +105,7 @@ use tesser_execution::{
     RiskContext, RiskLimits, SqliteAlgoStateRepository,
 };
 use tesser_markets::MarketRegistry;
-use tesser_paper::PaperExecutionClient;
+use tesser_paper::{PaperExecutionClient, PaperFactory};
 use tesser_portfolio::{
     LiveState, Portfolio, PortfolioConfig, SqliteStateRepository, StateRepository,
 };
@@ -172,6 +234,7 @@ pub async fn run_live_with_shutdown(
     } else {
         None
     };
+    ensure_builtin_connectors_registered();
     let connector_payload = build_exchange_payload(&exchange, &settings);
     let connector_factory = get_connector_factory(&settings.driver)
         .ok_or_else(|| anyhow!("driver {} is not registered", settings.driver))?;
@@ -420,35 +483,49 @@ impl LiveRuntime {
             let exec_client = execution_engine.client();
             match settings.driver.as_str() {
                 "bybit" | "" => {
-                    let bybit = exec_client
-                        .as_ref()
-                        .as_any()
-                        .downcast_ref::<BybitClient>()
-                        .ok_or_else(|| anyhow!("execution client is not Bybit"))?;
-                    let creds = bybit
-                        .get_credentials()
-                        .ok_or_else(|| anyhow!("live execution requires Bybit credentials"))?;
-                    spawn_bybit_private_stream(
-                        creds,
-                        bybit.get_ws_url(),
-                        private_event_tx.clone(),
-                        exec_client.clone(),
-                        symbols.clone(),
-                        last_private_sync.clone(),
-                        private_connection.clone(),
-                        metrics.clone(),
-                        shutdown.clone(),
-                    );
+                    #[cfg(feature = "bybit")]
+                    {
+                        let bybit = exec_client
+                            .as_ref()
+                            .as_any()
+                            .downcast_ref::<BybitClient>()
+                            .ok_or_else(|| anyhow!("execution client is not Bybit"))?;
+                        let creds = bybit
+                            .get_credentials()
+                            .ok_or_else(|| anyhow!("live execution requires Bybit credentials"))?;
+                        spawn_bybit_private_stream(
+                            creds,
+                            bybit.get_ws_url(),
+                            private_event_tx.clone(),
+                            exec_client.clone(),
+                            symbols.clone(),
+                            last_private_sync.clone(),
+                            private_connection.clone(),
+                            metrics.clone(),
+                            shutdown.clone(),
+                        );
+                    }
+                    #[cfg(not(feature = "bybit"))]
+                    {
+                        bail!("driver 'bybit' is unavailable without the 'bybit' feature");
+                    }
                 }
                 "binance" => {
-                    spawn_binance_private_stream(
-                        exec_client.clone(),
-                        exchange_ws_url.clone(),
-                        private_event_tx.clone(),
-                        private_connection.clone(),
-                        metrics.clone(),
-                        shutdown.clone(),
-                    );
+                    #[cfg(feature = "binance")]
+                    {
+                        spawn_binance_private_stream(
+                            exec_client.clone(),
+                            exchange_ws_url.clone(),
+                            private_event_tx.clone(),
+                            private_connection.clone(),
+                            metrics.clone(),
+                            shutdown.clone(),
+                        );
+                    }
+                    #[cfg(not(feature = "binance"))]
+                    {
+                        bail!("driver 'binance' is unavailable without the 'binance' feature");
+                    }
                 }
                 "paper" => {}
                 other => {
@@ -1687,6 +1764,8 @@ async fn load_market_registry(
     Ok(Arc::new(registry))
 }
 
+#[cfg(feature = "bybit")]
+#[allow(clippy::too_many_arguments)]
 fn spawn_bybit_private_stream(
     creds: BybitCredentials,
     ws_url: String,
@@ -1823,6 +1902,8 @@ fn spawn_bybit_private_stream(
     });
 }
 
+#[cfg(feature = "binance")]
+#[allow(clippy::too_many_arguments)]
 fn spawn_binance_private_stream(
     exec_client: Arc<dyn ExecutionClient>,
     ws_url: String,
