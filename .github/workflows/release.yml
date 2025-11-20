@@ -233,18 +233,22 @@ jobs:
           }
 
           $includeDir = Join-Path $opensslRoot 'include'
-          if (-not (Test-Path $includeDir)) {
-            throw "OpenSSL include directory not found under $opensslRoot"
+          $sslHeader = Join-Path $includeDir 'openssl\ssl.h'
+          if (-not (Test-Path $sslHeader)) {
+            throw "OpenSSL headers not found under $includeDir"
           }
 
-          $libCandidates = @(
-            (Join-Path $opensslRoot 'lib'),
-            (Join-Path $opensslRoot 'lib\VC'),
-            (Join-Path $opensslRoot 'lib64')
-          )
-          $libDir = $libCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $libSubdirs = @('lib\VC\static', 'lib\VC', 'lib64', 'lib')
+          $libDir = $null
+          foreach ($sub in $libSubdirs) {
+            $candidate = Join-Path $opensslRoot $sub
+            if (Test-Path (Join-Path $candidate 'libcrypto.lib')) {
+              $libDir = $candidate
+              break
+            }
+          }
           if (-not $libDir) {
-            throw "OpenSSL library directory not found under $opensslRoot"
+            throw "OpenSSL libraries (libcrypto/libssl) not found under $opensslRoot"
           }
 
           Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_DIR=$opensslRoot"
