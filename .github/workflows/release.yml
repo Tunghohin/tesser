@@ -63,10 +63,11 @@ jobs:
     permissions:
       contents: write
     outputs:
-      tag_name: ${{ steps.version.outputs.tag_name }}
-      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+      tag_name: ${{ steps.metadata.outputs.tag_name }}
+      is_prerelease: ${{ steps.metadata.outputs.is_prerelease }}
       changelog: ${{ steps.changelog.outputs.body }}
-      commit_sha: ${{ steps.version.outputs.commit_sha }}
+      base_sha: ${{ steps.metadata.outputs.base_sha }}
+      commit_message: ${{ steps.metadata.outputs.commit_message }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -98,10 +99,11 @@ jobs:
         # --no-confirm: Crucial for CI automation
         run: cargo release ${{ github.event.inputs.version }} --execute --no-publish --no-push --no-confirm --no-tag
 
-      - name: Determine release version
-        id: version
+      - name: Capture release metadata
+        id: metadata
         shell: bash
         run: |
+          set -euo pipefail
           VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r ".packages[] | select(.name == \"${{ env.PACKAGE_NAME }}\") | .version")
           if [ -z "$VERSION" ]; then
             echo "::error::Could not determine version!"
@@ -118,7 +120,16 @@ jobs:
           fi
 
           echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
-          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$(git rev-parse HEAD^)" >> "$GITHUB_OUTPUT"
+
+          COMMIT_MSG=$(git show -s --format=%B HEAD)
+          {
+            echo 'commit_message<<EOF'
+            echo "$COMMIT_MSG"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          git diff HEAD^ > release.patch
 
       - name: Generate changelog
         id: changelog
@@ -130,8 +141,12 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Push changes
-        run: git push origin HEAD:refs/heads/main
+      - name: Upload release patch
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-patch
+          path: release.patch
+          retention-days: 1
 
   # 3. Build Phase
   build-artifacts:
@@ -176,7 +191,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.bump-version.outputs.commit_sha }}
+          ref: ${{ needs.bump-version.outputs.base_sha }}
+          fetch-depth: 0
+
+      - name: Download release patch
+        uses: actions/download-artifact@v4
+        with:
+          name: release-patch
+          path: patch
+
+      - name: Apply release bump
+        run: git apply patch/release.patch
 
       - name: Install system dependencies
         if: matrix.setup_cmd != ''
@@ -248,12 +273,30 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.bump-version.outputs.commit_sha }}
+          ref: ${{ needs.bump-version.outputs.base_sha }}
+          fetch-depth: 0
+
+      - name: Download release patch
+        uses: actions/download-artifact@v4
+        with:
+          name: release-patch
+          path: patch
 
       - name: Configure Git
         run: |
           git config user.name "${{ github.actor }}"
           git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Apply and commit release bump
+        env:
+          COMMIT_MESSAGE: ${{ needs.bump-version.outputs.commit_message }}
+        run: |
+          git apply patch/release.patch
+          git add -A
+          printf "%s" "$COMMIT_MESSAGE" | git commit -F -
+
+      - name: Push release commit
+        run: git push origin HEAD:refs/heads/main
 
       - name: Create and push tag
         env:
