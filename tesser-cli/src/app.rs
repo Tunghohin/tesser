@@ -3,6 +3,7 @@ use crate::data_validation::{validate_dataset, ValidationConfig, ValidationOutco
 use crate::live::{run_live, ExecutionBackend, LiveSessionSettings};
 use crate::state;
 use crate::telemetry::init_tracing;
+use crate::PublicChannel;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
@@ -24,7 +25,6 @@ use serde::{Deserialize, Serialize};
 use tesser_backtester::reporting::PerformanceReport;
 use tesser_backtester::{BacktestConfig, BacktestMode, Backtester, MarketEvent, MarketEventKind};
 use tesser_broker::ExecutionClient;
-use tesser_bybit::PublicChannel;
 use tesser_config::{load_config, AppConfig, RiskManagementConfig};
 use tesser_core::{Candle, DepthUpdate, Interval, OrderBook, OrderBookLevel, Side, Symbol, Tick};
 use tesser_data::download::{BinanceDownloader, BybitDownloader, KlineRequest};

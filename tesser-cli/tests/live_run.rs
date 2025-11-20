@@ -23,10 +23,10 @@ use tokio::time::{sleep, timeout};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use async_trait::async_trait;
-use tesser_bybit::PublicChannel;
 use tesser_cli::live::{
     run_live_with_shutdown, ExecutionBackend, LiveSessionSettings, ShutdownSignal,
 };
+use tesser_cli::PublicChannel;
 use tesser_config::{AlertingConfig, ExchangeConfig, RiskManagementConfig};
 use tesser_core::{AccountBalance, Candle, Interval, Position, Side, Signal, SignalKind, Tick};
 use tesser_portfolio::{SqliteStateRepository, StateRepository};

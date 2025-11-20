@@ -18,51 +18,6 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, trace, warn};
 
 use serde_json::{json, Value};
-#[cfg(not(feature = "bybit"))]
-mod fallback_channel {
-    use super::*;
-    use std::str::FromStr;
-    #[derive(Clone, Copy, Debug)]
-    pub enum PublicChannel {
-        Linear,
-        Inverse,
-        Spot,
-        Option,
-        Spread,
-    }
-
-    impl PublicChannel {
-        pub fn as_path(&self) -> &'static str {
-            match self {
-                Self::Linear => "linear",
-                Self::Inverse => "inverse",
-                Self::Spot => "spot",
-                Self::Option => "option",
-                Self::Spread => "spread",
-            }
-        }
-    }
-
-    impl FromStr for PublicChannel {
-        type Err = BrokerError;
-
-        fn from_str(value: &str) -> Result<Self, Self::Err> {
-            match value.to_lowercase().as_str() {
-                "linear" => Ok(Self::Linear),
-                "inverse" => Ok(Self::Inverse),
-                "spot" => Ok(Self::Spot),
-                "option" => Ok(Self::Option),
-                "spread" => Ok(Self::Spread),
-                other => Err(BrokerError::InvalidRequest(format!(
-                    "unsupported Bybit public channel '{other}'"
-                ))),
-            }
-        }
-    }
-}
-
-#[cfg(not(feature = "bybit"))]
-use fallback_channel::PublicChannel;
 
 fn ensure_builtin_connectors_registered() {
     static INIT: Once = Once::new();
@@ -88,9 +43,7 @@ use tesser_broker::{
 #[cfg(feature = "bybit")]
 use tesser_bybit::ws::{BybitWsExecution, BybitWsOrder, PrivateMessage};
 #[cfg(feature = "bybit")]
-use tesser_bybit::{
-    register_factory as register_bybit_factory, BybitClient, BybitCredentials, PublicChannel,
-};
+use tesser_bybit::{register_factory as register_bybit_factory, BybitClient, BybitCredentials};
 use tesser_config::{AlertingConfig, ExchangeConfig, RiskManagementConfig};
 use tesser_core::{
     Candle, Fill, Interval, Order, OrderBook, OrderStatus, Position, Price, Quantity, Side, Signal,
@@ -113,6 +66,7 @@ use tesser_strategy::{Strategy, StrategyContext};
 
 use crate::alerts::{AlertDispatcher, AlertManager};
 use crate::telemetry::{spawn_metrics_server, LiveMetrics};
+use crate::PublicChannel;
 
 /// Unified event type for asynchronous updates from the broker.
 #[derive(Debug)]
@@ -359,7 +313,7 @@ impl LiveRuntime {
         symbols: Vec<String>,
         orchestrator: OrderOrchestrator,
         settings: LiveSessionSettings,
-        exchange_ws_url: String,
+        #[cfg_attr(not(feature = "binance"), allow(unused_variables))] exchange_ws_url: String,
         market_registry: Arc<MarketRegistry>,
         shutdown: ShutdownSignal,
         public_connection: Arc<AtomicBool>,
@@ -994,6 +948,7 @@ impl ShutdownSignal {
         self.flag.load(Ordering::SeqCst)
     }
 
+    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
     async fn wait(&self) {
         if self.triggered() {
             return;
