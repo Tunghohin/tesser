@@ -2,9 +2,11 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write;
 use std::str::FromStr;
 
 use chrono::{DateTime, Duration, Utc};
+use crc32fast::Hasher;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -300,6 +302,10 @@ pub struct OrderBook {
     pub bids: Vec<OrderBookLevel>,
     pub asks: Vec<OrderBookLevel>,
     pub timestamp: DateTime<Utc>,
+    #[serde(default)]
+    pub exchange_checksum: Option<u32>,
+    #[serde(default)]
+    pub local_checksum: Option<u32>,
 }
 
 impl OrderBook {
@@ -327,6 +333,25 @@ impl OrderBook {
         } else {
             Some((bid_vol - ask_vol) / denom)
         }
+    }
+
+    /// Compute a checksum for the current order book using up to `depth` levels (or full depth when `None`).
+    #[must_use]
+    pub fn computed_checksum(&self, depth: Option<usize>) -> u32 {
+        let mut lob = LocalOrderBook::new();
+        let bids = self
+            .bids
+            .iter()
+            .map(|level| (level.price, level.size))
+            .collect::<Vec<_>>();
+        let asks = self
+            .asks
+            .iter()
+            .map(|level| (level.price, level.size))
+            .collect::<Vec<_>>();
+        lob.load_snapshot(&bids, &asks);
+        let depth = depth.unwrap_or_else(|| bids.len().max(asks.len()).max(1));
+        lob.checksum(depth)
     }
 }
 
@@ -365,7 +390,7 @@ impl LocalOrderBook {
         }
     }
 
-    /// Insert or update a price level.
+    /// Insert or update a price level by accumulating quantity.
     pub fn add_order(&mut self, side: Side, price: Price, quantity: Quantity) {
         if quantity <= Decimal::ZERO {
             return;
@@ -380,6 +405,32 @@ impl LocalOrderBook {
                 let entry = self.asks.entry(price).or_insert(Decimal::ZERO);
                 *entry += quantity;
             }
+        }
+    }
+
+    /// Overwrite a price level with the provided absolute quantity (removing when zero).
+    pub fn apply_delta(&mut self, side: Side, price: Price, quantity: Quantity) {
+        if quantity <= Decimal::ZERO {
+            self.clear_level(side, price);
+            return;
+        }
+        match side {
+            Side::Buy => {
+                self.bids.insert(Reverse(price), quantity);
+            }
+            Side::Sell => {
+                self.asks.insert(price, quantity);
+            }
+        }
+    }
+
+    /// Apply a batch of bid/ask deltas atomically.
+    pub fn apply_deltas(&mut self, bids: &[(Price, Quantity)], asks: &[(Price, Quantity)]) {
+        for &(price, qty) in bids {
+            self.apply_delta(Side::Buy, price, qty);
+        }
+        for &(price, qty) in asks {
+            self.apply_delta(Side::Sell, price, qty);
         }
     }
 
@@ -474,6 +525,43 @@ impl LocalOrderBook {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.bids.is_empty() && self.asks.is_empty()
+    }
+
+    /// Compute a CRC32 checksum for the top N levels (Bybit/Binance compatibility).
+    #[must_use]
+    pub fn checksum(&self, depth: usize) -> u32 {
+        if depth == 0 {
+            return 0;
+        }
+        let mut buffer = String::new();
+        let mut first = true;
+        for (price, size) in self.bids().take(depth) {
+            if !first {
+                buffer.push(':');
+            }
+            first = false;
+            write!(buffer, "{}:{}", price.normalize(), size.normalize()).ok();
+        }
+        for (price, size) in self.asks().take(depth) {
+            if !first {
+                buffer.push(':');
+            }
+            first = false;
+            write!(buffer, "{}:{}", price.normalize(), size.normalize()).ok();
+        }
+        let mut hasher = Hasher::new();
+        hasher.update(buffer.as_bytes());
+        hasher.finalize()
+    }
+
+    /// Helper for generating owned bid levels up to the desired depth.
+    pub fn bid_levels(&self, depth: usize) -> Vec<(Price, Quantity)> {
+        self.bids().take(depth).collect()
+    }
+
+    /// Helper for generating owned ask levels up to the desired depth.
+    pub fn ask_levels(&self, depth: usize) -> Vec<(Price, Quantity)> {
+        self.asks().take(depth).collect()
     }
 }
 
@@ -691,5 +779,29 @@ mod tests {
             lob.best_ask(),
             Some((Decimal::from(13), Decimal::from_f64(2.5).unwrap()))
         );
+    }
+
+    #[test]
+    fn local_order_book_apply_delta_overwrites_level() {
+        let mut lob = LocalOrderBook::new();
+        lob.apply_delta(Side::Buy, Decimal::from(100), Decimal::from(1));
+        lob.apply_delta(Side::Buy, Decimal::from(100), Decimal::from(3));
+        assert_eq!(lob.best_bid(), Some((Decimal::from(100), Decimal::from(3))));
+
+        lob.apply_delta(Side::Buy, Decimal::from(100), Decimal::ZERO);
+        assert!(lob.best_bid().is_none());
+    }
+
+    #[test]
+    fn local_order_book_checksum_reflects_depth() {
+        let mut lob = LocalOrderBook::new();
+        lob.apply_delta(Side::Buy, Decimal::from(10), Decimal::from(1));
+        lob.apply_delta(Side::Buy, Decimal::from(9), Decimal::from(2));
+        lob.apply_delta(Side::Sell, Decimal::from(11), Decimal::from(1));
+        lob.apply_delta(Side::Sell, Decimal::from(12), Decimal::from(2));
+
+        let checksum_full = lob.checksum(2);
+        let checksum_partial = lob.checksum(1);
+        assert_ne!(checksum_full, checksum_partial);
     }
 }

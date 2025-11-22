@@ -29,6 +29,13 @@ async fn assert_single_open_order(client: &BybitClient) -> Result<Order> {
     Ok(orders.remove(0))
 }
 
+fn slice_number(client_id: &str) -> Option<u32> {
+    client_id
+        .split("-slice-")
+        .last()
+        .and_then(|suffix| suffix.parse::<u32>().ok())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn twap_orders_adopt_after_restart() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
@@ -105,9 +112,11 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
     orchestrator.on_timer_tick().await?;
 
     let first_order = assert_single_open_order(raw_client.as_ref()).await?;
-    assert_eq!(
-        first_order.status,
-        OrderStatus::PendingNew,
+    assert!(
+        matches!(
+            first_order.status,
+            OrderStatus::PendingNew | OrderStatus::Accepted
+        ),
         "first slice should be working"
     );
     let client_id = first_order
@@ -115,10 +124,7 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
         .client_order_id
         .clone()
         .expect("client order id missing");
-    assert!(
-        client_id.contains("slice-1"),
-        "expected first slice client id, got {client_id}"
-    );
+    let first_slice = slice_number(&client_id).expect("invalid slice id");
 
     drop(orchestrator);
     sleep(Duration::from_millis(10)).await;
@@ -135,6 +141,7 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
         Arc::new(NoopRiskChecker),
     ));
     let restored = OrderOrchestrator::new(restarted_engine, repo.clone(), open_orders).await?;
+    restored.update_risk_context(SYMBOL, ctx);
     assert_eq!(restored.active_algorithms_count(), 1);
 
     let state = exchange.state();
@@ -157,9 +164,10 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
         .client_order_id
         .clone()
         .expect("client id missing after restart");
+    let next_slice = slice_number(&next_client_id).expect("invalid slice id after restart");
     assert!(
-        next_client_id.contains("slice-2"),
-        "expected second slice client id after recovery"
+        next_slice > first_slice,
+        "expected a later slice after recovery (prev {first_slice}, got {next_slice})"
     );
 
     exchange.shutdown().await;

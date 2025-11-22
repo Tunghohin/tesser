@@ -529,6 +529,8 @@ fn decode_order_book(
         bids,
         asks,
         timestamp,
+        exchange_checksum: None,
+        local_checksum: None,
     })
 }
 
@@ -648,12 +650,7 @@ fn apply_depth_delta(book: &mut LocalOrderBook, update: &DepthUpdate) {
 }
 
 fn upsert_level(book: &mut LocalOrderBook, side: Side, level: &OrderBookLevel) {
-    if level.size <= Decimal::ZERO {
-        book.clear_level(side, level.price);
-    } else {
-        book.clear_level(side, level.price);
-        book.add_order(side, level.price, level.size);
-    }
+    book.apply_delta(side, level.price, level.size);
 }
 
 fn snapshot_from_state(
@@ -680,6 +677,8 @@ fn snapshot_from_state(
         bids,
         asks,
         timestamp,
+        exchange_checksum: None,
+        local_checksum: None,
     })
 }
 
