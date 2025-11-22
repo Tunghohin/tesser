@@ -1,13 +1,21 @@
-use anyhow::Result;
+use std::fs;
+use std::path::Path;
+
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use csv::Writer;
 use rust_decimal::Decimal;
+use serde::Serialize;
 use tesser_data::analytics::{
     analyze_execution, ExecutionAnalysisRequest, ExecutionReport, ExecutionStats,
 };
 
 /// Runs the execution analysis workflow and renders a textual report.
-pub fn run_execution(request: ExecutionAnalysisRequest) -> Result<()> {
+pub fn run_execution(request: ExecutionAnalysisRequest, export_csv: Option<&Path>) -> Result<()> {
     let report = analyze_execution(&request)?;
+    if let Some(path) = export_csv {
+        export_report(&report, path)?;
+    }
     render_report(&report);
     Ok(())
 }
@@ -102,4 +110,54 @@ fn arrival_percent(stats: &ExecutionStats) -> String {
     }
     let pct = stats.orders_with_arrival as f64 / stats.order_count as f64 * 100.0;
     format!("{pct:.0}%")
+}
+
+fn decimal_raw(value: &Decimal) -> String {
+    if value.is_zero() {
+        return "0".to_string();
+    }
+    value.normalize().to_string()
+}
+
+fn optional_decimal_raw(value: Option<Decimal>) -> String {
+    value.map(|v| decimal_raw(&v)).unwrap_or_default()
+}
+
+fn export_report(report: &ExecutionReport, output: &Path) -> Result<()> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+    let mut writer = Writer::from_path(output)
+        .with_context(|| format!("failed to create {}", output.display()))?;
+    let rows = std::iter::once(&report.totals).chain(report.per_algo.iter());
+    for stats in rows {
+        let row = ExecutionCsvRow {
+            label: &stats.label,
+            order_count: stats.order_count,
+            fill_count: stats.fill_count,
+            orders_with_arrival: stats.orders_with_arrival,
+            filled_quantity: decimal_raw(&stats.filled_quantity),
+            notional: decimal_raw(&stats.notional),
+            total_fees: decimal_raw(&stats.total_fees),
+            implementation_shortfall: decimal_raw(&stats.implementation_shortfall),
+            avg_slippage_bps: optional_decimal_raw(stats.avg_slippage_bps),
+        };
+        writer.serialize(row)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct ExecutionCsvRow<'a> {
+    label: &'a str,
+    order_count: usize,
+    fill_count: usize,
+    orders_with_arrival: usize,
+    filled_quantity: String,
+    notional: String,
+    total_fees: String,
+    implementation_shortfall: String,
+    avg_slippage_bps: String,
 }

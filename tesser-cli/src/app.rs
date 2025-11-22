@@ -38,8 +38,10 @@ use tesser_config::{load_config, AppConfig, PersistenceEngine, RiskManagementCon
 use tesser_core::{Candle, DepthUpdate, Interval, OrderBook, OrderBookLevel, Side, Symbol, Tick};
 use tesser_data::analytics::ExecutionAnalysisRequest;
 use tesser_data::download::{BinanceDownloader, BybitDownloader, KlineRequest};
+use tesser_data::io::{self, DatasetFormat as IoDatasetFormat};
 use tesser_data::merger::UnifiedEventStream;
 use tesser_data::parquet::ParquetMarketStream;
+use tesser_data::transform::Resampler;
 use tesser_execution::{
     ExecutionEngine, FixedOrderSizer, NoopRiskChecker, OrderSizer, PortfolioPercentSizer,
     RiskAdjustedSizer,
@@ -183,6 +185,9 @@ pub struct AnalyzeExecutionArgs {
     /// Inclusive end of the analysis window
     #[arg(long)]
     end: Option<String>,
+    /// Optional CSV file path for exporting ExecutionStats
+    #[arg(long, value_name = "PATH")]
+    export_csv: Option<PathBuf>,
 }
 
 impl StateInspectArgs {
@@ -381,6 +386,50 @@ impl DataValidateArgs {
     }
 }
 
+impl DataResampleArgs {
+    fn run(&self) -> Result<()> {
+        if !self.input.exists() {
+            bail!("input file {} not found", self.input.display());
+        }
+        let interval: Interval = self.interval.parse().map_err(|err: String| anyhow!(err))?;
+        let dataset = io::read_dataset(&self.input)
+            .with_context(|| format!("failed to read {}", self.input.display()))?;
+        let io::CandleDataset {
+            format: input_format,
+            candles,
+        } = dataset;
+        if candles.is_empty() {
+            bail!(
+                "dataset {} does not contain any candles",
+                self.input.display()
+            );
+        }
+        let input_len = candles.len();
+        let resampled = Resampler::resample(candles, interval);
+        if resampled.is_empty() {
+            bail!(
+                "no candles produced after resampling {}",
+                self.input.display()
+            );
+        }
+        let output_format = self
+            .format
+            .map(IoDatasetFormat::from)
+            .unwrap_or_else(|| IoDatasetFormat::from_path(&self.output));
+        io::write_dataset(&self.output, output_format, &resampled)
+            .with_context(|| format!("failed to write {}", self.output.display()))?;
+        info!(
+            "Resampled {} -> {} candles (input {:?} -> output {:?}) to {}",
+            input_len,
+            resampled.len(),
+            input_format,
+            output_format,
+            self.output.display()
+        );
+        Ok(())
+    }
+}
+
 #[derive(Args)]
 pub struct DataResampleArgs {
     #[arg(long)]
@@ -389,6 +438,24 @@ pub struct DataResampleArgs {
     output: PathBuf,
     #[arg(long, default_value = "1h")]
     interval: String,
+    /// Force the output format (defaults to --output extension)
+    #[arg(long, value_enum)]
+    format: Option<DatasetFormatArg>,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum DatasetFormatArg {
+    Csv,
+    Parquet,
+}
+
+impl From<DatasetFormatArg> for IoDatasetFormat {
+    fn from(value: DatasetFormatArg) -> Self {
+        match value {
+            DatasetFormatArg::Csv => IoDatasetFormat::Csv,
+            DatasetFormatArg::Parquet => IoDatasetFormat::Parquet,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -746,12 +813,7 @@ async fn handle_data(cmd: DataCommand, config: &AppConfig) -> Result<()> {
             args.run()?;
         }
         DataCommand::Resample(args) => {
-            info!(
-                "stub: resampling {} into {} at {}",
-                args.input.display(),
-                args.output.display(),
-                args.interval
-            );
+            args.run()?;
         }
         DataCommand::InspectParquet(args) => {
             args.run()?;
@@ -776,7 +838,9 @@ async fn handle_state(cmd: StateCommand, config: &AppConfig) -> Result<()> {
 
 fn handle_analyze(cmd: AnalyzeCommand) -> Result<()> {
     match cmd {
-        AnalyzeCommand::Execution(args) => analyze::run_execution(args.build_request()?),
+        AnalyzeCommand::Execution(args) => {
+            analyze::run_execution(args.build_request()?, args.export_csv.as_deref())
+        }
     }
 }
 
