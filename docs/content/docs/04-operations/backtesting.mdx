@@ -17,6 +17,21 @@ cargo run -p tesser-cli -- \
 
 Switch to `--mode tick` and provide order-book snapshots when you need depth-aware simulations.
 
+### Streaming Tick Mode from Flight Recorder
+
+Phase 4.1 introduces a streaming tick engine that replays the same Parquet assets produced by the flight recorder. Instead of converting JSONL blobs, point `--lob-data` at the recorder root and the CLI will merge ticks, order-book snapshots, and depth deltas on the fly:
+
+```bash
+cargo run -p tesser-cli -- \
+    backtest run \
+    --strategy-config strategies/pegged.toml \
+    --mode tick \
+    --lob-data data/flight_recorder \
+    --quantity 0.01
+```
+
+The backtester now consumes an async stream of events, so it only keeps the active snapshot and pending fills in memory even when you replay months of high-frequency data.
+
 ## Reports
 
 - Equity curve + drawdown
