@@ -234,7 +234,7 @@ What happens under the hood:
   - `--exec paper`: Keeps the previous behavior (instant synthetic fills).
   - `--exec live`: Submits real REST orders. A separate private WebSocket connection listens for real-time order status updates (`Accepted`, `Filled`, `Canceled`) and execution reports (`Fill` events).
   - When a real `Fill` is received, it's applied to the portfolio, updating your cash, positions, and realized PnL. This creates a closed-loop system where your local state reflects the exchange's reality.
-- **State persistence**: Portfolio equity, open orders and last prices are serialized to `config.live.state_path` (default `./reports/live_state.db`). Restart the process or run `tesser-cli state inspect` to review the snapshot.
+- **State persistence**: Portfolio equity, open orders and last prices are serialized via `config.live.persistence` (path defaults to `./reports/live_state.db`, engine `sqlite` or `lmdb`). Restart the process or run `tesser-cli state inspect` to review the snapshot.
 - **State Reconciliation**: On startup and periodically, the system fetches your open positions and balances via the REST API and compares them to its local state. Discrepancies are logged as warnings, providing a crucial safety net against state drift.
 - **Structured logging**: When running `live`, a JSON file is written to `config.live.log_path` (default `./logs/live.json`). Point Promtail/Loki/Grafana at that file to build dashboards without touching stdout logs.
 - **Metrics**: A Prometheus endpoint is exposed at `config.live.metrics_addr` (default `127.0.0.1:9100`). Scrape `/metrics` to monitor tick/candle throughput, portfolio equity, order errors, and data-gap gauges.
@@ -242,11 +242,11 @@ What happens under the hood:
 
 #### State Database Backups
 
-The SQLite file referenced by `config.live.state_path` is the source of truth for portfolio and order recovery. Treat it like any other operational database:
+The state store referenced by `config.live.persistence.path` is the source of truth for portfolio and order recovery. With `engine = "sqlite"` it's a single file; with `engine = "lmdb"` it's a directory containing `data.mdb`/`lock.mdb`. Treat it like any other operational database:
 
 1. **Ad-hoc inspection**: `tesser-cli state inspect` prints a human-readable summary, while `--raw` dumps the JSON payload you can edit or version-control.
-2. **Offline backup**: stop the live process and copy the file (`cp reports/live_state.db reports/live_state.db.bak`).
-3. **Online backup**: when a session must stay up, use SQLite's native snapshotting: `sqlite3 reports/live_state.db ".backup 'reports/live_state.db.bak'"`. The command is safe because the repository enables WAL journaling.
+2. **Offline backup**: stop the live process and copy the store (for SQLite: `cp reports/live_state.db reports/live_state.db.bak`; for LMDB: copy the directory).
+3. **Online backup**: when a session must stay up, use SQLite's native snapshotting: `sqlite3 reports/live_state.db ".backup 'reports/live_state.db.bak'"`. For LMDB, use `mdb_copy` or take a filesystem snapshot.
 4. **Restoring**: replace the file with a known-good backup and restart `tesser-cli live run`; the runtime will hydrate the portfolio from the restored snapshot.
 
 > ⚠️ **Risk warning**: `--exec live` forwards orders exactly as produced by your strategy—there is no extra confirmation prompt, and portfolio PnL stays paper-based until a future release. Always dry-run on the exchange testnet before pointing to mainnet keys.
@@ -275,9 +275,12 @@ Sample snippet from `config/default.toml`:
 
 ```toml
 [live]
-state_path = "./reports/live_state.db"
 metrics_addr = "127.0.0.1:9100"
 log_path = "./logs/live.json"
+
+[live.persistence]
+engine = "sqlite"
+path = "./reports/live_state.db"
 
 [live.alerting]
 webhook_url = ""          # Optional HTTP endpoint
@@ -291,7 +294,7 @@ max_position_quantity = 2.0 # Absolute cap on aggregate exposure per symbol
 max_drawdown = 0.05         # Liquidate-only kill switch threshold (fractional)
 ```
 
-Every CLI flag (e.g., `--state-path`, `--metrics-addr`, `--log-path`, `--initial-equity`, `--risk-max-*`, `--alert-max-*`) overrides the config file so you can spin up multiple isolated sessions with tailored risk and telemetry controls.
+Every CLI flag (e.g., `--state-path`, `--persistence`, `--metrics-addr`, `--log-path`, `--initial-equity`, `--risk-max-*`, `--alert-max-*`) overrides the config file so you can spin up multiple isolated sessions with tailored risk and telemetry controls.
 
 When `tesser-cli live run` executes, each order is filtered through the pre-trade risk layer: quantities above `max_order_quantity` are rejected, projected exposure cannot exceed `max_position_quantity`, and once equity suffers a drawdown beyond `max_drawdown` the portfolio flips into liquidate-only mode (only allowing exposure-reducing orders) until the process is restarted.
 
