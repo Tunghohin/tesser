@@ -185,6 +185,9 @@ pub struct AnalyzeExecutionArgs {
     /// Inclusive end of the analysis window
     #[arg(long)]
     end: Option<String>,
+    /// Optional CSV file path for exporting ExecutionStats
+    #[arg(long, value_name = "PATH")]
+    export_csv: Option<PathBuf>,
 }
 
 impl StateInspectArgs {
@@ -835,7 +838,9 @@ async fn handle_state(cmd: StateCommand, config: &AppConfig) -> Result<()> {
 
 fn handle_analyze(cmd: AnalyzeCommand) -> Result<()> {
     match cmd {
-        AnalyzeCommand::Execution(args) => analyze::run_execution(args.build_request()?),
+        AnalyzeCommand::Execution(args) => {
+            analyze::run_execution(args.build_request()?, args.export_csv.as_deref())
+        }
     }
 }
 
