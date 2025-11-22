@@ -9,7 +9,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tesser_core::{
     AccountBalance, Cash, CashBook, Fill, Instrument, InstrumentKind, Order, Position, Price,
     Quantity, Side, Symbol,
@@ -552,10 +552,13 @@ pub struct LiveState {
 
 /// Abstraction over state persistence backends.
 pub trait StateRepository: Send + Sync + 'static {
+    /// Structured snapshot stored in durable persistence.
+    type Snapshot: Serialize + DeserializeOwned + Send + Sync + 'static;
+
     /// Load the most recent state from durable storage or defaults if none exists.
-    fn load(&self) -> PortfolioResult<LiveState>;
+    fn load(&self) -> PortfolioResult<Self::Snapshot>;
     /// Atomically save the provided state snapshot.
-    fn save(&self, state: &LiveState) -> PortfolioResult<()>;
+    fn save(&self, state: &Self::Snapshot) -> PortfolioResult<()>;
 }
 
 const STATE_SCHEMA: &str = r#"
@@ -604,6 +607,8 @@ impl SqliteStateRepository {
 }
 
 impl StateRepository for SqliteStateRepository {
+    type Snapshot = LiveState;
+
     fn load(&self) -> PortfolioResult<LiveState> {
         let conn = self.connect()?;
         let payload: Option<String> = conn
