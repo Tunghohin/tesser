@@ -356,7 +356,7 @@ impl OrderOrchestrator {
             let seconds = duration.num_seconds().max(1);
             slice_guess = seconds as u32;
         }
-        let num_slices = slice_guess.max(1).min(30);
+        let num_slices = slice_guess.clamp(1, 30);
 
         // Create and start the algorithm
         let mut algo = TwapAlgorithm::new(signal, total_quantity, duration, num_slices)?;
