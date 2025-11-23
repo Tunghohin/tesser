@@ -1,6 +1,7 @@
 //! Simple paper-trading connector used by the backtester.
 
 mod conditional;
+mod fees;
 
 use std::{
     any::Any,
@@ -40,6 +41,8 @@ use tokio::{
 };
 use tracing::{error, info};
 use uuid::Uuid;
+
+pub use fees::{FeeContext, FeeModel, FeeScheduleConfig, LiquidityRole, MarketFeeConfig};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -91,6 +94,8 @@ pub struct PaperConnectorConfig {
     #[serde(default)]
     pub fee_bps: Decimal,
     #[serde(default)]
+    pub fee_schedule: Option<FeeScheduleConfig>,
+    #[serde(default)]
     pub market: PaperMarketConfig,
 }
 
@@ -102,6 +107,7 @@ impl Default for PaperConnectorConfig {
             initial_balance: default_initial_balance(),
             slippage_bps: Decimal::ZERO,
             fee_bps: Decimal::ZERO,
+            fee_schedule: None,
             market: PaperMarketConfig::default(),
         }
     }
@@ -122,11 +128,16 @@ struct PaperRuntimeState {
 impl PaperRuntimeState {
     fn new(config: PaperConnectorConfig) -> Self {
         let stream_name = format!("paper-{}", config.symbol.to_lowercase());
+        let fee_schedule = config
+            .fee_schedule
+            .clone()
+            .unwrap_or_else(|| FeeScheduleConfig::flat(config.fee_bps.max(Decimal::ZERO)));
+        let fee_model = fee_schedule.build_model();
         let client = Arc::new(PaperExecutionClient::new(
             stream_name,
             vec![config.symbol.clone()],
             config.slippage_bps,
-            config.fee_bps,
+            fee_model,
         ));
         Self {
             client,
@@ -250,16 +261,17 @@ pub struct PaperExecutionClient {
     last_prices: Arc<Mutex<HashMap<Symbol, Price>>>,
     /// Simulation parameters
     slippage_bps: Decimal,
-    fee_bps: Decimal,
+    fee_model: Arc<dyn FeeModel>,
 }
 
 impl Default for PaperExecutionClient {
     fn default() -> Self {
+        let fee_model = FeeScheduleConfig::default().build_model();
         Self::new(
             "paper".into(),
             vec!["BTCUSDT".into()],
             Decimal::ZERO,
-            Decimal::ZERO,
+            fee_model,
         )
     }
 }
@@ -270,7 +282,7 @@ impl PaperExecutionClient {
         name: String,
         markets: Vec<String>,
         slippage_bps: Decimal,
-        fee_bps: Decimal,
+        fee_model: Arc<dyn FeeModel>,
     ) -> Self {
         Self {
             info: BrokerInfo {
@@ -289,7 +301,7 @@ impl PaperExecutionClient {
             conditional_orders: Arc::new(AsyncMutex::new(ConditionalOrderManager::new())),
             last_prices: Arc::new(Mutex::new(HashMap::new())),
             slippage_bps,
-            fee_bps,
+            fee_model,
         }
     }
 
@@ -316,6 +328,19 @@ impl PaperExecutionClient {
         }
     }
 
+    fn compute_fee(
+        &self,
+        symbol: &str,
+        side: Side,
+        role: LiquidityRole,
+        price: Price,
+        qty: Quantity,
+    ) -> Decimal {
+        self.fee_model
+            .fee(FeeContext { symbol, side, role }, price, qty)
+            .max(Decimal::ZERO)
+    }
+
     /// Create a Fill object from an order with proper fee calculation.
     fn create_fill_from_order(
         &self,
@@ -323,11 +348,17 @@ impl PaperExecutionClient {
         fill_price: Price,
         timestamp: DateTime<Utc>,
     ) -> Fill {
-        let fee = if self.fee_bps > Decimal::ZERO {
-            let fee_rate = (self.fee_bps.max(Decimal::ZERO)) / Decimal::from(10_000);
-            Some(fill_price.abs() * order.request.quantity.abs() * fee_rate)
-        } else {
+        let fee_amount = self.compute_fee(
+            &order.request.symbol,
+            order.request.side,
+            LiquidityRole::Taker,
+            fill_price,
+            order.request.quantity.abs(),
+        );
+        let fee = if fee_amount.is_zero() {
             None
+        } else {
+            Some(fee_amount)
         };
 
         Fill {
@@ -660,20 +691,19 @@ struct RestingOrder {
 }
 
 /// Controls how aggressively the matching engine assumes we improve queue position.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum QueueModel {
     #[default]
     Conservative,
     Optimistic,
 }
 
-
 /// Configuration block wiring latency and queue modeling assumptions.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MatchingEngineConfig {
     pub latency: ChronoDuration,
     pub queue_model: QueueModel,
+    pub fee_model: Arc<dyn FeeModel>,
 }
 
 impl Default for MatchingEngineConfig {
@@ -681,6 +711,7 @@ impl Default for MatchingEngineConfig {
         Self {
             latency: ChronoDuration::zero(),
             queue_model: QueueModel::default(),
+            fee_model: FeeScheduleConfig::default().build_model(),
         }
     }
 }
@@ -707,6 +738,7 @@ pub struct MatchingEngine {
     queue_model: QueueModel,
     clock: Arc<Mutex<Option<DateTime<Utc>>>>,
     queue_reset: Arc<AtomicBool>,
+    fee_model: Arc<dyn FeeModel>,
 }
 
 impl MatchingEngine {
@@ -750,6 +782,7 @@ impl MatchingEngine {
             queue_model: config.queue_model,
             clock: Arc::new(Mutex::new(None)),
             queue_reset: Arc::new(AtomicBool::new(false)),
+            fee_model: config.fee_model.clone(),
         }
     }
 
@@ -788,6 +821,19 @@ impl MatchingEngine {
             book.add_order(side, price, quantity);
         }
         self.queue_reset.store(true, Ordering::Relaxed);
+    }
+
+    fn compute_fee(
+        &self,
+        symbol: &str,
+        side: Side,
+        role: LiquidityRole,
+        price: Price,
+        qty: Quantity,
+    ) -> Decimal {
+        self.fee_model
+            .fee(FeeContext { symbol, side, role }, price, qty)
+            .max(Decimal::ZERO)
     }
 
     fn simulated_now(&self) -> DateTime<Utc> {
@@ -936,12 +982,20 @@ impl MatchingEngine {
             let mut resting_book = self.resting_depth.lock().unwrap();
             resting_book.remove_order(resting.order.request.side, resting.price, quantity);
         }
+        let fee_amount = self.compute_fee(
+            &resting.order.request.symbol,
+            resting.order.request.side,
+            LiquidityRole::Maker,
+            price,
+            quantity,
+        );
         let fill = Self::build_fill(
             order_id,
             &resting.order.request.symbol,
             resting.order.request.side,
             price,
             quantity,
+            fee_amount,
             timestamp,
         );
         fills.push(fill.clone());
@@ -1146,15 +1200,23 @@ impl MatchingEngine {
         }
         let mut store = self.fills.lock().await;
         for event in triggered {
-            let fill = Fill {
-                order_id: event.order.id.clone(),
-                symbol: event.order.request.symbol.clone(),
-                side: event.order.request.side,
-                fill_price: event.fill_price,
-                fill_quantity: event.order.request.quantity,
-                fee: None,
-                timestamp: event.timestamp,
-            };
+            let qty = event.order.request.quantity;
+            let fee_amount = self.compute_fee(
+                &event.order.request.symbol,
+                event.order.request.side,
+                LiquidityRole::Taker,
+                event.fill_price,
+                qty,
+            );
+            let fill = Self::build_fill(
+                &event.order.id,
+                &event.order.request.symbol,
+                event.order.request.side,
+                event.fill_price,
+                qty,
+                fee_amount,
+                event.timestamp,
+            );
             self.apply_fill_accounting(&fill).await;
             store.push(fill);
         }
@@ -1173,6 +1235,7 @@ impl MatchingEngine {
         side: Side,
         price: Price,
         qty: Quantity,
+        fee: Decimal,
         timestamp: DateTime<Utc>,
     ) -> Fill {
         Fill {
@@ -1181,7 +1244,7 @@ impl MatchingEngine {
             side,
             fill_price: price,
             fill_quantity: qty,
-            fee: None,
+            fee: if fee.is_zero() { None } else { Some(fee) },
             timestamp,
         }
     }
@@ -1222,9 +1285,10 @@ impl MatchingEngine {
         let mut balances = self.balances.lock().await;
         if let Some(balance) = balances.iter_mut().find(|b| b.currency == "USDT") {
             let notional = fill.fill_price * fill.fill_quantity;
+            let fee = fill.fee.unwrap_or(Decimal::ZERO);
             match fill.side {
-                Side::Buy => balance.available -= notional,
-                Side::Sell => balance.available += notional,
+                Side::Buy => balance.available -= notional + fee,
+                Side::Sell => balance.available += notional - fee,
             }
             balance.total = balance.available;
             balance.updated_at = fill.timestamp;
@@ -1309,12 +1373,20 @@ impl MatchingEngine {
 
         let mut realized_fills = Vec::new();
         for (price, qty) in slices {
+            let fee_amount = self.compute_fee(
+                &order.request.symbol,
+                order.request.side,
+                LiquidityRole::Taker,
+                *price,
+                *qty,
+            );
             let fill = Self::build_fill(
                 &order.id,
                 &order.request.symbol,
                 order.request.side,
                 *price,
                 *qty,
+                fee_amount,
                 Utc::now(),
             );
             self.apply_fill_accounting(&fill).await;
@@ -1359,21 +1431,10 @@ impl ExecutionClient for PaperExecutionClient {
                 let order = self.fill_order(&request);
                 self.orders.lock().await.push(order.clone());
 
-                // Calculate fee if applicable
-                let fee = if self.fee_bps > Decimal::ZERO {
-                    let rate = self.fee_bps.max(Decimal::ZERO) / Decimal::from(10_000);
-                    order
-                        .avg_fill_price
-                        .map(|fill_price| fill_price * order.request.quantity.abs() * rate)
-                } else {
-                    None
-                };
-
                 info!(
                     symbol = %order.request.symbol,
                     qty = %order.request.quantity,
                     price = ?order.avg_fill_price,
-                    fee = ?fee,
                     side = ?order.request.side,
                     "paper order filled"
                 );
@@ -1985,6 +2046,7 @@ mod tests {
             MatchingEngineConfig {
                 latency: ChronoDuration::zero(),
                 queue_model: QueueModel::Conservative,
+                fee_model: FeeScheduleConfig::default().build_model(),
             },
         );
         let book_time = Utc::now();
@@ -2061,6 +2123,7 @@ mod tests {
             MatchingEngineConfig {
                 latency: ChronoDuration::milliseconds(50),
                 queue_model: QueueModel::Optimistic,
+                fee_model: FeeScheduleConfig::default().build_model(),
             },
         );
         let book_time = Utc::now();
@@ -2132,6 +2195,7 @@ mod tests {
             MatchingEngineConfig {
                 latency: ChronoDuration::zero(),
                 queue_model: QueueModel::Optimistic,
+                fee_model: FeeScheduleConfig::default().build_model(),
             },
         );
         let book_time = Utc::now();
@@ -2174,5 +2238,87 @@ mod tests {
         let fills = engine.drain_fills().await;
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].fill_quantity, Decimal::new(2, 0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fee_schedule_distinguishes_maker_and_taker() {
+        let fee_cfg =
+            FeeScheduleConfig::with_defaults(Decimal::ZERO, Decimal::from_f64(0.5).unwrap());
+        let engine = MatchingEngine::with_config(
+            "paper",
+            vec!["BTCUSDT".into()],
+            Decimal::from(10_000),
+            MatchingEngineConfig {
+                latency: ChronoDuration::zero(),
+                queue_model: QueueModel::Optimistic,
+                fee_model: fee_cfg.build_model(),
+            },
+        );
+        let book_time = Utc::now();
+        let snapshot = OrderBook {
+            symbol: "BTCUSDT".into(),
+            bids: vec![OrderBookLevel {
+                price: Decimal::from(9_900),
+                size: Decimal::from(5),
+            }],
+            asks: vec![OrderBookLevel {
+                price: Decimal::from(10_000),
+                size: Decimal::from(5),
+            }],
+            timestamp: book_time,
+            exchange_checksum: None,
+            local_checksum: None,
+        };
+        engine.load_market_snapshot(&snapshot);
+        engine.advance_time(book_time).await;
+
+        let taker_request = OrderRequest {
+            symbol: "BTCUSDT".into(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            quantity: Decimal::ONE,
+            price: Some(Decimal::from(10_100)),
+            trigger_price: None,
+            time_in_force: Some(TimeInForce::GoodTilCanceled),
+            client_order_id: None,
+            take_profit: None,
+            stop_loss: None,
+            display_quantity: None,
+        };
+        let _ = engine.place_order(taker_request).await.unwrap();
+        let mut fills = engine.drain_fills().await;
+        assert_eq!(fills.len(), 1);
+        let taker_fee = fills.pop().and_then(|fill| fill.fee).unwrap();
+        assert!(taker_fee > Decimal::ZERO);
+
+        let maker_request = OrderRequest {
+            symbol: "BTCUSDT".into(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            quantity: Decimal::ONE,
+            price: Some(Decimal::from(9_900)),
+            trigger_price: None,
+            time_in_force: Some(TimeInForce::GoodTilCanceled),
+            client_order_id: None,
+            take_profit: None,
+            stop_loss: None,
+            display_quantity: None,
+        };
+        let order = engine.place_order(maker_request).await.unwrap();
+        assert_eq!(order.status, OrderStatus::Accepted);
+        engine
+            .process_trade(
+                Side::Sell,
+                Decimal::from(9_900),
+                Decimal::ONE,
+                book_time + ChronoDuration::milliseconds(1),
+            )
+            .await;
+        let fills = engine.drain_fills().await;
+        let maker_fee = fills
+            .last()
+            .and_then(|fill| fill.fee)
+            .unwrap_or(Decimal::ZERO);
+        assert!(maker_fee.is_zero());
     }
 }

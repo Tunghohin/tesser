@@ -49,7 +49,8 @@ use tesser_execution::{
 };
 use tesser_markets::MarketRegistry;
 use tesser_paper::{
-    MatchingEngine, MatchingEngineConfig, PaperExecutionClient, PaperMarketStream, QueueModel,
+    FeeScheduleConfig, MatchingEngine, MatchingEngineConfig, PaperExecutionClient,
+    PaperMarketStream, QueueModel,
 };
 use tesser_strategy::{builtin_strategy_names, load_strategy};
 use tracing::{info, warn};
@@ -579,6 +580,9 @@ pub struct BacktestRunArgs {
     /// Trading fees in basis points applied to notional
     #[arg(long, default_value = "0")]
     fee_bps: Decimal,
+    /// Optional fee schedule describing maker/taker rates
+    #[arg(long = "fee-schedule")]
+    fee_schedule: Option<PathBuf>,
     /// Number of candles between signal and execution
     #[arg(long, default_value_t = 1)]
     latency_candles: usize,
@@ -625,6 +629,9 @@ pub struct BacktestBatchArgs {
     /// Trading fees in basis points applied to notional
     #[arg(long, default_value = "0")]
     fee_bps: Decimal,
+    /// Optional fee schedule describing maker/taker rates
+    #[arg(long = "fee-schedule")]
+    fee_schedule: Option<PathBuf>,
     /// Number of candles between signal and execution
     #[arg(long, default_value_t = 1)]
     latency_candles: usize,
@@ -921,16 +928,18 @@ impl BacktestRunArgs {
                 format!("failed to load markets from {}", markets_path.display())
             })?,
         );
+        let fee_schedule = self.resolve_fee_schedule()?;
 
         let (market_stream, event_stream, execution_client, matching_engine) = match mode {
             BacktestMode::Candle => {
                 let stream = self.build_candle_stream(&symbols)?;
-                (
-                    Some(stream),
-                    None,
-                    Arc::new(PaperExecutionClient::default()) as Arc<dyn ExecutionClient>,
-                    None,
-                )
+                let exec_client: Arc<dyn ExecutionClient> = Arc::new(PaperExecutionClient::new(
+                    "paper-backtest".to_string(),
+                    symbols.clone(),
+                    self.slippage_bps,
+                    fee_schedule.build_model(),
+                ));
+                (Some(stream), None, exec_client, None)
             }
             BacktestMode::Tick => {
                 if self.lob_paths.is_empty() {
@@ -938,6 +947,7 @@ impl BacktestRunArgs {
                 }
                 let source = self.detect_lob_source()?;
                 let latency_ms = self.sim_latency_ms.min(i64::MAX as u64);
+                let fee_model = fee_schedule.build_model();
                 let engine = Arc::new(MatchingEngine::with_config(
                     "matching-engine",
                     symbols.clone(),
@@ -945,6 +955,7 @@ impl BacktestRunArgs {
                     MatchingEngineConfig {
                         latency: Duration::milliseconds(latency_ms as i64),
                         queue_model: self.sim_queue_model.into(),
+                        fee_model: fee_model.clone(),
                     },
                 ));
                 let stream = match source {
@@ -995,6 +1006,17 @@ impl BacktestRunArgs {
         .context("backtest failed")?;
         print_report(&report);
         Ok(())
+    }
+
+    fn resolve_fee_schedule(&self) -> Result<FeeScheduleConfig> {
+        if let Some(path) = &self.fee_schedule {
+            load_fee_schedule_file(path)
+        } else {
+            Ok(FeeScheduleConfig::with_defaults(
+                self.fee_bps.max(Decimal::ZERO),
+                self.fee_bps.max(Decimal::ZERO),
+            ))
+        }
     }
 
     fn build_candle_stream(&self, symbols: &[Symbol]) -> Result<BacktestStream> {
@@ -1054,6 +1076,18 @@ impl BacktestRunArgs {
     }
 }
 
+fn load_fee_schedule_file(path: &Path) -> Result<FeeScheduleConfig> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read fee schedule {}", path.display()))?;
+    let cfg = match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("json") => serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse JSON fee schedule {}", path.display()))?,
+        _ => toml::from_str(&contents)
+            .with_context(|| format!("failed to parse TOML fee schedule {}", path.display()))?,
+    };
+    Ok(cfg)
+}
+
 impl BacktestBatchArgs {
     async fn run(&self, config: &AppConfig) -> Result<()> {
         if self.config_paths.is_empty() {
@@ -1076,6 +1110,14 @@ impl BacktestBatchArgs {
         );
         let data_format = detect_data_format(&self.data_paths)?;
         let mut aggregated = Vec::new();
+        let fee_schedule = if let Some(path) = &self.fee_schedule {
+            load_fee_schedule_file(path)?
+        } else {
+            FeeScheduleConfig::with_defaults(
+                self.fee_bps.max(Decimal::ZERO),
+                self.fee_bps.max(Decimal::ZERO),
+            )
+        };
         for config_path in &self.config_paths {
             let contents = std::fs::read_to_string(config_path).with_context(|| {
                 format!("failed to read strategy config {}", config_path.display())
@@ -1101,8 +1143,12 @@ impl BacktestBatchArgs {
                 }
                 DataFormat::Parquet => parquet_market_stream(&symbols, self.data_paths.clone()),
             };
-            let execution_client: Arc<dyn ExecutionClient> =
-                Arc::new(PaperExecutionClient::default());
+            let execution_client: Arc<dyn ExecutionClient> = Arc::new(PaperExecutionClient::new(
+                format!("paper-batch-{}", def.name),
+                symbols.clone(),
+                self.slippage_bps,
+                fee_schedule.build_model(),
+            ));
             let execution =
                 ExecutionEngine::new(execution_client, sizer, Arc::new(NoopRiskChecker));
             let mut cfg = BacktestConfig::new(symbols[0].clone());
