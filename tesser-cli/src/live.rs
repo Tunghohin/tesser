@@ -633,6 +633,7 @@ impl LiveRuntime {
             orchestrator.clone(),
             persisted.clone(),
             last_data_timestamp.clone(),
+            event_bus.clone(),
             shutdown.clone(),
         );
         let reconciliation_ctx = (!settings.exec_backend.is_paper()).then(|| {
@@ -1250,12 +1251,17 @@ fn spawn_event_subscribers(
     let exec_alerts = alerts.clone();
     let exec_metrics = metrics.clone();
     let exec_orchestrator = orchestrator.clone();
+    let exec_recorder = recorder.clone();
     handles.push(tokio::spawn(async move {
         let orchestrator = exec_orchestrator.clone();
+        let recorder = exec_recorder;
         let mut stream = exec_bus.subscribe();
         loop {
             match stream.recv().await {
                 Ok(Event::Signal(evt)) => {
+                    if let Some(handle) = recorder.as_ref() {
+                        handle.record_signal(evt.signal.clone());
+                    }
                     if let Err(err) = process_signal_event(
                         evt.signal,
                         orchestrator.clone(),
