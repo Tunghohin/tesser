@@ -5,7 +5,7 @@ description: Acquire, validate, and store high quality market data.
 
 ## Sources
 
-- **Bybit/Binance Historical** – Use `tesser-cli data download` for candles or `tesser-cli data download-trades` for tick data. When you need months of Bybit trades, pass `--source bybit-public --partition-by-day --resume` to stream the public archive without re-downloading finished partitions.
+- **Bybit/Binance Historical** – Use `tesser-cli data download` for candles or `tesser-cli data download-trades` for tick data. For Bybit, pass `--source bybit-public --partition-by-day --resume` to stream the public archive with automatic resume. For Binance, `--source binance-public --binance-market futures-um` (or `spot` / `futures-cm`) pulls and caches the daily ZIPs before normalizing them to Tesser ticks.
 - **Custom Feeds** – Drop CSV/JSONL files under `data/` and point backtests to them via `--data`.
 
 ## Validation

@@ -1,21 +1,26 @@
 use std::collections::HashSet;
-use std::io::Error as IoError;
+use std::fs::File as StdFile;
+use std::io::{BufRead as StdBufRead, BufReader as StdBufReader};
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Days, Utc};
 use futures::StreamExt;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tesser_core::{Candle, Interval, Side, Symbol, Tick};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio_util::io::StreamReader;
-use tracing::{debug, info, warn};
+use tokio::fs::{self, OpenOptions};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::task;
+use tracing::{debug, info};
+use zip::ZipArchive;
 
 const MAX_LIMIT: usize = 1000;
 const BYBIT_PUBLIC_BASE_URL: &str = "https://public.bybit.com/trading";
+const BINANCE_PUBLIC_BASE_URL: &str = "https://data.binance.vision/data/futures/um/daily/aggTrades";
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 #[async_trait]
@@ -28,6 +33,7 @@ pub trait MarketDataDownloader {
 pub enum TradeSource {
     Rest,
     BybitPublicArchive,
+    BinancePublicArchive,
 }
 
 /// Parameters for a trade download request.
@@ -40,6 +46,8 @@ pub struct TradeRequest<'a> {
     pub limit: usize,
     pub source: TradeSource,
     pub public_data_url: Option<&'a str>,
+    pub archive_cache_dir: Option<PathBuf>,
+    pub resume_archives: bool,
 }
 
 impl<'a> TradeRequest<'a> {
@@ -52,6 +60,8 @@ impl<'a> TradeRequest<'a> {
             limit: MAX_LIMIT,
             source: TradeSource::Rest,
             public_data_url: None,
+            archive_cache_dir: None,
+            resume_archives: false,
         }
     }
 
@@ -76,6 +86,18 @@ impl<'a> TradeRequest<'a> {
     #[must_use]
     pub fn with_public_data_url(mut self, url: &'a str) -> Self {
         self.public_data_url = Some(url);
+        self
+    }
+
+    #[must_use]
+    pub fn with_archive_cache_dir(mut self, dir: PathBuf) -> Self {
+        self.archive_cache_dir = Some(dir);
+        self
+    }
+
+    #[must_use]
+    pub fn with_resume_archives(mut self, resume: bool) -> Self {
+        self.resume_archives = resume;
         self
     }
 }
@@ -255,6 +277,9 @@ impl MarketDataDownloader for BybitDownloader {
         match req.source {
             TradeSource::Rest => self.download_trades_rest(req).await,
             TradeSource::BybitPublicArchive => self.download_trades_public(req).await,
+            TradeSource::BinancePublicArchive => Err(anyhow!(
+                "binance public archive source is invalid for Bybit requests"
+            )),
         }
     }
 }
@@ -372,6 +397,7 @@ impl BybitDownloader {
         let mut trades = Vec::new();
         let mut seen_ids = HashSet::new();
         let base_url = req.public_data_url.unwrap_or(BYBIT_PUBLIC_BASE_URL);
+        let cache_root = resolve_archive_cache_dir(req, "bybit", req.symbol);
         let total_days = (end_date
             .signed_duration_since(cursor_date)
             .num_days()
@@ -410,19 +436,33 @@ impl BybitDownloader {
                 continue;
             }
 
+            let filename = format!("{}_{}.csv.gz", req.symbol, cursor_date.format("%Y-%m-%d"));
+            let cache_path = cache_root.join(&filename);
             let url = format!(
                 "{}/{symbol}/{symbol}{}.csv.gz",
                 base_url,
                 cursor_date.format("%Y-%m-%d"),
                 symbol = req.symbol
             );
-            match self
-                .download_public_day(&url, req.symbol, day_start, day_end, &mut seen_ids)
-                .await
+            if download_archive_file(&self.client, &url, &cache_path, req.resume_archives)
+                .await?
+                .is_none()
             {
-                Ok(day_trades) => trades.extend(day_trades),
-                Err(err) => warn!("failed to load {}: {err:#}", url),
+                if next_date == cursor_date {
+                    break;
+                }
+                cursor_date = next_date;
+                continue;
             }
+            let mut day_trades = read_bybit_archive(
+                &cache_path,
+                req.symbol,
+                day_start.timestamp_millis(),
+                day_end.timestamp_millis(),
+                &mut seen_ids,
+            )
+            .await?;
+            trades.append(&mut day_trades);
 
             if next_date == cursor_date {
                 break;
@@ -437,64 +477,6 @@ impl BybitDownloader {
                 && a.tick.size == b.tick.size
                 && a.tick.side == b.tick.side
         });
-        Ok(trades)
-    }
-
-    async fn download_public_day(
-        &self,
-        url: &str,
-        symbol: &str,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-        seen_ids: &mut HashSet<String>,
-    ) -> Result<Vec<NormalizedTrade>> {
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .with_context(|| format!("failed to fetch {url}"))?;
-        let status = response.status();
-        if status.as_u16() == 404 {
-            debug!("bybit public archive missing {}", url);
-            return Ok(Vec::new());
-        }
-        if !status.is_success() {
-            warn!("archive request {url} failed with {}", status);
-            return Ok(Vec::new());
-        }
-
-        let stream = response
-            .bytes_stream()
-            .map(|result| result.map_err(IoError::other));
-        let reader = StreamReader::new(stream);
-        let buf_reader = BufReader::new(reader);
-        let decoder = async_compression::tokio::bufread::GzipDecoder::new(buf_reader);
-        let reader = BufReader::new(decoder);
-        let mut lines = reader.lines();
-        let mut trades = Vec::new();
-        let start_ms = start.timestamp_millis();
-        let end_ms = end.timestamp_millis();
-
-        while let Some(line) = lines.next_line().await? {
-            if line.starts_with("timestamp") {
-                continue;
-            }
-            let Some(trade) = parse_bybit_public_line(symbol, &line) else {
-                continue;
-            };
-            let ts = trade.tick.exchange_timestamp.timestamp_millis();
-            if ts < start_ms || ts > end_ms {
-                continue;
-            }
-            if let Some(id) = trade.trade_id.as_ref() {
-                if !seen_ids.insert(id.clone()) {
-                    continue;
-                }
-            }
-            trades.push(trade);
-        }
-
         Ok(trades)
     }
 }
@@ -674,6 +656,89 @@ impl BinanceDownloader {
         });
         Ok(trades)
     }
+
+    async fn download_trades_public(&self, req: &TradeRequest<'_>) -> Result<Vec<NormalizedTrade>> {
+        let mut cursor_date = req.start.date_naive();
+        let end_date = req.end.date_naive();
+        let mut trades = Vec::new();
+        let mut seen_ids = HashSet::new();
+        let base_url = req.public_data_url.unwrap_or(BINANCE_PUBLIC_BASE_URL);
+        let cache_root = resolve_archive_cache_dir(req, "binance", req.symbol);
+
+        while cursor_date <= end_date {
+            let next_date = cursor_date
+                .checked_add_days(Days::new(1))
+                .unwrap_or(cursor_date);
+            let day_start = DateTime::<Utc>::from_naive_utc_and_offset(
+                cursor_date
+                    .and_hms_opt(0, 0, 0)
+                    .ok_or_else(|| anyhow!("invalid date {}", cursor_date))?,
+                Utc,
+            )
+            .max(req.start);
+            let day_end = DateTime::<Utc>::from_naive_utc_and_offset(
+                next_date
+                    .and_hms_opt(0, 0, 0)
+                    .ok_or_else(|| anyhow!("invalid date {}", next_date))?,
+                Utc,
+            )
+            .min(req.end);
+            if day_start >= day_end {
+                if next_date == cursor_date {
+                    break;
+                }
+                cursor_date = next_date;
+                continue;
+            }
+
+            let filename = format!(
+                "{}-aggTrades-{}.zip",
+                req.symbol,
+                cursor_date.format("%Y-%m-%d")
+            );
+            let cache_path = cache_root.join(&filename);
+            let url = format!("{}/{symbol}/{filename}", base_url, symbol = req.symbol);
+            if download_archive_file(&self.client, &url, &cache_path, req.resume_archives)
+                .await?
+                .is_none()
+            {
+                if next_date == cursor_date {
+                    break;
+                }
+                cursor_date = next_date;
+                continue;
+            }
+            let parsed = read_binance_archive(cache_path.clone(), req.symbol.to_string()).await?;
+            let start_ms = day_start.timestamp_millis();
+            let end_ms = day_end.timestamp_millis();
+            for trade in parsed {
+                let ts = trade.tick.exchange_timestamp.timestamp_millis();
+                if ts < start_ms || ts > end_ms {
+                    continue;
+                }
+                if let Some(id) = trade.trade_id.as_ref() {
+                    if !seen_ids.insert(id.clone()) {
+                        continue;
+                    }
+                }
+                trades.push(trade);
+            }
+
+            if next_date == cursor_date {
+                break;
+            }
+            cursor_date = next_date;
+        }
+
+        trades.sort_by_key(|trade| trade.tick.exchange_timestamp);
+        trades.dedup_by(|a, b| {
+            a.tick.exchange_timestamp == b.tick.exchange_timestamp
+                && a.tick.price == b.tick.price
+                && a.tick.size == b.tick.size
+                && a.tick.side == b.tick.side
+        });
+        Ok(trades)
+    }
 }
 
 #[async_trait]
@@ -753,7 +818,13 @@ impl MarketDataDownloader for BinanceDownloader {
     }
 
     async fn download_trades(&self, req: &TradeRequest<'_>) -> Result<Vec<NormalizedTrade>> {
-        self.fetch_agg_trades(req).await
+        match req.source {
+            TradeSource::Rest => self.fetch_agg_trades(req).await,
+            TradeSource::BinancePublicArchive => self.download_trades_public(req).await,
+            TradeSource::BybitPublicArchive => Err(anyhow!(
+                "bybit public archive source is invalid for Binance requests"
+            )),
+        }
     }
 }
 
@@ -796,11 +867,11 @@ struct BinanceAggTrade {
 
 fn parse_bybit_public_line(symbol: &str, line: &str) -> Option<NormalizedTrade> {
     let mut columns = line.split(',');
-    let timestamp = parse_public_timestamp(columns.next()?)?;
+    let timestamp = parse_public_timestamp(columns.next()?.trim())?;
     let _symbol = columns.next()?;
-    let side = parse_side(columns.next()?)?;
-    let size = columns.next()?.parse::<Decimal>().ok()?;
-    let price = columns.next()?.parse::<Decimal>().ok()?;
+    let side = parse_side(columns.next()?.trim())?;
+    let size = columns.next()?.trim().parse::<Decimal>().ok()?;
+    let price = columns.next()?.trim().parse::<Decimal>().ok()?;
     columns.next()?; // tickDirection
     let trade_id = columns.next().map(|value| value.trim().to_string());
 
@@ -813,6 +884,42 @@ fn parse_bybit_public_line(symbol: &str, line: &str) -> Option<NormalizedTrade> 
         received_at: timestamp,
     };
     Some(NormalizedTrade::new(tick, trade_id))
+}
+
+fn parse_binance_public_line(symbol: &str, line: &str) -> Option<NormalizedTrade> {
+    let mut columns = line.split(',');
+    let agg_id = columns.next()?.trim().parse::<u64>().ok()?;
+    let price = columns.next()?.trim().parse::<Decimal>().ok()?;
+    let size = columns.next()?.trim().parse::<Decimal>().ok()?;
+    columns.next()?; // firstTradeId
+    columns.next()?; // lastTradeId
+    let timestamp = columns
+        .next()?
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)?;
+    let maker_flag = columns.next()?.trim();
+    let is_buyer_maker = match maker_flag {
+        "true" | "True" | "1" => true,
+        "false" | "False" | "0" => false,
+        _ => return None,
+    };
+    let _ = columns.next(); // ignore bestPriceMatch flag
+    let side = if is_buyer_maker {
+        Side::Sell
+    } else {
+        Side::Buy
+    };
+    let tick = Tick {
+        symbol: Symbol::from(symbol),
+        price,
+        size,
+        side,
+        exchange_timestamp: timestamp,
+        received_at: timestamp,
+    };
+    Some(NormalizedTrade::new(tick, Some(agg_id.to_string())))
 }
 
 fn parse_public_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -880,6 +987,146 @@ fn truncate(body: &str, max: usize) -> String {
     }
 }
 
+fn resolve_archive_cache_dir(req: &TradeRequest<'_>, exchange: &str, symbol: &str) -> PathBuf {
+    req.archive_cache_dir.clone().unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join("tesser-data")
+            .join(exchange)
+            .join(symbol)
+    })
+}
+
+async fn download_archive_file(
+    client: &Client,
+    url: &str,
+    cache_path: &Path,
+    resume: bool,
+) -> Result<Option<()>> {
+    if let Some(parent) = cache_path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let mut start = 0;
+    if resume {
+        if let Ok(meta) = fs::metadata(cache_path).await {
+            start = meta.len();
+        }
+    } else if fs::try_exists(cache_path).await? {
+        fs::remove_file(cache_path).await?;
+    }
+    let mut request = client.get(url);
+    if resume && start > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={start}-"));
+    }
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch archive {url}"))?;
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        debug!("archive missing {}", url);
+        return Ok(None);
+    }
+    if resume && status == StatusCode::RANGE_NOT_SATISFIABLE {
+        debug!("archive already complete {}", url);
+        return Ok(Some(()));
+    }
+    if !(status.is_success() || status == StatusCode::PARTIAL_CONTENT) {
+        return Err(anyhow!(
+            "archive request {} failed with status {}",
+            url,
+            status
+        ));
+    }
+
+    let mut file = if start > 0 {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(cache_path)
+            .await?
+    } else {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(cache_path)
+            .await?
+    };
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.context("failed to read archive chunk")?;
+        file.write_all(&bytes).await?;
+    }
+    file.flush().await?;
+    Ok(Some(()))
+}
+
+async fn read_bybit_archive(
+    cache_path: &Path,
+    symbol: &str,
+    start_ms: i64,
+    end_ms: i64,
+    seen_ids: &mut HashSet<String>,
+) -> Result<Vec<NormalizedTrade>> {
+    let file = tokio::fs::File::open(cache_path)
+        .await
+        .with_context(|| format!("failed to open {}", cache_path.display()))?;
+    let reader = BufReader::new(file);
+    let decoder = async_compression::tokio::bufread::GzipDecoder::new(reader);
+    let reader = BufReader::new(decoder);
+    let mut lines = reader.lines();
+    let mut trades = Vec::new();
+    while let Some(line) = lines.next_line().await? {
+        if line.starts_with("timestamp") {
+            continue;
+        }
+        let Some(trade) = parse_bybit_public_line(symbol, line.trim()) else {
+            continue;
+        };
+        let ts = trade.tick.exchange_timestamp.timestamp_millis();
+        if ts < start_ms || ts > end_ms {
+            continue;
+        }
+        if let Some(id) = trade.trade_id.as_ref() {
+            if !seen_ids.insert(id.clone()) {
+                continue;
+            }
+        }
+        trades.push(trade);
+    }
+    Ok(trades)
+}
+
+async fn read_binance_archive(cache_path: PathBuf, symbol: String) -> Result<Vec<NormalizedTrade>> {
+    task::spawn_blocking(move || -> Result<Vec<NormalizedTrade>> {
+        let file = StdFile::open(&cache_path)
+            .with_context(|| format!("failed to open {}", cache_path.display()))?;
+        let mut archive = ZipArchive::new(file)
+            .with_context(|| format!("failed to open zip {}", cache_path.display()))?;
+        let mut trades = Vec::new();
+        for index in 0..archive.len() {
+            let file = archive.by_index(index)?;
+            if !file.name().ends_with(".csv") {
+                continue;
+            }
+            let reader = StdBufReader::new(file);
+            for line in reader.lines() {
+                let line = line?;
+                if line.starts_with("aggTradeId") || line.trim().is_empty() {
+                    continue;
+                }
+                if let Some(trade) = parse_binance_public_line(&symbol, line.trim()) {
+                    trades.push(trade);
+                }
+            }
+        }
+        Ok(trades)
+    })
+    .await?
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -905,5 +1152,14 @@ mod tests {
         let ts = parse_public_timestamp("1585180700.0647").expect("timestamp");
         assert_eq!(ts.timestamp(), 1_585_180_700);
         assert!(ts.timestamp_subsec_nanos() > 0);
+    }
+
+    #[test]
+    fn parses_binance_public_line() {
+        let line = "1001,51234.5,0.010,200,205,1585180700064,true,false";
+        let trade = parse_binance_public_line("BTCUSDT", line).expect("trade");
+        assert_eq!(trade.trade_id.as_deref(), Some("1001"));
+        assert_eq!(trade.tick.price, Decimal::from_str("51234.5").unwrap());
+        assert_eq!(trade.tick.side, Side::Sell);
     }
 }

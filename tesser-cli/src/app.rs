@@ -201,6 +201,9 @@ pub struct DataDownloadTradesArgs {
     /// Override Bybit public archive base URL
     #[arg(long)]
     bybit_public_url: Option<String>,
+    /// Binance public archive market (spot/futures)
+    #[arg(long, value_enum, default_value_t = BinanceMarketArg::FuturesUm)]
+    binance_market: BinanceMarketArg,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -208,6 +211,28 @@ pub enum TradeSourceArg {
     Rest,
     #[value(name = "bybit-public")]
     BybitPublic,
+    #[value(name = "binance-public")]
+    BinancePublic,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum BinanceMarketArg {
+    #[value(name = "spot")]
+    Spot,
+    #[value(name = "futures-um")]
+    FuturesUm,
+    #[value(name = "futures-cm")]
+    FuturesCm,
+}
+
+impl BinanceMarketArg {
+    fn base_path(self) -> &'static str {
+        match self {
+            Self::Spot => "https://data.binance.vision/data/spot/daily/aggTrades",
+            Self::FuturesUm => "https://data.binance.vision/data/futures/um/daily/aggTrades",
+            Self::FuturesCm => "https://data.binance.vision/data/futures/cm/daily/aggTrades",
+        }
+    }
 }
 
 #[derive(Args)]
@@ -384,10 +409,22 @@ impl DataDownloadTradesArgs {
             self.symbol, self.exchange, start, end
         );
 
-        let mut base_request = TradeRequest::new(&self.symbol, start, end).with_limit(self.limit);
+        let cache_dir = config
+            .data_path
+            .join("ticks")
+            .join("cache")
+            .join(&self.exchange)
+            .join(&self.symbol);
+        let mut base_request = TradeRequest::new(&self.symbol, start, end)
+            .with_limit(self.limit)
+            .with_archive_cache_dir(cache_dir)
+            .with_resume_archives(self.resume);
         let driver = exchange_cfg.driver.as_str();
         match driver {
             "bybit" | "" => {
+                if self.source == TradeSourceArg::BinancePublic {
+                    bail!("Binance public archives are not available for Bybit");
+                }
                 base_request = base_request.with_category(&self.category);
                 if self.source == TradeSourceArg::BybitPublic {
                     base_request = base_request.with_source(TradeSource::BybitPublicArchive);
@@ -396,11 +433,17 @@ impl DataDownloadTradesArgs {
                     }
                 }
             }
-            "binance" => {
-                if self.source != TradeSourceArg::Rest {
-                    bail!("Binance only supports --source=rest");
+            "binance" => match self.source {
+                TradeSourceArg::Rest => {}
+                TradeSourceArg::BinancePublic => {
+                    base_request = base_request
+                        .with_source(TradeSource::BinancePublicArchive)
+                        .with_public_data_url(self.binance_market.base_path());
                 }
-            }
+                TradeSourceArg::BybitPublic => {
+                    bail!("Bybit public archives are not available for Binance");
+                }
+            },
             other => bail!("unknown exchange driver '{other}' for {}", self.exchange),
         }
 
