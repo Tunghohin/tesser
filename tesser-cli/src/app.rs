@@ -48,7 +48,9 @@ use tesser_execution::{
     RiskAdjustedSizer,
 };
 use tesser_markets::MarketRegistry;
-use tesser_paper::{MatchingEngine, PaperExecutionClient, PaperMarketStream};
+use tesser_paper::{
+    MatchingEngine, MatchingEngineConfig, PaperExecutionClient, PaperMarketStream, QueueModel,
+};
 use tesser_strategy::{builtin_strategy_names, load_strategy};
 use tracing::{info, warn};
 
@@ -545,6 +547,21 @@ pub enum BacktestModeArg {
     Tick,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum QueueModelArg {
+    Conserv,
+    Optimistic,
+}
+
+impl From<QueueModelArg> for QueueModel {
+    fn from(value: QueueModelArg) -> Self {
+        match value {
+            QueueModelArg::Conserv => QueueModel::Conservative,
+            QueueModelArg::Optimistic => QueueModel::Optimistic,
+        }
+    }
+}
+
 #[derive(Args)]
 pub struct BacktestRunArgs {
     #[arg(long)]
@@ -574,6 +591,12 @@ pub struct BacktestRunArgs {
     /// One or more JSONL files or a flight-recorder directory containing tick/order book events (required for `--mode tick`)
     #[arg(long = "lob-data", value_name = "PATH", num_args = 0.., action = clap::ArgAction::Append)]
     lob_paths: Vec<PathBuf>,
+    /// Round-trip latency, in milliseconds, applied to limit order placements/cancellations during tick-mode sims
+    #[arg(long = "sim-latency-ms", default_value_t = 0)]
+    sim_latency_ms: u64,
+    /// Queue modeling assumption used when simulating passive fills
+    #[arg(long = "sim-queue-model", value_enum, default_value = "conserv")]
+    sim_queue_model: QueueModelArg,
     #[arg(long)]
     markets_file: Option<PathBuf>,
 }
@@ -914,10 +937,15 @@ impl BacktestRunArgs {
                     bail!("--lob-data is required when --mode tick");
                 }
                 let source = self.detect_lob_source()?;
-                let engine = Arc::new(MatchingEngine::new(
+                let latency_ms = self.sim_latency_ms.min(i64::MAX as u64);
+                let engine = Arc::new(MatchingEngine::with_config(
                     "matching-engine",
                     symbols.clone(),
                     reporting_balance(&config.backtest),
+                    MatchingEngineConfig {
+                        latency: Duration::milliseconds(latency_ms as i64),
+                        queue_model: self.sim_queue_model.into(),
+                    },
                 ));
                 let stream = match source {
                     LobSource::Json(paths) => {

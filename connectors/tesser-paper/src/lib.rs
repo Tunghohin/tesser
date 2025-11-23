@@ -520,13 +520,14 @@ impl ExecutionClient for MatchingEngine {
                     self.handle_immediate_fills(&mut order, &slices).await?;
                     Ok(order)
                 } else {
-                    order.status = OrderStatus::Accepted;
-                    order.updated_at = Utc::now();
-                    {
-                        let mut resting = self.resting_depth.lock().unwrap();
-                        resting.add_order(request.side, limit_price, request.quantity);
+                    let now = self.simulated_now();
+                    let activation_time = self.activation_deadline(now);
+                    if self.latency <= ChronoDuration::zero() {
+                        order.status = OrderStatus::Accepted;
+                        order.updated_at = now;
                     }
-                    self.record_resting_order(order.clone()).await;
+                    self.record_resting_order(order.clone(), limit_price, activation_time)
+                        .await;
                     Ok(order)
                 }
             }
@@ -547,16 +548,24 @@ impl ExecutionClient for MatchingEngine {
 
     async fn cancel_order(&self, order_id: OrderId, _symbol: &str) -> BrokerResult<()> {
         let mut open = self.open_orders.lock().await;
-        if let Some(resting) = open.remove(&order_id) {
-            let mut book = self.resting_depth.lock().unwrap();
-            book.remove_order(resting.order.request.side, resting.price, resting.remaining);
-            Ok(())
-        } else {
-            Err(BrokerError::InvalidRequest(format!(
-                "order {} not found",
-                order_id
-            )))
+        if let Some(resting) = open.get_mut(&order_id) {
+            if self.latency <= ChronoDuration::zero() {
+                let resting = open.remove(&order_id).unwrap();
+                drop(open);
+                if resting.active && resting.remaining > Decimal::ZERO {
+                    let mut book = self.resting_depth.lock().unwrap();
+                    book.remove_order(resting.order.request.side, resting.price, resting.remaining);
+                }
+                return Ok(());
+            }
+            let now = self.simulated_now();
+            resting.cancel_after = Some(self.activation_deadline(now));
+            return Ok(());
         }
+        Err(BrokerError::InvalidRequest(format!(
+            "order {} not found",
+            order_id
+        )))
     }
 
     async fn amend_order(&self, request: OrderUpdateRequest) -> BrokerResult<Order> {
@@ -574,7 +583,7 @@ impl ExecutionClient for MatchingEngine {
                 "side mismatch for amend".into(),
             ));
         }
-        {
+        if resting.active && resting.remaining > Decimal::ZERO {
             let mut book = self.resting_depth.lock().unwrap();
             book.remove_order(resting.order.request.side, resting.price, resting.remaining);
         }
@@ -590,6 +599,7 @@ impl ExecutionClient for MatchingEngine {
             }
             resting.order.request.quantity = quantity;
             resting.remaining = (quantity - resting.order.filled_quantity).max(Decimal::ZERO);
+            resting.original_quantity = quantity;
         } else {
             resting.remaining =
                 (resting.order.request.quantity - resting.order.filled_quantity).max(Decimal::ZERO);
@@ -602,11 +612,12 @@ impl ExecutionClient for MatchingEngine {
             resting.order.status = OrderStatus::Accepted;
         }
         resting.order.updated_at = Utc::now();
-        {
+        if resting.active && resting.remaining > Decimal::ZERO {
+            resting.initial_queue_position =
+                self.queue_ahead_for(resting.order.request.side, resting.price, Decimal::ZERO);
+            resting.processed_volume = Decimal::ZERO;
             let mut book = self.resting_depth.lock().unwrap();
-            if resting.remaining > Decimal::ZERO {
-                book.add_order(resting.order.request.side, resting.price, resting.remaining);
-            }
+            book.add_order(resting.order.request.side, resting.price, resting.remaining);
         }
         Ok(resting.order.clone())
     }
@@ -640,6 +651,38 @@ struct RestingOrder {
     order: Order,
     remaining: Quantity,
     price: Price,
+    initial_queue_position: Quantity,
+    processed_volume: Quantity,
+    activation_time: DateTime<Utc>,
+    cancel_after: Option<DateTime<Utc>>,
+    active: bool,
+    original_quantity: Quantity,
+}
+
+/// Controls how aggressively the matching engine assumes we improve queue position.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Default)]
+pub enum QueueModel {
+    #[default]
+    Conservative,
+    Optimistic,
+}
+
+
+/// Configuration block wiring latency and queue modeling assumptions.
+#[derive(Clone, Debug)]
+pub struct MatchingEngineConfig {
+    pub latency: ChronoDuration,
+    pub queue_model: QueueModel,
+}
+
+impl Default for MatchingEngineConfig {
+    fn default() -> Self {
+        Self {
+            latency: ChronoDuration::zero(),
+            queue_model: QueueModel::default(),
+        }
+    }
 }
 
 /// Matching engine that consumes tick/L2 data for high-fidelity backtests.
@@ -660,12 +703,31 @@ pub struct MatchingEngine {
     open_orders: Arc<AsyncMutex<HashMap<OrderId, RestingOrder>>>,
     fills: Arc<AsyncMutex<Vec<Fill>>>,
     conditional_orders: Arc<AsyncMutex<ConditionalOrderManager>>,
+    latency: ChronoDuration,
+    queue_model: QueueModel,
+    clock: Arc<Mutex<Option<DateTime<Utc>>>>,
+    queue_reset: Arc<AtomicBool>,
 }
 
 impl MatchingEngine {
     /// Build a new matching engine with the provided book metadata.
     pub fn new(name: impl Into<String>, markets: Vec<String>, initial_cash: Price) -> Self {
+        Self::with_config(name, markets, initial_cash, MatchingEngineConfig::default())
+    }
+
+    /// Build a matching engine configured with explicit latency/queue parameters.
+    pub fn with_config(
+        name: impl Into<String>,
+        markets: Vec<String>,
+        initial_cash: Price,
+        config: MatchingEngineConfig,
+    ) -> Self {
         let now = Utc::now();
+        let latency = if config.latency < ChronoDuration::zero() {
+            ChronoDuration::zero()
+        } else {
+            config.latency
+        };
         Self {
             info: BrokerInfo {
                 name: name.into(),
@@ -684,6 +746,10 @@ impl MatchingEngine {
             open_orders: Arc::new(AsyncMutex::new(HashMap::new())),
             fills: Arc::new(AsyncMutex::new(Vec::new())),
             conditional_orders: Arc::new(AsyncMutex::new(ConditionalOrderManager::new())),
+            latency,
+            queue_model: config.queue_model,
+            clock: Arc::new(Mutex::new(None)),
+            queue_reset: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -701,6 +767,7 @@ impl MatchingEngine {
             .map(|level| (level.price, level.size))
             .collect();
         depth.load_snapshot(&bids, &asks);
+        self.queue_reset.store(true, Ordering::Relaxed);
     }
 
     /// Apply an incremental depth update.
@@ -720,6 +787,181 @@ impl MatchingEngine {
         } else {
             book.add_order(side, price, quantity);
         }
+        self.queue_reset.store(true, Ordering::Relaxed);
+    }
+
+    fn simulated_now(&self) -> DateTime<Utc> {
+        let guard = self.clock.lock().unwrap();
+        guard.unwrap_or_else(Utc::now)
+    }
+
+    fn activation_deadline(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        now + self.latency
+    }
+
+    fn queue_ahead_for(&self, side: Side, price: Price, exclude_self: Quantity) -> Quantity {
+        if self.queue_model == QueueModel::Optimistic {
+            return Decimal::ZERO;
+        }
+        let market_qty = {
+            let depth = self.market_depth.lock().unwrap();
+            depth.volume_at_level(side, price)
+        };
+        let own_qty = {
+            let book = self.resting_depth.lock().unwrap();
+            let total = book.volume_at_level(side, price);
+            (total - exclude_self).max(Decimal::ZERO)
+        };
+        market_qty + own_qty
+    }
+
+    pub async fn advance_time(&self, now: DateTime<Utc>) {
+        {
+            let mut guard = self.clock.lock().unwrap();
+            if guard.is_none_or(|prev| now > prev) {
+                *guard = Some(now);
+            }
+        }
+        if self.queue_reset.swap(false, Ordering::Relaxed) {
+            self.reseed_queue_positions().await;
+        }
+        self.activate_due(now).await;
+        self.finalize_cancels(now).await;
+    }
+
+    async fn activate_due(&self, now: DateTime<Utc>) {
+        let mut additions = Vec::new();
+        {
+            let mut open = self.open_orders.lock().await;
+            for resting in open.values_mut() {
+                if resting.active || now < resting.activation_time {
+                    continue;
+                }
+                resting.active = true;
+                resting.order.status = OrderStatus::Accepted;
+                resting.order.updated_at = now;
+                resting.initial_queue_position =
+                    self.queue_ahead_for(resting.order.request.side, resting.price, Decimal::ZERO);
+                resting.processed_volume = Decimal::ZERO;
+                if resting.remaining > Decimal::ZERO {
+                    additions.push((resting.order.request.side, resting.price, resting.remaining));
+                }
+            }
+        }
+        if additions.is_empty() {
+            return;
+        }
+        let mut book = self.resting_depth.lock().unwrap();
+        for (side, price, qty) in additions {
+            book.add_order(side, price, qty);
+        }
+    }
+
+    async fn finalize_cancels(&self, now: DateTime<Utc>) {
+        let mut canceled = Vec::new();
+        {
+            let mut open = self.open_orders.lock().await;
+            let ids: Vec<_> = open
+                .iter()
+                .filter_map(|(id, resting)| {
+                    if resting.cancel_after.is_some_and(|deadline| now >= deadline) {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for id in ids {
+                if let Some(resting) = open.remove(&id) {
+                    canceled.push(resting);
+                }
+            }
+        }
+        if canceled.is_empty() {
+            return;
+        }
+        let mut book = self.resting_depth.lock().unwrap();
+        for mut resting in canceled {
+            if resting.active && resting.remaining > Decimal::ZERO {
+                book.remove_order(resting.order.request.side, resting.price, resting.remaining);
+            }
+            resting.order.status = OrderStatus::Canceled;
+            resting.order.updated_at = now;
+        }
+    }
+
+    async fn reseed_queue_positions(&self) {
+        let mut open = self.open_orders.lock().await;
+        for resting in open.values_mut() {
+            if !resting.active || resting.remaining <= Decimal::ZERO {
+                continue;
+            }
+            let ahead =
+                self.queue_ahead_for(resting.order.request.side, resting.price, resting.remaining);
+            resting.initial_queue_position = ahead;
+            resting.processed_volume = Decimal::ZERO;
+        }
+    }
+
+    fn passive_fillable_volume(
+        &self,
+        resting: &mut RestingOrder,
+        trade_size: Quantity,
+    ) -> Quantity {
+        if resting.remaining <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        let prev_processed = resting.processed_volume;
+        let cap = resting.initial_queue_position + resting.original_quantity;
+        let new_processed = (resting.processed_volume + trade_size).min(cap);
+        resting.processed_volume = new_processed;
+        let prev_fillable = (prev_processed - resting.initial_queue_position).max(Decimal::ZERO);
+        let new_fillable = (new_processed - resting.initial_queue_position).max(Decimal::ZERO);
+        (new_fillable - prev_fillable).max(Decimal::ZERO)
+    }
+
+    async fn apply_resting_fill(
+        &self,
+        order_id: &OrderId,
+        resting: &mut RestingOrder,
+        price: Price,
+        quantity: Quantity,
+        timestamp: DateTime<Utc>,
+        fills: &mut Vec<Fill>,
+    ) {
+        if quantity <= Decimal::ZERO {
+            return;
+        }
+        {
+            let mut resting_book = self.resting_depth.lock().unwrap();
+            resting_book.remove_order(resting.order.request.side, resting.price, quantity);
+        }
+        let fill = Self::build_fill(
+            order_id,
+            &resting.order.request.symbol,
+            resting.order.request.side,
+            price,
+            quantity,
+            timestamp,
+        );
+        fills.push(fill.clone());
+        let prev_qty = resting.order.filled_quantity;
+        resting.order.filled_quantity += quantity;
+        let prev_notional = resting.order.avg_fill_price.unwrap_or(Decimal::ZERO) * prev_qty;
+        let new_notional = prev_notional + price * quantity;
+        resting.order.avg_fill_price = if resting.order.filled_quantity.is_zero() {
+            Some(price)
+        } else {
+            Some(new_notional / resting.order.filled_quantity)
+        };
+        resting.remaining = (resting.remaining - quantity).max(Decimal::ZERO);
+        resting.order.updated_at = timestamp;
+        resting.order.status = if resting.remaining <= Decimal::ZERO {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::PartiallyFilled
+        };
+        self.apply_fill_accounting(&fill).await;
     }
 
     fn build_pending_order(request: OrderRequest) -> Order {
@@ -822,51 +1064,55 @@ impl MatchingEngine {
         mut quantity: Quantity,
         timestamp: DateTime<Utc>,
     ) -> Vec<Fill> {
+        self.advance_time(timestamp).await;
         let mut generated = Vec::new();
         if quantity <= Decimal::ZERO {
             return generated;
         }
 
+        let trade_size = quantity;
         let mut open = self.open_orders.lock().await;
         let mut finished = Vec::new();
         for (order_id, resting) in open.iter_mut() {
-            if quantity <= Decimal::ZERO {
-                break;
+            if resting.remaining <= Decimal::ZERO || !resting.active {
+                continue;
+            }
+            if quantity <= Decimal::ZERO && resting.price != price {
+                continue;
             }
             if !Self::trade_crosses_order(aggressor_side, price, resting) {
+                if resting.price == price && resting.order.request.side != aggressor_side {
+                    let incremental = self.passive_fillable_volume(resting, trade_size);
+                    if incremental > Decimal::ZERO && quantity > Decimal::ZERO {
+                        let fill_qty = incremental.min(resting.remaining).min(quantity);
+                        self.apply_resting_fill(
+                            order_id,
+                            resting,
+                            price,
+                            fill_qty,
+                            timestamp,
+                            &mut generated,
+                        )
+                        .await;
+                        quantity -= fill_qty;
+                        if resting.remaining <= Decimal::ZERO {
+                            finished.push(order_id.clone());
+                        }
+                    }
+                }
                 continue;
             }
             let trade_qty: Quantity = quantity.min(resting.remaining);
-            resting.remaining -= trade_qty;
             quantity -= trade_qty;
-            {
-                let mut resting_book = self.resting_depth.lock().unwrap();
-                resting_book.remove_order(resting.order.request.side, resting.price, trade_qty);
-            }
-            let fill = Self::build_fill(
+            self.apply_resting_fill(
                 order_id,
-                &resting.order.request.symbol,
-                resting.order.request.side,
+                resting,
                 price,
                 trade_qty,
-            );
-            generated.push(fill.clone());
-            let prev_qty = resting.order.filled_quantity;
-            resting.order.filled_quantity += trade_qty;
-            let prev_notional = resting.order.avg_fill_price.unwrap_or(Decimal::ZERO) * prev_qty;
-            let new_notional = prev_notional + price * trade_qty;
-            resting.order.avg_fill_price = if resting.order.filled_quantity.is_zero() {
-                Some(price)
-            } else {
-                Some(new_notional / resting.order.filled_quantity)
-            };
-            resting.order.updated_at = fill.timestamp;
-            resting.order.status = if resting.remaining <= Decimal::ZERO {
-                OrderStatus::Filled
-            } else {
-                OrderStatus::PartiallyFilled
-            };
-            self.apply_fill_accounting(&fill).await;
+                timestamp,
+                &mut generated,
+            )
+            .await;
             if resting.remaining <= Decimal::ZERO {
                 finished.push(order_id.clone());
             }
@@ -916,12 +1162,19 @@ impl MatchingEngine {
 
     fn trade_crosses_order(side: Side, trade_price: Price, order: &RestingOrder) -> bool {
         match side {
-            Side::Buy => order.order.request.side == Side::Sell && order.price <= trade_price,
-            Side::Sell => order.order.request.side == Side::Buy && order.price >= trade_price,
+            Side::Buy => order.order.request.side == Side::Sell && order.price < trade_price,
+            Side::Sell => order.order.request.side == Side::Buy && order.price > trade_price,
         }
     }
 
-    fn build_fill(order_id: &OrderId, symbol: &str, side: Side, price: Price, qty: Price) -> Fill {
+    fn build_fill(
+        order_id: &OrderId,
+        symbol: &str,
+        side: Side,
+        price: Price,
+        qty: Quantity,
+        timestamp: DateTime<Utc>,
+    ) -> Fill {
         Fill {
             order_id: order_id.clone(),
             symbol: symbol.to_string(),
@@ -929,21 +1182,40 @@ impl MatchingEngine {
             fill_price: price,
             fill_quantity: qty,
             fee: None,
-            timestamp: Utc::now(),
+            timestamp,
         }
     }
 
-    async fn record_resting_order(&self, order: Order) {
+    async fn record_resting_order(
+        &self,
+        order: Order,
+        price: Price,
+        activation_time: DateTime<Utc>,
+    ) {
+        let original_quantity = order.request.quantity;
+        let mut entry = RestingOrder {
+            price,
+            remaining: (order.request.quantity - order.filled_quantity).max(Decimal::ZERO),
+            order,
+            initial_queue_position: Decimal::ZERO,
+            processed_volume: Decimal::ZERO,
+            activation_time,
+            cancel_after: None,
+            active: self.latency <= ChronoDuration::zero(),
+            original_quantity,
+        };
+        if entry.active && entry.remaining > Decimal::ZERO {
+            entry.initial_queue_position =
+                self.queue_ahead_for(entry.order.request.side, entry.price, Decimal::ZERO);
+            let mut book = self.resting_depth.lock().unwrap();
+            book.add_order(entry.order.request.side, entry.price, entry.remaining);
+        }
+        if entry.active {
+            entry.order.status = OrderStatus::Accepted;
+            entry.order.updated_at = activation_time;
+        }
         let mut open = self.open_orders.lock().await;
-        let price = order.request.price.unwrap_or_default();
-        open.insert(
-            order.id.clone(),
-            RestingOrder {
-                price,
-                remaining: order.request.quantity,
-                order,
-            },
-        );
+        open.insert(entry.order.id.clone(), entry);
     }
 
     async fn apply_fill_accounting(&self, fill: &Fill) {
@@ -1043,6 +1315,7 @@ impl MatchingEngine {
                 order.request.side,
                 *price,
                 *qty,
+                Utc::now(),
             );
             self.apply_fill_accounting(&fill).await;
             realized_fills.push(fill);
@@ -1664,6 +1937,7 @@ impl MarketStream for PaperMarketStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tesser_core::OrderBookLevel;
 
     #[tokio::test(flavor = "current_thread")]
     async fn matching_engine_amend_updates_resting_state() {
@@ -1700,5 +1974,205 @@ mod tests {
         let (price, qty) = book.best_bid().expect("resting bid exists");
         assert_eq!(price, Decimal::from(25_500));
         assert_eq!(qty, Decimal::from(3));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queue_model_waits_for_depth_before_fill() {
+        let engine = MatchingEngine::with_config(
+            "paper",
+            vec!["BTCUSDT".into()],
+            Decimal::from(10_000),
+            MatchingEngineConfig {
+                latency: ChronoDuration::zero(),
+                queue_model: QueueModel::Conservative,
+            },
+        );
+        let book_time = Utc::now();
+        let snapshot = OrderBook {
+            symbol: "BTCUSDT".into(),
+            bids: vec![OrderBookLevel {
+                price: Decimal::from(9_950),
+                size: Decimal::from(2),
+            }],
+            asks: vec![OrderBookLevel {
+                price: Decimal::from(10_000),
+                size: Decimal::from(1),
+            }],
+            timestamp: book_time,
+            exchange_checksum: None,
+            local_checksum: None,
+        };
+        engine.load_market_snapshot(&snapshot);
+        engine.advance_time(book_time).await;
+
+        let request = OrderRequest {
+            symbol: "BTCUSDT".into(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            quantity: Decimal::ONE,
+            price: Some(Decimal::from(9_950)),
+            trigger_price: None,
+            time_in_force: Some(TimeInForce::GoodTilCanceled),
+            client_order_id: None,
+            take_profit: None,
+            stop_loss: None,
+            display_quantity: None,
+        };
+
+        let order = engine.place_order(request).await.unwrap();
+        assert_eq!(order.status, OrderStatus::Accepted);
+
+        let ts = book_time;
+        engine
+            .process_trade(Side::Sell, Decimal::from(9_950), Decimal::ONE, ts)
+            .await;
+        assert!(engine.drain_fills().await.is_empty());
+
+        engine
+            .process_trade(
+                Side::Sell,
+                Decimal::from(9_950),
+                Decimal::ONE,
+                ts + ChronoDuration::milliseconds(1),
+            )
+            .await;
+        assert!(engine.drain_fills().await.is_empty());
+
+        engine
+            .process_trade(
+                Side::Sell,
+                Decimal::from(9_950),
+                Decimal::ONE,
+                ts + ChronoDuration::milliseconds(2),
+            )
+            .await;
+        let fills = engine.drain_fills().await;
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].fill_quantity, Decimal::ONE);
+        assert_eq!(fills[0].fill_price, Decimal::from(9_950));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn latency_delays_limit_order_activation() {
+        let engine = MatchingEngine::with_config(
+            "paper",
+            vec!["BTCUSDT".into()],
+            Decimal::from(10_000),
+            MatchingEngineConfig {
+                latency: ChronoDuration::milliseconds(50),
+                queue_model: QueueModel::Optimistic,
+            },
+        );
+        let book_time = Utc::now();
+        let snapshot = OrderBook {
+            symbol: "BTCUSDT".into(),
+            bids: vec![OrderBookLevel {
+                price: Decimal::from(9_900),
+                size: Decimal::from(1),
+            }],
+            asks: vec![OrderBookLevel {
+                price: Decimal::from(10_000),
+                size: Decimal::from(1),
+            }],
+            timestamp: book_time,
+            exchange_checksum: None,
+            local_checksum: None,
+        };
+        engine.load_market_snapshot(&snapshot);
+        engine.advance_time(book_time).await;
+
+        let request = OrderRequest {
+            symbol: "BTCUSDT".into(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            quantity: Decimal::ONE,
+            price: Some(Decimal::from(9_900)),
+            trigger_price: None,
+            time_in_force: Some(TimeInForce::GoodTilCanceled),
+            client_order_id: None,
+            take_profit: None,
+            stop_loss: None,
+            display_quantity: None,
+        };
+
+        let order = engine.place_order(request).await.unwrap();
+        assert_eq!(order.status, OrderStatus::PendingNew);
+        let mut open = engine.list_open_orders("BTCUSDT").await.unwrap();
+        assert_eq!(open[0].status, OrderStatus::PendingNew);
+
+        let ts = book_time;
+        engine
+            .process_trade(Side::Sell, Decimal::from(9_900), Decimal::ONE, ts)
+            .await;
+        assert!(engine.drain_fills().await.is_empty());
+        open = engine.list_open_orders("BTCUSDT").await.unwrap();
+        assert_eq!(open[0].status, OrderStatus::PendingNew);
+
+        engine
+            .process_trade(
+                Side::Sell,
+                Decimal::from(9_900),
+                Decimal::ONE,
+                ts + ChronoDuration::milliseconds(75),
+            )
+            .await;
+        let fills = engine.drain_fills().await;
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].fill_quantity, Decimal::ONE);
+        let open = engine.list_open_orders("BTCUSDT").await.unwrap();
+        assert!(open.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn optimistic_queue_fills_even_with_depth_ahead() {
+        let engine = MatchingEngine::with_config(
+            "paper",
+            vec!["BTCUSDT".into()],
+            Decimal::from(10_000),
+            MatchingEngineConfig {
+                latency: ChronoDuration::zero(),
+                queue_model: QueueModel::Optimistic,
+            },
+        );
+        let book_time = Utc::now();
+        let snapshot = OrderBook {
+            symbol: "BTCUSDT".into(),
+            bids: vec![OrderBookLevel {
+                price: Decimal::from(9_900),
+                size: Decimal::from(10),
+            }],
+            asks: vec![OrderBookLevel {
+                price: Decimal::from(10_000),
+                size: Decimal::from(10),
+            }],
+            timestamp: book_time,
+            exchange_checksum: None,
+            local_checksum: None,
+        };
+        engine.load_market_snapshot(&snapshot);
+        engine.advance_time(book_time).await;
+
+        let request = OrderRequest {
+            symbol: "BTCUSDT".into(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            quantity: Decimal::new(5, 0),
+            price: Some(Decimal::from(9_900)),
+            trigger_price: None,
+            time_in_force: Some(TimeInForce::GoodTilCanceled),
+            client_order_id: None,
+            take_profit: None,
+            stop_loss: None,
+            display_quantity: None,
+        };
+        engine.place_order(request).await.unwrap();
+
+        let ts = book_time;
+        engine
+            .process_trade(Side::Sell, Decimal::from(9_900), Decimal::new(2, 0), ts)
+            .await;
+        let fills = engine.drain_fills().await;
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].fill_quantity, Decimal::new(2, 0));
     }
 }
