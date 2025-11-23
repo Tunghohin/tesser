@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -129,7 +128,7 @@ impl ControlGrpcService {
 
 #[tonic::async_trait]
 impl ControlService for ControlGrpcService {
-    type MonitorStream = Pin<Box<ReceiverStream<Result<Event, Status>>>>;
+    type MonitorStream = ReceiverStream<Result<Event, Status>>;
 
     async fn get_portfolio(
         &self,
@@ -204,9 +203,13 @@ impl ControlService for ControlGrpcService {
                         debug!(kind = label, "monitor captured event");
                         if let Some(proto) = event_to_proto(event) {
                             if tx.send(Ok(proto)).await.is_err() {
-                                warn!("monitor stream receiver dropped");
+                                warn!(kind = label, "monitor stream receiver dropped during send");
                                 break;
+                            } else {
+                                debug!(kind = label, "monitor event forwarded to client");
                             }
+                        } else {
+                            debug!(kind = label, "monitor event skipped (no proto mapping)");
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -217,8 +220,7 @@ impl ControlService for ControlGrpcService {
                 }
             }
         });
-        let stream: Self::MonitorStream = Box::pin(ReceiverStream::new(rx));
-        Ok(Response::new(stream))
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 
@@ -241,7 +243,10 @@ fn event_to_proto(event: RuntimeEvent) -> Option<proto::Event> {
         RuntimeEvent::OrderUpdate(evt) => Some(proto::Event {
             payload: Some(Payload::Order(evt.order.into())),
         }),
-        RuntimeEvent::OrderBook(_) => None,
+        RuntimeEvent::OrderBook(book) => {
+            debug!(symbol = %book.order_book.symbol, "monitor dropping order book event");
+            None
+        }
     }
 }
 

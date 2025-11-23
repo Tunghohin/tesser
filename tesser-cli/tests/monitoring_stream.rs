@@ -102,6 +102,7 @@ impl Strategy for SignalStrategy {
             signal.execution_hint = Some(ExecutionHint::Twap {
                 duration: ChronoDuration::seconds(30),
             });
+            println!("strategy queued signal id={}", signal.id);
             self.pending.push(signal);
         }
         Ok(())
@@ -218,7 +219,10 @@ async fn monitor_streams_signal_events_and_records() -> Result<()> {
         loop {
             match stream.message().await? {
                 Some(event) => match event.payload {
-                    Some(Payload::Signal(sig)) => return Ok::<_, tonic::Status>(sig),
+                    Some(Payload::Signal(sig)) => {
+                        println!("monitor received signal id={} symbol={} confidence={}", sig.id, sig.symbol, sig.confidence);
+                        return Ok::<_, tonic::Status>(sig);
+                    }
                     Some(other) => {
                         println!("received monitor event: {:?}", other);
                     }
