@@ -266,7 +266,7 @@ Key CLI flags:
 | `--state-path`, `--metrics-addr`, `--log-path` | Override the `[live]` config block | see config |
 | `--webhook-url` | Per-run override for `[live.alerting].webhook_url` | empty |
 | `--initial-equity` | Override the `[backtest.initial_balances]` entry for the reporting currency | see config |
-| `--risk-max-order-qty`, `--risk-max-position-qty`, `--risk-max-drawdown` | Override `[risk_management]` guardrails | see config |
+| `--risk-max-order-qty`, `--risk-max-order-notional`, `--risk-max-position-qty`, `--risk-max-drawdown` | Override `[risk_management]` guardrails | see config |
 | `--alert-max-data-gap-secs`, `--alert-max-order-failures`, `--alert-max-drawdown` | Override `[live.alerting]` thresholds | see config |
 
 Inspect all options with `cargo run -p tesser-cli -- live run --help`.
@@ -290,13 +290,14 @@ max_drawdown = 0.03         # 3% peak-to-trough drawdown guardrail
 
 [risk_management]
 max_order_quantity = 1.0    # Fat-finger guard per order (base asset qty)
+max_order_notional = 0.0    # Optional notional clamp (quote currency); remove/zero to disable
 max_position_quantity = 2.0 # Absolute cap on aggregate exposure per symbol
 max_drawdown = 0.05         # Liquidate-only kill switch threshold (fractional)
 ```
 
 Every CLI flag (e.g., `--state-path`, `--persistence`, `--metrics-addr`, `--log-path`, `--initial-equity`, `--risk-max-*`, `--alert-max-*`) overrides the config file so you can spin up multiple isolated sessions with tailored risk and telemetry controls.
 
-When `tesser-cli live run` executes, each order is filtered through the pre-trade risk layer: quantities above `max_order_quantity` are rejected, projected exposure cannot exceed `max_position_quantity`, and once equity suffers a drawdown beyond `max_drawdown` the portfolio flips into liquidate-only mode (only allowing exposure-reducing orders) until the process is restarted.
+When `tesser-cli live run` executes, each order is filtered through the pre-trade risk layer: quantities above `max_order_quantity` are rejected, estimated notional above `max_order_notional` is blocked, projected exposure cannot exceed `max_position_quantity`, and once equity suffers a drawdown beyond `max_drawdown` the portfolio flips into liquidate-only mode (only allowing exposure-reducing orders) until the process is restarted.
 
 ### Multi-Strategy Deployment (Multi-Process Model)
 
