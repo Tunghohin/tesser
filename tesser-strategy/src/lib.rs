@@ -51,6 +51,10 @@ pub struct StrategyContext {
     recent_ticks: VecDeque<Tick>,
     recent_order_books: VecDeque<OrderBook>,
     positions: Vec<Position>,
+    candle_index: HashMap<Symbol, VecDeque<Candle>>,
+    tick_index: HashMap<Symbol, VecDeque<Tick>>,
+    order_book_index: HashMap<Symbol, VecDeque<OrderBook>>,
+    position_index: HashMap<Symbol, Position>,
     max_history: usize,
 }
 
@@ -63,37 +67,62 @@ impl StrategyContext {
             recent_ticks: VecDeque::with_capacity(capacity),
             recent_order_books: VecDeque::with_capacity(capacity),
             positions: Vec::new(),
+            candle_index: HashMap::new(),
+            tick_index: HashMap::new(),
+            order_book_index: HashMap::new(),
+            position_index: HashMap::new(),
             max_history: capacity,
         }
     }
 
+    fn push_with_capacity<T>(buffer: &mut VecDeque<T>, item: T, limit: usize) {
+        if buffer.len() >= limit {
+            buffer.pop_front();
+        }
+        buffer.push_back(item);
+    }
+
     /// Push a candle while respecting the configured history size.
     pub fn push_candle(&mut self, candle: Candle) {
-        if self.recent_candles.len() >= self.max_history {
-            self.recent_candles.pop_front();
-        }
-        self.recent_candles.push_back(candle);
+        let symbol = candle.symbol;
+        Self::push_with_capacity(&mut self.recent_candles, candle.clone(), self.max_history);
+        let entry = self
+            .candle_index
+            .entry(symbol)
+            .or_insert_with(|| VecDeque::with_capacity(self.max_history));
+        Self::push_with_capacity(entry, candle, self.max_history);
     }
 
     /// Push a tick while respecting the configured history size.
     pub fn push_tick(&mut self, tick: Tick) {
-        if self.recent_ticks.len() >= self.max_history {
-            self.recent_ticks.pop_front();
-        }
-        self.recent_ticks.push_back(tick);
+        let symbol = tick.symbol;
+        Self::push_with_capacity(&mut self.recent_ticks, tick.clone(), self.max_history);
+        let entry = self
+            .tick_index
+            .entry(symbol)
+            .or_insert_with(|| VecDeque::with_capacity(self.max_history));
+        Self::push_with_capacity(entry, tick, self.max_history);
     }
 
     /// Push an order book snapshot while respecting the configured history size.
     pub fn push_order_book(&mut self, book: OrderBook) {
-        if self.recent_order_books.len() >= self.max_history {
-            self.recent_order_books.pop_front();
-        }
-        self.recent_order_books.push_back(book);
+        let symbol = book.symbol;
+        Self::push_with_capacity(&mut self.recent_order_books, book.clone(), self.max_history);
+        let entry = self
+            .order_book_index
+            .entry(symbol)
+            .or_insert_with(|| VecDeque::with_capacity(self.max_history));
+        Self::push_with_capacity(entry, book, self.max_history);
     }
 
     /// Replace the in-memory position snapshot.
     pub fn update_positions(&mut self, positions: Vec<Position>) {
         self.positions = positions;
+        self.position_index.clear();
+        for position in &self.positions {
+            self.position_index
+                .insert(position.symbol, position.clone());
+        }
     }
 
     /// Access recently observed candles.
@@ -102,16 +131,37 @@ impl StrategyContext {
         &self.recent_candles
     }
 
+    /// Access recent candles for a specific symbol.
+    #[must_use]
+    pub fn candles_for(&self, symbol: impl Into<Symbol>) -> Option<&VecDeque<Candle>> {
+        let symbol = symbol.into();
+        self.candle_index.get(&symbol)
+    }
+
     /// Access recently observed ticks.
     #[must_use]
     pub fn ticks(&self) -> &VecDeque<Tick> {
         &self.recent_ticks
     }
 
+    /// Access recent ticks for a specific symbol.
+    #[must_use]
+    pub fn ticks_for(&self, symbol: impl Into<Symbol>) -> Option<&VecDeque<Tick>> {
+        let symbol = symbol.into();
+        self.tick_index.get(&symbol)
+    }
+
     /// Access recently observed order books.
     #[must_use]
     pub fn order_books(&self) -> &VecDeque<OrderBook> {
         &self.recent_order_books
+    }
+
+    /// Access order book history for a specific symbol.
+    #[must_use]
+    pub fn order_books_for(&self, symbol: impl Into<Symbol>) -> Option<&VecDeque<OrderBook>> {
+        let symbol = symbol.into();
+        self.order_book_index.get(&symbol)
     }
 
     /// Access all tracked positions.
@@ -124,17 +174,16 @@ impl StrategyContext {
     #[must_use]
     pub fn position(&self, symbol: impl Into<Symbol>) -> Option<&Position> {
         let symbol = symbol.into();
-        self.positions.iter().find(|p| p.symbol == symbol)
+        self.position_index.get(&symbol)
     }
 
     /// Returns the latest order book snapshot for the specified symbol.
     #[must_use]
     pub fn order_book(&self, symbol: impl Into<Symbol>) -> Option<&OrderBook> {
         let symbol = symbol.into();
-        self.recent_order_books
-            .iter()
-            .rev()
-            .find(|book| book.symbol == symbol)
+        self.order_book_index
+            .get(&symbol)
+            .and_then(|books| books.back())
     }
 }
 
@@ -327,14 +376,11 @@ fn normalize_name(name: &str) -> String {
 // Helpers
 // -------------------------------------------------------------------------------------------------
 
-fn collect_symbol_closes(candles: &VecDeque<Candle>, symbol: Symbol, limit: usize) -> Vec<Decimal> {
-    let mut values: Vec<Decimal> = candles
-        .iter()
-        .rev()
-        .filter(|c| c.symbol == symbol)
-        .take(limit)
-        .map(|c| c.close)
-        .collect();
+fn collect_symbol_closes(ctx: &StrategyContext, symbol: Symbol, limit: usize) -> Vec<Decimal> {
+    let Some(entries) = ctx.candles_for(symbol) else {
+        return Vec::new();
+    };
+    let mut values: Vec<Decimal> = entries.iter().rev().take(limit).map(|c| c.close).collect();
     values.reverse();
     values
 }
@@ -840,8 +886,7 @@ pub struct MlClassifier {
 impl MlClassifier {
     fn score(&self, ctx: &StrategyContext) -> Option<f64> {
         let model = self.model.as_ref()?;
-        let raw_closes =
-            collect_symbol_closes(ctx.candles(), self.cfg.symbol, self.cfg.lookback + 1);
+        let raw_closes = collect_symbol_closes(ctx, self.cfg.symbol, self.cfg.lookback + 1);
         if raw_closes.len() < self.cfg.lookback + 1 {
             return None;
         }
@@ -1123,7 +1168,7 @@ pub struct PairsTradingConfig {
 impl Default for PairsTradingConfig {
     fn default() -> Self {
         Self {
-            symbols: ["BTCUSDT".into(), "ETHUSDT".into()],
+            symbols: ["binance_perp:BTCUSDT".into(), "binance_perp:ETHUSDT".into()],
             lookback: 200,
             entry_z: Decimal::from(2),
             exit_z: Decimal::new(5, 1),
@@ -1147,6 +1192,7 @@ impl Default for PairsTradingArbitrage {
 
 impl PairsTradingArbitrage {
     fn from_config(cfg: PairsTradingConfig) -> StrategyResult<Self> {
+        Self::validate_symbols(&cfg)?;
         let mut strategy = Self {
             cfg,
             signals: Vec::new(),
@@ -1155,6 +1201,22 @@ impl PairsTradingArbitrage {
         };
         strategy.rebuild_thresholds()?;
         Ok(strategy)
+    }
+
+    fn validate_symbols(cfg: &PairsTradingConfig) -> StrategyResult<()> {
+        if cfg.symbols[0] == cfg.symbols[1] {
+            return Err(StrategyError::InvalidConfig(
+                "`symbols` entries must be distinct".into(),
+            ));
+        }
+        for symbol in cfg.symbols {
+            if !symbol.exchange.is_specified() {
+                return Err(StrategyError::InvalidConfig(
+                    "symbols must include an exchange prefix (e.g., binance_perp:BTCUSDT)".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn rebuild_thresholds(&mut self) -> StrategyResult<()> {
@@ -1169,8 +1231,8 @@ impl PairsTradingArbitrage {
     }
 
     fn spreads(&self, ctx: &StrategyContext) -> Option<Vec<Decimal>> {
-        let closes_a = collect_symbol_closes(ctx.candles(), self.cfg.symbols[0], self.cfg.lookback);
-        let closes_b = collect_symbol_closes(ctx.candles(), self.cfg.symbols[1], self.cfg.lookback);
+        let closes_a = collect_symbol_closes(ctx, self.cfg.symbols[0], self.cfg.lookback);
+        let closes_b = collect_symbol_closes(ctx, self.cfg.symbols[1], self.cfg.lookback);
         if closes_a.len() < self.cfg.lookback || closes_b.len() < self.cfg.lookback {
             return None;
         }
@@ -1210,6 +1272,7 @@ impl Strategy for PairsTradingArbitrage {
                 "lookback must be at least 2".into(),
             ));
         }
+        Self::validate_symbols(&cfg)?;
         self.cfg = cfg;
         self.rebuild_thresholds()
     }
