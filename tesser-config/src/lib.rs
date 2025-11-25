@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use config::{Config, ConfigError, Environment, File};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,8 @@ pub struct AppConfig {
     pub backtest: BacktestConfig,
     #[serde(default)]
     pub exchange: HashMap<String, ExchangeConfig>,
+    #[serde(default)]
+    pub exchanges: Vec<NamedExchangeConfig>,
     #[serde(default)]
     pub live: LiveRuntimeConfig,
     #[serde(default)]
@@ -128,6 +130,13 @@ impl Default for LiveRuntimeConfig {
             reconciliation_threshold: default_reconciliation_threshold(),
             alerting: AlertingConfig::default(),
         }
+    }
+}
+
+impl LiveRuntimeConfig {
+    /// Resolve the persistence settings, falling back to the legacy `state_path` when needed.
+    pub fn persistence_config(&self) -> PersistenceConfig {
+        self.persistence.with_fallback(&self.state_path)
     }
 }
 
@@ -293,7 +302,7 @@ pub fn load_config(env: Option<&str>) -> Result<AppConfig> {
     let config = builder.build()?;
     let mut app: AppConfig = config
         .try_deserialize()
-        .map_err(|err: ConfigError| err.into())?;
+        .map_err(|err: ConfigError| anyhow!(err))?;
     app.merge_inline_exchanges();
     Ok(app)
 }

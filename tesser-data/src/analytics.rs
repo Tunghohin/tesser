@@ -706,6 +706,7 @@ mod tests {
             fill_price: Decimal::from_f64(102.0).unwrap(),
             fill_quantity: Decimal::ONE,
             fee: Some(Decimal::new(1, 2)),
+            fee_asset: None,
             timestamp: created_at,
         };
         let fills_batch = fills_to_batch(&[fill_one, fill_two])?;

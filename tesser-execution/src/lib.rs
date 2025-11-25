@@ -52,7 +52,7 @@ impl Default for PanicCloseConfig {
 }
 
 /// Observes panic-close events so callers can emit alerts or metrics.
-pub trait PanicObserver {
+pub trait PanicObserver: Send + Sync {
     fn on_group_event(&self, group_id: Uuid, symbol: Symbol, quantity: Quantity, reason: &str);
 }
 
@@ -485,6 +485,7 @@ mod tests {
             portfolio_equity: Decimal::from(50_000u32),
             last_price: Decimal::from(25_000u32),
             liquidate_only: false,
+            ..RiskContext::default()
         };
         let order = OrderRequest {
             symbol: "BTCUSDT".into(),

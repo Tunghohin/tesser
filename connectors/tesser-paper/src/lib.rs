@@ -888,7 +888,7 @@ pub struct MatchingEngine {
     clock: Arc<Mutex<Option<DateTime<Utc>>>>,
     queue_reset: Arc<AtomicBool>,
     fee_model: Arc<dyn FeeModel>,
-    cash_asset: AssetId,
+    cash_asset: Arc<Mutex<AssetId>>,
 }
 
 impl MatchingEngine {
@@ -939,7 +939,7 @@ impl MatchingEngine {
             clock: Arc::new(Mutex::new(None)),
             queue_reset: Arc::new(AtomicBool::new(false)),
             fee_model: config.fee_model.clone(),
-            cash_asset,
+            cash_asset: Arc::new(Mutex::new(cash_asset)),
         }
     }
 
@@ -1454,7 +1454,7 @@ impl MatchingEngine {
     }
 
     async fn apply_fill_accounting(&self, fill: &Fill) {
-        let cash_asset = self.cash_asset;
+        let cash_asset = *self.cash_asset.lock().unwrap();
         let mut balances = self.balances.lock().await;
         if let Some(balance) = balances.iter_mut().find(|b| b.asset == cash_asset) {
             let notional = fill.fill_price * fill.fill_quantity;

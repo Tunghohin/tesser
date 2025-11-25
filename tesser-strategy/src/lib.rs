@@ -1384,7 +1384,8 @@ impl Strategy for PairsTradingArbitrage {
                         );
                     } else if z.abs() <= self.exit_z_level {
                         let group_id = Uuid::new_v4();
-                        for (idx, symbol) in self.cfg.symbols.iter().enumerate() {
+                        let symbols = self.cfg.symbols;
+                        for (idx, symbol) in symbols.iter().copied().enumerate() {
                             let exit_kind = match self.bias {
                                 SpreadBias::ShortFirst => {
                                     if idx == 0 {
@@ -1401,7 +1402,7 @@ impl Strategy for PairsTradingArbitrage {
                                     }
                                 }
                                 SpreadBias::Flat => {
-                                    match ctx.position(*symbol).and_then(|position| position.side) {
+                                    match ctx.position(symbol).and_then(|position| position.side) {
                                         Some(Side::Buy) => SignalKind::ExitLong,
                                         Some(Side::Sell) => SignalKind::ExitShort,
                                         None => SignalKind::Flatten,
@@ -1409,7 +1410,7 @@ impl Strategy for PairsTradingArbitrage {
                                 }
                             };
                             self.push_signal_with_clip(
-                                *symbol,
+                                symbol,
                                 exit_kind,
                                 0.6,
                                 clip,

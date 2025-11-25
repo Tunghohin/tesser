@@ -1,14 +1,17 @@
+use async_trait::async_trait;
 use chrono::Duration;
 use rust_decimal::Decimal;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tempfile::NamedTempFile;
-use tesser_core::{ExecutionHint, Signal, SignalKind, Symbol};
+use tesser_broker::{BrokerError, BrokerInfo, ExecutionClient};
+use tesser_core::{ExecutionHint, Signal, SignalKind, SignalPanicBehavior, Symbol};
 use tesser_execution::{
     algorithm::{ChildOrderAction, TwapAlgorithm},
     AlgoStatus, ExecutionAlgorithm, ExecutionEngine, FixedOrderSizer, NoopRiskChecker,
-    OrderOrchestrator, PanicCloseConfig, RiskContext, SqliteAlgoStateRepository,
+    OrderOrchestrator, PanicCloseConfig, PanicObserver, RiskContext, SqliteAlgoStateRepository,
 };
 use tesser_paper::PaperExecutionClient;
+use uuid::Uuid;
 
 #[tokio::test]
 async fn test_twap_algorithm_basic() {
@@ -84,6 +87,7 @@ async fn test_orchestrator_integration() {
         algo_state_repo,
         Vec::new(),
         PanicCloseConfig::default(),
+        None,
     )
     .await
     .unwrap();
@@ -178,4 +182,133 @@ async fn orchestrator_restores_from_sqlite() {
             .await
             .unwrap();
     assert_eq!(restored.active_algorithms_count(), 1);
+}
+
+fn new_sqlite_repo() -> SqliteAlgoStateRepository {
+    let temp_file = NamedTempFile::new().unwrap();
+    SqliteAlgoStateRepository::new(temp_file.path()).unwrap()
+}
+
+struct RecordingObserver {
+    events: Arc<Mutex<Vec<(Uuid, Symbol, Decimal, String)>>>,
+}
+
+impl RecordingObserver {
+    fn new() -> (Self, Arc<Mutex<Vec<(Uuid, Symbol, Decimal, String)>>>) {
+        let store = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                events: store.clone(),
+            },
+            store,
+        )
+    }
+}
+
+impl PanicObserver for RecordingObserver {
+    fn on_group_event(&self, group_id: Uuid, symbol: Symbol, qty: Decimal, reason: &str) {
+        self.events
+            .lock()
+            .unwrap()
+            .push((group_id, symbol, qty, reason.to_string()));
+    }
+}
+
+struct FailingClient;
+
+#[async_trait]
+impl ExecutionClient for FailingClient {
+    fn info(&self) -> BrokerInfo {
+        BrokerInfo {
+            name: "fail".into(),
+            markets: vec![],
+            supports_testnet: true,
+        }
+    }
+
+    async fn place_order(
+        &self,
+        _request: tesser_core::OrderRequest,
+    ) -> Result<tesser_core::Order, BrokerError> {
+        Err(BrokerError::InvalidRequest("synthetic failure".into()))
+    }
+
+    async fn cancel_order(&self, _order_id: String, _symbol: &str) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    async fn amend_order(
+        &self,
+        _request: tesser_core::OrderUpdateRequest,
+    ) -> Result<tesser_core::Order, BrokerError> {
+        Err(BrokerError::InvalidRequest("unsupported".into()))
+    }
+
+    async fn list_open_orders(
+        &self,
+        _symbol: &str,
+    ) -> Result<Vec<tesser_core::Order>, BrokerError> {
+        Ok(Vec::new())
+    }
+
+    async fn account_balances(&self) -> Result<Vec<tesser_core::AccountBalance>, BrokerError> {
+        Ok(Vec::new())
+    }
+
+    async fn positions(&self) -> Result<Vec<tesser_core::Position>, BrokerError> {
+        Ok(Vec::new())
+    }
+
+    async fn list_instruments(
+        &self,
+        _category: &str,
+    ) -> Result<Vec<tesser_core::Instrument>, BrokerError> {
+        Ok(Vec::new())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[tokio::test]
+async fn router_failure_triggers_panic_observer() {
+    let repo = Arc::new(new_sqlite_repo());
+    let client = Arc::new(FailingClient);
+    let sizer = Box::new(FixedOrderSizer {
+        quantity: Decimal::from(2),
+    });
+    let engine = Arc::new(ExecutionEngine::new(
+        client,
+        sizer,
+        Arc::new(NoopRiskChecker),
+    ));
+    let (observer, log) = RecordingObserver::new();
+
+    let orchestrator = OrderOrchestrator::new(
+        engine,
+        repo,
+        Vec::new(),
+        PanicCloseConfig::default(),
+        Some(Arc::new(observer)),
+    )
+    .await
+    .unwrap();
+    let group = Uuid::new_v4();
+    let signal = Signal::new("BINANCE:BTCUSDT", SignalKind::EnterLong, 0.9)
+        .with_group(group)
+        .with_panic_behavior(SignalPanicBehavior::AggressiveLimit {
+            offset_bps: Decimal::from(15),
+        });
+    let ctx = RiskContext {
+        symbol: signal.symbol,
+        exchange: signal.symbol.exchange,
+        last_price: Decimal::from(30_000),
+        ..RiskContext::default()
+    };
+    assert!(orchestrator.on_signal(&signal, &ctx).await.is_err());
+    let events = log.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, group);
+    assert_eq!(events[0].1, signal.symbol);
 }

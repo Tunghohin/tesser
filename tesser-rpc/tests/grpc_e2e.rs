@@ -98,6 +98,8 @@ fn build_signal(kind: proto::signal::Kind, note: &str) -> Signal {
             nanos: 0,
         }),
         metadata: String::new(),
+        quantity: None,
+        group_id: String::new(),
     }
 }
 

@@ -13,7 +13,7 @@ use crate::algorithm::{
     PeggedBestAlgorithm, SniperAlgorithm, TrailingStopAlgorithm, TwapAlgorithm, VwapAlgorithm,
 };
 use crate::repository::{AlgoStateRepository, StoredAlgoState};
-use crate::{ExecutionEngine, PanicCloseConfig, PanicCloseMode, RiskContext};
+use crate::{ExecutionEngine, PanicCloseConfig, PanicCloseMode, PanicObserver, RiskContext};
 use tesser_core::{
     ExecutionHint, Fill, Order, OrderRequest, OrderStatus, OrderType, Price, Quantity, Side,
     Signal, SignalPanicBehavior, Symbol, Tick, TimeInForce,
@@ -61,7 +61,6 @@ struct ExecutionGroupState {
     id: Uuid,
     legs: HashMap<Symbol, ExecutionGroupLeg>,
     panic_config: PanicCloseConfig,
-    panic_observer: Option<Arc<dyn PanicObserver>>,
     panic_triggered: bool,
 }
 
@@ -155,6 +154,7 @@ pub struct OrderOrchestrator {
     state_repo: Arc<dyn AlgoStateRepository<State = StoredAlgoState>>,
 
     panic_config: PanicCloseConfig,
+    panic_observer: Option<Arc<dyn PanicObserver>>,
 
     /// Active multi-leg execution groups keyed by identifier.
     execution_groups: Arc<Mutex<HashMap<Uuid, ExecutionGroupState>>>,
@@ -434,12 +434,14 @@ impl OrderOrchestrator {
 
     async fn fail_group_leg(&self, group_id: Uuid, symbol: Symbol, reason: &str) -> Result<()> {
         let mut maybe_actions = None;
+        let mut group_config = None;
         {
             let mut groups = self.execution_groups.lock().unwrap();
             if let Some(state) = groups.get_mut(&group_id) {
                 if let Some(leg) = state.legs.get_mut(&symbol) {
                     leg.status = ExecutionLegStatus::Failed;
                 }
+                group_config = Some(state.panic_config);
                 if let Some(actions) = state.panic_actions() {
                     maybe_actions = Some(actions);
                 } else if state.is_finished() {
@@ -679,23 +681,47 @@ impl OrderOrchestrator {
             }
             None => {
                 // Handle normal, non-algorithmic orders
-                if let Some(group_id) = signal.group_id {
-                    self.register_group_signal(signal);
-                }
-                if let Some(order) = self
+                self.register_group_signal(signal);
+                match self
                     .execution_engine
                     .handle_signal(signal.clone(), *ctx)
-                    .await?
+                    .await
                 {
-                    if let Some(group_id) = signal.group_id {
-                        self.track_group_order(group_id, &order);
+                    Ok(Some(order)) => {
+                        if let Some(group_id) = signal.group_id {
+                            self.track_group_order(group_id, &order);
+                        }
+                        self.register_pending(&order);
+                        Ok(())
                     }
-                    self.register_pending(&order);
-                } else if let Some(group_id) = signal.group_id {
-                    self.fail_group_leg(group_id, signal.symbol, "order size resolved to zero")
-                        .await?;
+                    Ok(None) => {
+                        if let Some(group_id) = signal.group_id {
+                            self.fail_group_leg(
+                                group_id,
+                                signal.symbol,
+                                "order size resolved to zero",
+                            )
+                            .await?;
+                        }
+                        Ok(())
+                    }
+                    Err(err) => {
+                        if let Some(group_id) = signal.group_id {
+                            if let Err(panic_err) = self
+                                .fail_group_leg(group_id, signal.symbol, "order routing error")
+                                .await
+                            {
+                                tracing::error!(
+                                    %panic_err,
+                                    %group_id,
+                                    symbol = %signal.symbol,
+                                    "failed to trigger panic-close after routing failure"
+                                );
+                            }
+                        }
+                        Err(err.into())
+                    }
                 }
-                Ok(())
             }
         }
     }

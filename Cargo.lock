@@ -4250,6 +4250,7 @@ name = "tesser-execution"
 version = "0.9.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "rusqlite",
  "rust_decimal",
@@ -4297,6 +4298,7 @@ dependencies = [
 name = "tesser-markets"
 version = "0.9.0"
 dependencies = [
+ "rust_decimal",
  "serde",
  "tesser-broker",
  "tesser-core",

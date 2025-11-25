@@ -63,6 +63,7 @@ pub struct LiveMetrics {
     orders_total: IntCounter,
     order_failures: IntCounter,
     panic_closes: IntCounter,
+    router_failures: IntCounterVec,
     equity_gauge: Gauge,
     price_gauge: GaugeVec,
     data_gap_gauge: Gauge,
@@ -134,6 +135,14 @@ impl LiveMetrics {
             &["driver", "symbol"],
         )
         .unwrap();
+        let router_failures = IntCounterVec::new(
+            prometheus::Opts::new(
+                "tesser_router_failures_total",
+                "Router-level execution failures grouped by reason",
+            ),
+            &["reason"],
+        )
+        .unwrap();
 
         registry.register(Box::new(ticks_total.clone())).unwrap();
         registry.register(Box::new(candles_total.clone())).unwrap();
@@ -159,6 +168,9 @@ impl LiveMetrics {
         registry
             .register(Box::new(checksum_mismatches.clone()))
             .unwrap();
+        registry
+            .register(Box::new(router_failures.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -176,6 +188,7 @@ impl LiveMetrics {
             last_data_timestamp,
             checksum_mismatches,
             panic_closes,
+            router_failures,
         }
     }
 
@@ -205,6 +218,10 @@ impl LiveMetrics {
 
     pub fn inc_panic_close(&self) {
         self.panic_closes.inc();
+    }
+
+    pub fn inc_router_failure(&self, reason: &str) {
+        self.router_failures.with_label_values(&[reason]).inc();
     }
 
     pub fn update_equity(&self, equity: f64) {

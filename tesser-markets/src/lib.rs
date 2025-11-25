@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use rust_decimal::{Decimal, MathematicalOps};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use tesser_broker::{BrokerError, ExecutionClient};
 use tesser_core::{AssetId, ExchangeId, Instrument, InstrumentKind, Price, Quantity, Symbol};

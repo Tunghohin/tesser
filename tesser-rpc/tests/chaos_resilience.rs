@@ -57,6 +57,8 @@ impl StrategyService for ResilientMockStrategy {
                 nanos: 0,
             }),
             metadata: String::new(),
+            quantity: None,
+            group_id: String::new(),
         };
 
         Ok(Response::new(SignalList {

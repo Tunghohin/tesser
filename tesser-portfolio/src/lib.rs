@@ -143,15 +143,13 @@ impl Portfolio {
             } else {
                 balance.asset.exchange
             };
+            let reporting = portfolio.reporting_currency;
             let account = portfolio.account_mut(exchange);
-            account.ensure_currency(portfolio.reporting_currency, balance.asset);
+            account.ensure_currency(reporting, balance.asset);
             account.balances.upsert(Cash {
                 currency: balance.asset,
                 quantity: balance.available,
-                conversion_rate: conversion_rate_for_currency(
-                    balance.asset,
-                    portfolio.reporting_currency,
-                ),
+                conversion_rate: conversion_rate_for_currency(balance.asset, reporting),
             });
         }
         portfolio.ensure_reporting_currency_entries();
@@ -167,10 +165,11 @@ impl Portfolio {
             .market_registry
             .get(fill.symbol)
             .ok_or(PortfolioError::UnknownSymbol(fill.symbol))?;
+        let reporting = self.reporting_currency;
         let account = self.account_mut(fill.symbol.exchange);
-        account.ensure_currency(self.reporting_currency, instrument.settlement_currency);
-        account.ensure_currency(self.reporting_currency, instrument.base);
-        account.ensure_currency(self.reporting_currency, instrument.quote);
+        account.ensure_currency(reporting, instrument.settlement_currency);
+        account.ensure_currency(reporting, instrument.base);
+        account.ensure_currency(reporting, instrument.quote);
         let mut realized_delta = Decimal::ZERO;
         {
             let entry = account.positions.entry(fill.symbol).or_insert(Position {
@@ -235,7 +234,7 @@ impl Portfolio {
             entry.updated_at = fill.timestamp;
         }
 
-        self.apply_cash_flow(account, &instrument, fill, realized_delta);
+        Self::apply_cash_flow(account, reporting, &instrument, fill, realized_delta);
         self.update_drawdown_state();
         Ok(())
     }
@@ -432,13 +431,14 @@ impl Portfolio {
             .market_registry
             .get(symbol)
             .ok_or(PortfolioError::UnknownSymbol(symbol))?;
+        let reporting = self.reporting_currency;
         let account = self.account_mut(symbol.exchange);
         let mut updated = false;
         if let Some(position) = account.positions.get_mut(&symbol) {
             update_unrealized(position, &instrument, price);
             updated = true;
         }
-        self.update_conversion_rates(account, &instrument, price);
+        Self::update_conversion_rates(account, reporting, &instrument, price);
         self.update_drawdown_state();
         Ok(updated)
     }
@@ -459,16 +459,18 @@ impl Portfolio {
     }
 
     fn apply_cash_flow(
-        &mut self,
         account: &mut SubAccount,
+        reporting_currency: AssetId,
         instrument: &Instrument,
         fill: &Fill,
         realized: Price,
     ) {
         match instrument.kind {
-            InstrumentKind::Spot => self.apply_spot_flow(account, instrument, fill),
+            InstrumentKind::Spot => {
+                Self::apply_spot_flow(account, reporting_currency, instrument, fill)
+            }
             InstrumentKind::LinearPerpetual | InstrumentKind::InversePerpetual => {
-                self.apply_derivative_flow(account, instrument, fill, realized)
+                Self::apply_derivative_flow(account, reporting_currency, instrument, fill, realized)
             }
         }
         if let Some(fee) = fill.fee {
@@ -476,23 +478,28 @@ impl Portfolio {
                 InstrumentKind::Spot => instrument.quote,
                 _ => instrument.settlement_currency,
             });
-            account.ensure_currency(self.reporting_currency, fee_currency);
+            account.ensure_currency(reporting_currency, fee_currency);
             account.balances.adjust(fee_currency, -fee);
         }
     }
 
-    fn apply_spot_flow(&mut self, account: &mut SubAccount, instrument: &Instrument, fill: &Fill) {
+    fn apply_spot_flow(
+        account: &mut SubAccount,
+        reporting_currency: AssetId,
+        instrument: &Instrument,
+        fill: &Fill,
+    ) {
         let notional = fill.fill_price * fill.fill_quantity;
         match fill.side {
             Side::Buy => {
-                account.ensure_currency(self.reporting_currency, instrument.base);
-                account.ensure_currency(self.reporting_currency, instrument.quote);
+                account.ensure_currency(reporting_currency, instrument.base);
+                account.ensure_currency(reporting_currency, instrument.quote);
                 account.balances.adjust(instrument.base, fill.fill_quantity);
                 account.balances.adjust(instrument.quote, -notional);
             }
             Side::Sell => {
-                account.ensure_currency(self.reporting_currency, instrument.base);
-                account.ensure_currency(self.reporting_currency, instrument.quote);
+                account.ensure_currency(reporting_currency, instrument.base);
+                account.ensure_currency(reporting_currency, instrument.quote);
                 account
                     .balances
                     .adjust(instrument.base, -fill.fill_quantity);
@@ -502,8 +509,8 @@ impl Portfolio {
     }
 
     fn apply_derivative_flow(
-        &mut self,
         account: &mut SubAccount,
+        reporting_currency: AssetId,
         instrument: &Instrument,
         fill: &Fill,
         realized: Price,
@@ -511,7 +518,7 @@ impl Portfolio {
         let notional = fill.fill_price * fill.fill_quantity;
         let direction = Decimal::from(fill.side.as_i8());
         let settlement = &instrument.settlement_currency;
-        account.ensure_currency(self.reporting_currency, *settlement);
+        account.ensure_currency(reporting_currency, *settlement);
         account
             .balances
             .adjust(*settlement, -(notional * direction));
@@ -521,14 +528,14 @@ impl Portfolio {
     }
 
     fn update_conversion_rates(
-        &mut self,
         account: &mut SubAccount,
+        reporting_currency: AssetId,
         instrument: &Instrument,
         price: Price,
     ) {
-        if instrument.quote == self.reporting_currency {
-            account.ensure_currency(self.reporting_currency, instrument.base);
-            account.ensure_currency(self.reporting_currency, instrument.quote);
+        if instrument.quote == reporting_currency {
+            account.ensure_currency(reporting_currency, instrument.base);
+            account.ensure_currency(reporting_currency, instrument.quote);
             account
                 .balances
                 .update_conversion_rate(instrument.base, price);
@@ -537,9 +544,9 @@ impl Portfolio {
                 .update_conversion_rate(instrument.quote, Decimal::ONE);
             return;
         }
-        if instrument.base == self.reporting_currency && !price.is_zero() {
-            account.ensure_currency(self.reporting_currency, instrument.quote);
-            account.ensure_currency(self.reporting_currency, instrument.base);
+        if instrument.base == reporting_currency && !price.is_zero() {
+            account.ensure_currency(reporting_currency, instrument.quote);
+            account.ensure_currency(reporting_currency, instrument.base);
             account
                 .balances
                 .update_conversion_rate(instrument.base, Decimal::ONE);
@@ -554,7 +561,7 @@ impl Portfolio {
             .map(|cash| cash.conversion_rate)
             .unwrap_or(Decimal::ZERO);
         if quote_rate > Decimal::ZERO {
-            account.ensure_currency(self.reporting_currency, instrument.base);
+            account.ensure_currency(reporting_currency, instrument.base);
             account
                 .balances
                 .update_conversion_rate(instrument.base, price * quote_rate);
@@ -565,7 +572,7 @@ impl Portfolio {
             .map(|cash| cash.conversion_rate)
             .unwrap_or(Decimal::ZERO);
         if base_rate > Decimal::ZERO && !price.is_zero() {
-            account.ensure_currency(self.reporting_currency, instrument.quote);
+            account.ensure_currency(reporting_currency, instrument.quote);
             account
                 .balances
                 .update_conversion_rate(instrument.quote, base_rate / price);

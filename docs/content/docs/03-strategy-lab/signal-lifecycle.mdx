@@ -13,7 +13,16 @@ description: What happens after your strategy fires a signal.
 Signal -> Execution -> Risk -> Orders -> Exchange -> Fills -> Portfolio
 ```
 
-Keep the signal payload focused on *intent* (e.g., “go long BTCUSDT, size 0.5”). Pricing tactics, throttling, and compliance rules live downstream so they can be audited centrally.
+Keep the signal payload focused on _intent_ (e.g., “go long BTCUSDT, size 0.5”). Pricing tactics, throttling, and compliance rules live downstream so they can be audited centrally.
+
+### Multi-Leg Safety (New)
+
+Signals now support two extra fields that make cross-venue pairs safer:
+
+- `group_id`: assign the same UUID to all legs of a trade, or let the runtime infer it when you call `Signal::with_group`. The router tags every child order with this ID so fills, logs, and panic handling remain linked even if the legs live on different connectors.
+- `panic_behavior`: override the global panic-close policy per signal by calling `Signal::with_panic_behavior`. Use `SignalPanicBehavior::AggressiveLimit { offset_bps: 25 }` when you want the orchestrator to try an IOC limit 25 bps beyond the last mark before falling back to a market exit, or `SignalPanicBehavior::Market` when latency matters more than price.
+
+Pairs, basis trades, or any strategy that spans venues should set these explicitly so the router can unwind consistently if only one leg fills.
 
 ## PeggedBest Execution Hint
 

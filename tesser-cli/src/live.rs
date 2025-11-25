@@ -11,7 +11,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use futures::StreamExt;
-use rust_decimal::MathematicalOps;
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
@@ -49,7 +48,7 @@ use tesser_bybit::{register_factory as register_bybit_factory, BybitClient, Bybi
 use tesser_config::{AlertingConfig, ExchangeConfig, PersistenceEngine, RiskManagementConfig};
 use tesser_core::{
     AccountBalance, AssetId, Candle, ExchangeId, Fill, Interval, Order, OrderBook, OrderStatus,
-    Position, Price, Quantity, Side, Signal, Symbol, Tick,
+    Position, Price, Quantity, Side, Signal, SignalKind, Symbol, Tick,
 };
 use tesser_data::recorder::{ParquetRecorder, RecorderConfig, RecorderHandle};
 use tesser_events::{
@@ -511,6 +510,18 @@ pub async fn run_live_with_shutdown(
 
     let persistence = build_persistence_handles(&settings)?;
 
+    let metrics = Arc::new(LiveMetrics::new());
+    let alerting_cfg = settings.alerting.clone();
+    let dispatcher = AlertDispatcher::new(alerting_cfg.webhook_url.clone());
+    let alerts = Arc::new(AlertManager::new(
+        alerting_cfg,
+        dispatcher,
+        Some(public_connection.clone()),
+        private_connection.clone(),
+    ));
+    let panic_hook: Arc<dyn PanicObserver> =
+        Arc::new(PanicAlertHook::new(metrics.clone(), alerts.clone()));
+
     // Create orchestrator with execution engine
     let initial_open_orders = bootstrap
         .as_ref()
@@ -533,6 +544,8 @@ pub async fn run_live_with_shutdown(
         orchestrator,
         persistence.state,
         settings,
+        metrics,
+        alerts,
         market_registry,
         shutdown,
         public_connection,
@@ -692,6 +705,8 @@ impl LiveRuntime {
         orchestrator: OrderOrchestrator,
         state_repo: Arc<dyn StateRepository<Snapshot = LiveState>>,
         settings: LiveSessionSettings,
+        metrics: Arc<LiveMetrics>,
+        alerts: Arc<AlertManager>,
         market_registry: Arc<MarketRegistry>,
         shutdown: ShutdownSignal,
         public_connection: Arc<AtomicBool>,
@@ -760,26 +775,14 @@ impl LiveRuntime {
             market_snapshots.insert(*symbol, snapshot);
         }
 
-        let metrics = LiveMetrics::new();
         metrics.update_connection_status("public", public_connection.load(Ordering::SeqCst));
         if let Some(flag) = &private_connection {
             metrics.update_connection_status("private", flag.load(Ordering::SeqCst));
         }
         let metrics_task = spawn_metrics_server(metrics.registry(), settings.metrics_addr);
-        let dispatcher = AlertDispatcher::new(settings.alerting.webhook_url.clone());
-        let alerts = AlertManager::new(
-            settings.alerting,
-            dispatcher,
-            Some(public_connection.clone()),
-            private_connection.clone(),
-        );
         let (private_event_tx, private_event_rx) = mpsc::channel(1024);
         let last_private_sync = Arc::new(tokio::sync::Mutex::new(persisted.last_candle_ts));
-        let alerts = Arc::new(alerts);
         let alert_task = alerts.spawn_watchdog();
-        let metrics = Arc::new(metrics);
-        let panic_hook: Arc<dyn PanicObserver> =
-            Arc::new(PanicAlertHook::new(metrics.clone(), alerts.clone()));
         let mut connection_monitors = Vec::new();
         connection_monitors.push(spawn_connection_monitor(
             shutdown.clone(),
@@ -991,7 +994,6 @@ impl LiveRuntime {
             strategy,
             _public_connection: public_connection,
             _private_connection: private_connection,
-            market_registry,
         })
     }
 
@@ -1551,6 +1553,7 @@ fn spawn_event_subscribers(
                         market_bus.clone(),
                         market_data_tracker.clone(),
                         driver_clone.clone(),
+                        market_catalog.clone(),
                     )
                     .await
                     {
@@ -1906,6 +1909,7 @@ async fn process_order_book_event(
     bus: Arc<EventBus>,
     last_data_timestamp: Arc<AtomicI64>,
     driver: Arc<String>,
+    market_registry: Arc<MarketRegistry>,
 ) -> Result<()> {
     metrics.update_staleness(0.0);
     alerts.heartbeat().await;
@@ -1975,6 +1979,7 @@ async fn process_signal_event(
         }
         Err(err) => {
             metrics.inc_order_failure();
+            metrics.inc_router_failure("orchestrator");
             alerts
                 .order_failure(&format!("orchestrator error: {err}"))
                 .await;
@@ -2204,14 +2209,14 @@ fn normalize_group_quantities(signals: &mut [Signal], registry: &MarketRegistry)
 fn assign_implicit_group_ids(signals: &mut [Signal]) {
     use std::collections::HashMap;
 
-    let mut note_groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut note_groups: HashMap<String, Vec<usize>> = HashMap::new();
     for (idx, signal) in signals.iter().enumerate() {
         if signal.group_id.is_some() {
             continue;
         }
         if let Some(note) = signal.note.as_deref() {
             if !note.is_empty() {
-                note_groups.entry(note).or_default().push(idx);
+                note_groups.entry(note.to_string()).or_default().push(idx);
             }
         }
     }
