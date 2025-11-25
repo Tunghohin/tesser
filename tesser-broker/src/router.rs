@@ -111,18 +111,20 @@ impl RouterExecutionClient {
     }
 
     /// Normalize a fill originating from an exchange-specific stream.
-    pub fn normalize_fill_event(&self, exchange: ExchangeId, mut fill: Fill) -> Fill {
+    /// Returns `None` when the router has no mapping for the fill's order ID.
+    pub fn normalize_fill_event(&self, exchange: ExchangeId, mut fill: Fill) -> Option<Fill> {
         let guard = self.state.lock().unwrap();
-        if let Some(internal) = guard
+        let Some(internal) = guard
             .lookup_external_order(exchange, &fill.order_id)
             .cloned()
-        {
-            if let Some(entry) = guard.get(&internal) {
-                fill.order_id = internal;
-                fill.symbol = entry.symbol;
-            }
+        else {
+            return None;
+        };
+        if let Some(entry) = guard.get(&internal) {
+            fill.order_id = internal;
+            fill.symbol = entry.symbol;
         }
-        fill
+        Some(fill)
     }
 }
 
@@ -566,11 +568,7 @@ mod tests {
             .place_order(sample_request(symbol))
             .await
             .expect("order");
-        let external_id = format!(
-            "{}-{}",
-            exchange.as_raw(),
-            *client.next_id.lock().unwrap()
-        );
+        let external_id = format!("{}-{}", exchange.as_raw(), *client.next_id.lock().unwrap());
         let fill = Fill {
             order_id: external_id,
             symbol,
@@ -581,7 +579,9 @@ mod tests {
             fee_asset: None,
             timestamp: Utc::now(),
         };
-        let normalized = router.normalize_fill_event(exchange, fill);
+        let normalized = router
+            .normalize_fill_event(exchange, fill)
+            .expect("mapping should exist");
         assert_eq!(normalized.order_id, order.id);
         assert_eq!(normalized.symbol, order.request.symbol);
     }

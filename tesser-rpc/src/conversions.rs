@@ -2,12 +2,13 @@ use crate::proto;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde_json::{json, Map};
+use std::collections::HashMap;
 use std::str::FromStr;
 use tesser_core::{
-    AssetId, Candle, Cash, ExecutionHint, Fill, Interval, Order, OrderBook, OrderBookLevel,
-    OrderStatus, OrderType, Position, Side, Signal, SignalKind, Tick,
+    AssetId, Candle, Cash, CashBook, ExchangeId, ExecutionHint, Fill, Interval, Order, OrderBook,
+    OrderBookLevel, OrderStatus, OrderType, Position, Side, Signal, SignalKind, Symbol, Tick,
 };
-use tesser_portfolio::{Portfolio, PortfolioState};
+use tesser_portfolio::{Portfolio, PortfolioState, SubAccountState};
 use tesser_strategy::StrategyContext;
 use uuid::Uuid;
 
@@ -229,23 +230,35 @@ fn signal_kind_to_proto(kind: SignalKind) -> proto::signal::Kind {
 }
 
 fn portfolio_state_to_proto(state: &PortfolioState) -> proto::PortfolioSnapshot {
-    let unrealized: Decimal = state.positions.values().map(|pos| pos.unrealized_pnl).sum();
-    let cash_value = state.balances.total_value();
+    let (positions, balances) = if state.sub_accounts.is_empty() {
+        (state.positions.clone(), state.balances.clone())
+    } else {
+        (
+            aggregate_positions(&state.sub_accounts),
+            aggregate_balances(&state.sub_accounts),
+        )
+    };
+    let unrealized: Decimal = positions.values().map(|pos| pos.unrealized_pnl).sum();
+    let cash_value = balances.total_value();
     let equity = cash_value + unrealized;
     let realized = equity - state.initial_equity - unrealized;
 
     proto::PortfolioSnapshot {
-        balances: state
-            .balances
+        balances: balances
             .iter()
             .map(|(currency, cash)| cash_to_proto(*currency, cash))
             .collect(),
-        positions: state.positions.values().cloned().map(Into::into).collect(),
+        positions: positions.values().cloned().map(Into::into).collect(),
         equity: Some(to_decimal_proto(equity)),
         initial_equity: Some(to_decimal_proto(state.initial_equity)),
         realized_pnl: Some(to_decimal_proto(realized)),
         reporting_currency: state.reporting_currency.to_string(),
         liquidate_only: state.liquidate_only,
+        sub_accounts: state
+            .sub_accounts
+            .iter()
+            .map(|(exchange, account)| sub_account_to_proto(*exchange, account))
+            .collect(),
     }
 }
 
@@ -255,6 +268,55 @@ fn cash_to_proto(currency: AssetId, cash: &Cash) -> proto::CashBalance {
         quantity: Some(to_decimal_proto(cash.quantity)),
         conversion_rate: Some(to_decimal_proto(cash.conversion_rate)),
     }
+}
+
+fn sub_account_to_proto(
+    exchange: ExchangeId,
+    account: &SubAccountState,
+) -> proto::SubAccountSnapshot {
+    let unrealized: Decimal = account
+        .positions
+        .values()
+        .map(|position| position.unrealized_pnl)
+        .sum();
+    let equity = account.balances.total_value() + unrealized;
+    proto::SubAccountSnapshot {
+        exchange: exchange.to_string(),
+        balances: account
+            .balances
+            .iter()
+            .map(|(currency, cash)| cash_to_proto(*currency, cash))
+            .collect(),
+        positions: account
+            .positions
+            .values()
+            .cloned()
+            .map(Into::into)
+            .collect(),
+        equity: Some(to_decimal_proto(equity)),
+    }
+}
+
+fn aggregate_positions(
+    sub_accounts: &HashMap<ExchangeId, SubAccountState>,
+) -> HashMap<Symbol, Position> {
+    let mut positions = HashMap::new();
+    for account in sub_accounts.values() {
+        for (symbol, position) in &account.positions {
+            positions.insert(*symbol, position.clone());
+        }
+    }
+    positions
+}
+
+fn aggregate_balances(sub_accounts: &HashMap<ExchangeId, SubAccountState>) -> CashBook {
+    let mut combined = CashBook::new();
+    for account in sub_accounts.values() {
+        for (_asset, cash) in account.balances.iter() {
+            combined.upsert(cash.clone());
+        }
+    }
+    combined
 }
 
 impl From<Position> for proto::Position {

@@ -2538,7 +2538,13 @@ fn spawn_bybit_private_stream(
                             Ok(fills) => {
                                 for mut fill in fills {
                                     if let Some(router) = &router {
-                                        fill = router.normalize_fill_event(exchange_id, fill);
+                                        match router.normalize_fill_event(exchange_id, fill) {
+                                            Some(normalized) => fill = normalized,
+                                            None => {
+                                                metrics.inc_router_failure("orphan_fill");
+                                                continue;
+                                            }
+                                        }
                                     }
                                     if let Err(err) = private_tx.send(BrokerEvent::Fill(fill)).await
                                     {
@@ -2601,10 +2607,20 @@ fn spawn_bybit_private_stream(
                                                         exec.to_tesser_fill(exchange_id)
                                                     {
                                                         if let Some(router) = &router {
-                                                            fill = router.normalize_fill_event(
+                                                            match router.normalize_fill_event(
                                                                 exchange_id,
                                                                 fill,
-                                                            );
+                                                            ) {
+                                                                Some(normalized) => {
+                                                                    fill = normalized
+                                                                }
+                                                                None => {
+                                                                    metrics.inc_router_failure(
+                                                                        "orphan_fill",
+                                                                    );
+                                                                    continue;
+                                                                }
+                                                            }
                                                         }
                                                         if let Err(err) = private_tx
                                                             .send(BrokerEvent::Fill(fill))
@@ -2683,6 +2699,7 @@ fn spawn_binance_private_stream(
                     let tx_orders = private_tx.clone();
                     let exchange_id = exchange;
                     let router_for_event = router.clone();
+                    let metrics_for_event = metrics.clone();
                     user_stream.on_event(move |event| {
                         if let Some(update) = extract_order_update(&event) {
                             if let Some(mut order) = order_from_update(exchange_id, update) {
@@ -2693,7 +2710,13 @@ fn spawn_binance_private_stream(
                             }
                             if let Some(mut fill) = fill_from_update(exchange_id, update) {
                                 if let Some(router) = &router_for_event {
-                                    fill = router.normalize_fill_event(exchange_id, fill);
+                                    match router.normalize_fill_event(exchange_id, fill) {
+                                        Some(normalized) => fill = normalized,
+                                        None => {
+                                            metrics_for_event.inc_router_failure("orphan_fill");
+                                            return;
+                                        }
+                                    }
                                 }
                                 let _ = tx_orders.blocking_send(BrokerEvent::Fill(fill));
                             }

@@ -129,6 +129,10 @@ cargo run -p tesser-cli -- \
 
 Per-signal overrides win over the global defaults—call `Signal::with_panic_behavior` to force a specific mode for a given leg while leaving the runtime default unchanged.
 
+### Router Health Metrics
+
+When you enable the `RouterExecutionClient` (multiple `--exchange` entries), the CLI exposes `tesser_router_failures_total{reason="..."}` for visibility into reconciled vs. orphaned events. If a private stream delivers a fill for an order the router never saw, the runtime drops the fill (to avoid double-counting) and bumps `reason="orphan_fill"`. Alert on this metric to catch exchanges that send stale events after restarts or when credentials point at the wrong sub-account.
+
 ## Flight Recorder
 
 Set `--record-data <path>` when you launch `tesser-cli live run` to stream every `Tick`, `Candle`, `Fill`, and order update into partitioned Parquet files. The recorder runs on its own Tokio task, buffers data in Arrow `RecordBatch`es, and rotates files per day under the provided directory (defaults to `data/flight_recorder`).

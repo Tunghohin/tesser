@@ -113,6 +113,13 @@ message CashBalance {
   Decimal conversion_rate = 3;
 }
 
+message SubAccountSnapshot {
+  string exchange = 1;
+  repeated CashBalance balances = 2;
+  repeated Position positions = 3;
+  Decimal equity = 4;
+}
+
 message PortfolioSnapshot {
   repeated CashBalance balances = 1;
   repeated Position positions = 2;
@@ -121,6 +128,7 @@ message PortfolioSnapshot {
   Decimal realized_pnl = 5;
   string reporting_currency = 6;
   bool liquidate_only = 7;
+  repeated SubAccountSnapshot sub_accounts = 8;
 }
 
 message OrderSnapshot {
