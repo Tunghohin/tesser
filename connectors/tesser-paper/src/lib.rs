@@ -1394,6 +1394,7 @@ impl MatchingEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_fill(
         &self,
         order_id: &OrderId,

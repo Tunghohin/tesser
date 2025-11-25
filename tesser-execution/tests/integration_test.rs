@@ -189,12 +189,14 @@ fn new_sqlite_repo() -> SqliteAlgoStateRepository {
     SqliteAlgoStateRepository::new(temp_file.path()).unwrap()
 }
 
+type PanicEventLog = Arc<Mutex<Vec<(Uuid, Symbol, Decimal, String)>>>;
+
 struct RecordingObserver {
-    events: Arc<Mutex<Vec<(Uuid, Symbol, Decimal, String)>>>,
+    events: PanicEventLog,
 }
 
 impl RecordingObserver {
-    fn new() -> (Self, Arc<Mutex<Vec<(Uuid, Symbol, Decimal, String)>>>) {
+    fn new() -> (Self, PanicEventLog) {
         let store = Arc::new(Mutex::new(Vec::new()));
         (
             Self {

@@ -474,7 +474,7 @@ impl Portfolio {
             }
         }
         if let Some(fee) = fill.fee {
-            let fee_currency = fill.fee_asset.unwrap_or_else(|| match instrument.kind {
+            let fee_currency = fill.fee_asset.unwrap_or(match instrument.kind {
                 InstrumentKind::Spot => instrument.quote,
                 _ => instrument.settlement_currency,
             });
@@ -585,10 +585,6 @@ impl Portfolio {
             account.ensure_currency(self.reporting_currency, self.reporting_currency);
             account
         })
-    }
-
-    fn account(&self, exchange: ExchangeId) -> Option<&SubAccount> {
-        self.sub_accounts.get(&exchange)
     }
 
     fn ensure_reporting_currency_entries(&mut self) {

@@ -58,16 +58,14 @@ impl ExecutionGroupLeg {
 }
 
 struct ExecutionGroupState {
-    id: Uuid,
     legs: HashMap<Symbol, ExecutionGroupLeg>,
     panic_config: PanicCloseConfig,
     panic_triggered: bool,
 }
 
 impl ExecutionGroupState {
-    fn new(id: Uuid, config: PanicCloseConfig) -> Self {
+    fn new(config: PanicCloseConfig) -> Self {
         Self {
-            id,
             legs: HashMap::new(),
             panic_config: config,
             panic_triggered: false,
@@ -346,7 +344,7 @@ impl OrderOrchestrator {
             let default_config = self.panic_config;
             let state = groups
                 .entry(group_id)
-                .or_insert_with(|| ExecutionGroupState::new(group_id, default_config));
+                .or_insert_with(|| ExecutionGroupState::new(default_config));
             if let Some(override_cfg) = self.panic_override_from_signal(signal) {
                 state.override_config(override_cfg);
             }

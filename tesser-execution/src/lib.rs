@@ -22,16 +22,11 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Determines how the orchestrator unwinds partially filled execution groups.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum PanicCloseMode {
+    #[default]
     Market,
     AggressiveLimit,
-}
-
-impl Default for PanicCloseMode {
-    fn default() -> Self {
-        Self::Market
-    }
 }
 
 /// Configuration describing how panic-close orders should be sent.

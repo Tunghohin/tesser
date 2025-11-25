@@ -119,6 +119,16 @@ Both modes generate group-aware client order IDs (the router tags each venue’s
 
 Every panic-close increments `tesser_panic_closes_total` (exposed on the Prometheus endpoint) and emits an alert via the existing webhook, so operators see the unwind in Grafana and PagerDuty immediately.
 
+```bash
+cargo run -p tesser-cli -- \
+  live run \
+  --exchange bybit_linear \
+  --panic-mode aggressive-limit \
+  --panic-limit-offset-bps 35
+```
+
+Per-signal overrides win over the global defaults—call `Signal::with_panic_behavior` to force a specific mode for a given leg while leaving the runtime default unchanged.
+
 ## Flight Recorder
 
 Set `--record-data <path>` when you launch `tesser-cli live run` to stream every `Tick`, `Candle`, `Fill`, and order update into partitioned Parquet files. The recorder runs on its own Tokio task, buffers data in Arrow `RecordBatch`es, and rotates files per day under the provided directory (defaults to `data/flight_recorder`).

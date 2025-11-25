@@ -1954,6 +1954,7 @@ async fn process_order_book_event(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_signal_event(
     signal: Signal,
     orchestrator: Arc<OrderOrchestrator>,

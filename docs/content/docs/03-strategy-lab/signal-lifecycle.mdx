@@ -24,6 +24,32 @@ Signals now support two extra fields that make cross-venue pairs safer:
 
 Pairs, basis trades, or any strategy that spans venues should set these explicitly so the router can unwind consistently if only one leg fills.
 
+```rust
+let group = Uuid::new_v4();
+let binance = ExchangeId::from("binance_perp");
+let bybit = ExchangeId::from("bybit_linear");
+let entry = Signal::new(
+    Symbol::from_code(binance, "BTCUSDT"),
+    SignalKind::EnterLong,
+    0.05,
+)
+.with_group(group)
+.with_panic_behavior(SignalPanicBehavior::AggressiveLimit {
+    offset_bps: Decimal::from(20u32),
+});
+let hedge = Signal::new(
+    Symbol::from_code(bybit, "BTCUSDT"),
+    SignalKind::EnterShort,
+    0.05,
+)
+.with_group(group)
+.with_panic_behavior(SignalPanicBehavior::Market);
+ctx.publish(entry);
+ctx.publish(hedge);
+```
+
+In the example above the orchestrator keeps both legs linked via `group_id`, yet each leg gets a tailored unwind policy (limit for Binance, market for Bybit) if only one side fills.
+
 ## PeggedBest Execution Hint
 
 Attach `ExecutionHint::PeggedBest` to a signal when you want the execution layer to rest passively at the top of book and automatically “chase” the quote. The orchestrator now keeps a single child order working on the exchange and issues native amendments instead of cancel/re-place cycles, which preserves queue position and dramatically reduces API weight consumption.
