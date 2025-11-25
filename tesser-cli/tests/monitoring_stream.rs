@@ -28,6 +28,7 @@ use tesser_core::{
     OrderBookLevel, Side, Signal, SignalKind, Symbol, Tick,
 };
 use tesser_data::recorder::{ParquetRecorder, RecorderConfig};
+use tesser_execution::PanicCloseConfig;
 use tesser_rpc::proto::control_service_client::ControlServiceClient;
 use tesser_rpc::proto::{event::Payload, Event, MonitorRequest};
 use tesser_strategy::{Strategy, StrategyContext, StrategyResult};
@@ -524,6 +525,7 @@ impl LiveTestHarness {
             orderbook_depth: 50,
             record_path: record_data.then(|| record_root.clone()),
             control_addr,
+            panic_close: PanicCloseConfig::default(),
         };
 
         let shutdown = ShutdownSignal::new();

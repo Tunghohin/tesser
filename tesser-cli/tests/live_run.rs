@@ -34,6 +34,7 @@ use tesser_core::{
     AccountBalance, AssetId, Candle, ExchangeId, Interval, Position, Side, Signal, SignalKind,
     Symbol, Tick,
 };
+use tesser_execution::PanicCloseConfig;
 use tesser_portfolio::{SqliteStateRepository, StateRepository};
 use tesser_rpc::proto::control_service_client::ControlServiceClient;
 use tesser_rpc::proto::{
@@ -323,6 +324,7 @@ async fn live_run_executes_round_trip() -> Result<()> {
         orderbook_depth: 50,
         record_path: None,
         control_addr: "127.0.0.1:0".parse().unwrap(),
+        panic_close: PanicCloseConfig::default(),
     };
     let exchange_cfg = ExchangeConfig {
         rest_url: exchange.rest_url(),
@@ -509,6 +511,7 @@ async fn live_run_executes_round_trip_multi_exchange() -> Result<()> {
         orderbook_depth: 50,
         record_path: None,
         control_addr: "127.0.0.1:0".parse().unwrap(),
+        panic_close: PanicCloseConfig::default(),
     };
     let exchanges = vec![
         NamedExchange {
@@ -672,6 +675,7 @@ async fn pairs_trading_executes_cross_exchange_round_trip() -> Result<()> {
         orderbook_depth: 50,
         record_path: None,
         control_addr: "127.0.0.1:0".parse().unwrap(),
+        panic_close: PanicCloseConfig::default(),
     };
     let exchanges = vec![
         NamedExchange {
@@ -788,6 +792,7 @@ async fn control_plane_reports_status() -> Result<()> {
         orderbook_depth: 50,
         record_path: None,
         control_addr,
+        panic_close: PanicCloseConfig::default(),
     };
     let exchange_cfg = ExchangeConfig {
         rest_url: exchange.rest_url(),
@@ -901,6 +906,7 @@ async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
         orderbook_depth: 50,
         record_path: None,
         control_addr: "127.0.0.1:0".parse().unwrap(),
+        panic_close: PanicCloseConfig::default(),
     };
     let exchange_cfg = ExchangeConfig {
         rest_url: exchange.rest_url(),
@@ -1048,6 +1054,7 @@ async fn alerts_on_rejected_order() -> Result<()> {
         orderbook_depth: 50,
         record_path: None,
         control_addr: "127.0.0.1:0".parse().unwrap(),
+        panic_close: PanicCloseConfig::default(),
     };
     let exchange_cfg = ExchangeConfig {
         rest_url: exchange.rest_url(),
