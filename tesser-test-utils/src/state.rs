@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -26,6 +27,7 @@ pub type PrivateMessage = serde_json::Value;
 pub struct MockExchangeState {
     inner: Arc<Mutex<Inner>>,
     scenarios: ScenarioManager,
+    auto_fill: Option<AutoFillConfig>,
 }
 
 #[allow(dead_code)]
@@ -294,6 +296,7 @@ pub struct MockExchangeConfig {
     pub ticks: Vec<Tick>,
     pub scenarios: ScenarioManager,
     pub exchange: ExchangeId,
+    pub auto_fill: Option<AutoFillConfig>,
 }
 
 impl MockExchangeConfig {
@@ -321,6 +324,11 @@ impl MockExchangeConfig {
         self
     }
 
+    pub fn with_auto_fill(mut self, config: AutoFillConfig) -> Self {
+        self.auto_fill = Some(config);
+        self
+    }
+
     pub fn with_exchange(mut self, exchange: ExchangeId) -> Self {
         self.exchange = exchange;
         self
@@ -335,8 +343,15 @@ impl Default for MockExchangeConfig {
             ticks: Vec::new(),
             scenarios: ScenarioManager::new(),
             exchange: ExchangeId::UNSPECIFIED,
+            auto_fill: None,
         }
     }
+}
+
+#[derive(Clone)]
+pub struct AutoFillConfig {
+    pub delay: Duration,
+    pub price: Option<Decimal>,
 }
 
 impl MockExchangeState {
@@ -363,11 +378,16 @@ impl MockExchangeState {
         Self {
             inner: Arc::new(Mutex::new(inner)),
             scenarios: config.scenarios,
+            auto_fill: config.auto_fill,
         }
     }
 
     pub fn scenarios(&self) -> ScenarioManager {
         self.scenarios.clone()
+    }
+
+    pub fn auto_fill_config(&self) -> Option<AutoFillConfig> {
+        self.auto_fill.clone()
     }
 
     pub async fn exchange(&self) -> ExchangeId {

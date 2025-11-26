@@ -42,8 +42,8 @@ use tesser_rpc::proto::{
 };
 use tesser_strategy::{PairsTradingArbitrage, Strategy, StrategyContext, StrategyResult};
 use tesser_test_utils::{
-    AccountConfig, MockExchange, MockExchangeConfig, OrderFillStep, Scenario, ScenarioAction,
-    ScenarioManager, ScenarioTrigger,
+    AccountConfig, AutoFillConfig, MockExchange, MockExchangeConfig, OrderFillStep, Scenario,
+    ScenarioAction, ScenarioManager, ScenarioTrigger,
 };
 
 const SYMBOL: &str = "BTCUSDT";
@@ -129,6 +129,22 @@ async fn wait_for_fill_count(
     })
     .await
     .with_context(|| format!("timed out waiting for {expected} fills"))??;
+    Ok(())
+}
+
+async fn wait_for_positions_flat(exchange: &MockExchange, timeout_dur: Duration) -> Result<()> {
+    let state = exchange.state();
+    timeout(timeout_dur, async move {
+        loop {
+            let positions = state.account_positions("test-key").await?;
+            if positions.iter().all(|position| position.quantity.is_zero()) {
+                return Ok::<(), anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for positions to flatten")??;
     Ok(())
 }
 
@@ -608,50 +624,22 @@ async fn pairs_trading_executes_cross_exchange_round_trip() -> Result<()> {
         .with_exchange(bybit_exchange())
         .with_account(account_a)
         .with_candles(candles_a)
-        .with_ticks(ticks_a);
+        .with_ticks(ticks_a)
+        .with_auto_fill(AutoFillConfig {
+            delay: Duration::from_millis(25),
+            price: Some(Decimal::new(10_000, 0)),
+        });
     let config_b = MockExchangeConfig::new()
         .with_exchange(binance_exchange())
         .with_account(account_b)
         .with_candles(candles_b)
-        .with_ticks(ticks_b);
+        .with_ticks(ticks_b)
+        .with_auto_fill(AutoFillConfig {
+            delay: Duration::from_millis(25),
+            price: Some(Decimal::new(9_950, 0)),
+        });
     let mut exchange_a = MockExchange::start(config_a).await?;
     let mut exchange_b = MockExchange::start(config_b).await?;
-    for (exchange, entry_price, exit_price) in [
-        (
-            &exchange_a,
-            Decimal::new(10_000, 0),
-            Decimal::new(10_050, 0),
-        ),
-        (&exchange_b, Decimal::new(9_950, 0), Decimal::new(10_000, 0)),
-    ] {
-        let scenarios = exchange.state().scenarios();
-        scenarios
-            .push(Scenario {
-                name: "pairs-entry".into(),
-                trigger: ScenarioTrigger::OrderCreate,
-                action: ScenarioAction::FillPlan {
-                    steps: vec![OrderFillStep {
-                        after: Duration::from_millis(25),
-                        quantity: Decimal::ONE,
-                        price: Some(entry_price),
-                    }],
-                },
-            })
-            .await;
-        scenarios
-            .push(Scenario {
-                name: "pairs-exit".into(),
-                trigger: ScenarioTrigger::OrderCreate,
-                action: ScenarioAction::FillPlan {
-                    steps: vec![OrderFillStep {
-                        after: Duration::from_millis(25),
-                        quantity: Decimal::ONE,
-                        price: Some(exit_price),
-                    }],
-                },
-            })
-            .await;
-    }
     let temp = tempdir()?;
     let state_path = temp.path().join("live_state.db");
     let markets_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config/markets.toml");
@@ -724,16 +712,8 @@ async fn pairs_trading_executes_cross_exchange_round_trip() -> Result<()> {
     wait_for_fill_count(&exchange_b, 2, Duration::from_secs(10)).await?;
     shutdown.trigger();
     run_handle.await??;
-    for exchange in [&exchange_a, &exchange_b] {
-        let positions = exchange
-            .state()
-            .account_positions("test-key")
-            .await
-            .expect("positions");
-        assert!(positions
-            .into_iter()
-            .all(|position| position.quantity.is_zero()));
-    }
+    wait_for_positions_flat(&exchange_a, Duration::from_secs(5)).await?;
+    wait_for_positions_flat(&exchange_b, Duration::from_secs(5)).await?;
     exchange_a.shutdown().await;
     exchange_b.shutdown().await;
     Ok(())

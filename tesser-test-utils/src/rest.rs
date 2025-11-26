@@ -164,6 +164,13 @@ async fn handle_order_create(
 
     if let Some(steps) = fill_plan {
         spawn_fill_plan(state.clone(), api_key.clone(), order.clone(), steps);
+    } else if let Some(config) = state.auto_fill_config() {
+        let step = OrderFillStep {
+            after: config.delay,
+            quantity: order.request.quantity,
+            price: config.price,
+        };
+        spawn_fill_plan(state.clone(), api_key.clone(), order.clone(), vec![step]);
     }
 
     ok_response(json!({
