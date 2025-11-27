@@ -1346,7 +1346,7 @@ impl Strategy for PairsTradingArbitrage {
             if let Some(spreads) = self.spreads(ctx) {
                 if let Some(z) = z_score(&spreads) {
                     let clip = self.manual_clip(ctx);
-                    if z >= self.entry_z_level {
+                    if z >= self.entry_z_level && matches!(self.bias, SpreadBias::Flat) {
                         self.bias = SpreadBias::ShortFirst;
                         let group_id = Uuid::new_v4();
                         // Asset A rich: short A, long B.
@@ -1364,7 +1364,7 @@ impl Strategy for PairsTradingArbitrage {
                             clip,
                             Some(group_id),
                         );
-                    } else if z <= -self.entry_z_level {
+                    } else if z <= -self.entry_z_level && matches!(self.bias, SpreadBias::Flat) {
                         self.bias = SpreadBias::LongFirst;
                         let group_id = Uuid::new_v4();
                         // Asset B rich: long A, short B.

@@ -111,48 +111,35 @@ fn build_price_series(
     (candles, ticks)
 }
 
-async fn wait_for_fill_count(
-    exchange: &MockExchange,
-    expected: usize,
-    timeout_dur: Duration,
-) -> Result<()> {
+async fn wait_for_fill_sides(exchange: &MockExchange, timeout_dur: Duration) -> Result<()> {
     let state = exchange.state();
     let since = Utc::now() - ChronoDuration::minutes(1);
     timeout(timeout_dur, async move {
         loop {
             let fills = state.executions_between("test-key", since, None).await?;
-            if fills.len() >= expected {
+            let mut net = Decimal::ZERO;
+            let mut seen_buy = false;
+            let mut seen_sell = false;
+            for fill in &fills {
+                match fill.side {
+                    Side::Buy => {
+                        seen_buy = true;
+                        net += fill.fill_quantity;
+                    }
+                    Side::Sell => {
+                        seen_sell = true;
+                        net -= fill.fill_quantity;
+                    }
+                }
+            }
+            if seen_buy && seen_sell && net.is_zero() {
                 return Ok::<(), anyhow::Error>(());
             }
             sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .with_context(|| format!("timed out waiting for {expected} fills"))??;
-    Ok(())
-}
-
-async fn wait_for_positions_flat(exchange: &MockExchange, timeout_dur: Duration) -> Result<()> {
-    let state = exchange.state();
-    let venue = state.exchange().await;
-    timeout(timeout_dur, async move {
-        let mut iterations = 0u32;
-        loop {
-            let positions = state.account_positions("test-key").await?;
-            if positions.iter().all(|position| position.quantity.is_zero()) {
-                return Ok::<(), anyhow::Error>(());
-            }
-            if iterations.is_multiple_of(20) {
-                println!(
-                    "[pairs-test] waiting for {venue} positions to flatten, snapshot={positions:?}"
-                );
-            }
-            iterations = iterations.wrapping_add(1);
-            sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .with_context(|| format!("timed out waiting for {venue} positions to flatten"))??;
+    .context("timed out waiting for entry + exit fills")??;
     Ok(())
 }
 
@@ -624,8 +611,8 @@ async fn pairs_trading_executes_cross_exchange_round_trip() -> Result<()> {
     let account_b = AccountConfig::new("test-key", "test-secret")
         .with_balance(binance_account_balance(Decimal::new(10_000, 0)));
     let base_time = Utc::now();
-    let series_a = [100, 100, 100, 300, 110, 95, 101, 98];
-    let series_b = [100, 100, 100, 100, 100, 100, 100, 100];
+    let series_a = [100, 100, 100, 300, 110, 95];
+    let series_b = [100, 100, 100, 100, 100, 100];
     let (candles_a, ticks_a) = build_price_series(test_symbol(), base_time, &series_a);
     let (candles_b, ticks_b) = build_price_series(binance_symbol(), base_time, &series_b);
     let config_a = MockExchangeConfig::new()
@@ -724,14 +711,22 @@ async fn pairs_trading_executes_cross_exchange_round_trip() -> Result<()> {
         settings,
         shutdown.clone(),
     );
-    wait_for_fill_count(&exchange_a, 2, Duration::from_secs(10)).await?;
-    wait_for_fill_count(&exchange_b, 2, Duration::from_secs(10)).await?;
     tokio::try_join!(
-        wait_for_positions_flat(&exchange_a, Duration::from_secs(10)),
-        wait_for_positions_flat(&exchange_b, Duration::from_secs(10))
+        wait_for_fill_sides(&exchange_a, Duration::from_secs(10)),
+        wait_for_fill_sides(&exchange_b, Duration::from_secs(10))
     )?;
     shutdown.trigger();
     run_handle.await??;
+    for exchange in [&exchange_a, &exchange_b] {
+        let positions = exchange
+            .state()
+            .account_positions("test-key")
+            .await
+            .expect("positions");
+        assert!(positions
+            .into_iter()
+            .all(|position| position.quantity.is_zero()));
+    }
     exchange_a.shutdown().await;
     exchange_b.shutdown().await;
     Ok(())
