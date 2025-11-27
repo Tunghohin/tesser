@@ -613,10 +613,12 @@ async fn pairs_trading_executes_cross_exchange_round_trip() -> Result<()> {
         .with_balance(binance_account_balance(Decimal::new(10_000, 0)));
     let base_time = Utc::now();
     let series_a = [
-        100, 100, 100, 300, 110, 100, 98, 100, 100, 101, 99, 100, 100, 100, 100,
+        100, 100, 100, 300, 110, 100, 98, 100, 100, 101, 99, 100, 100, 100, 100, 100, 100, 100,
+        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
     ];
     let series_b = [
-        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
     ];
     let (candles_a, ticks_a) = build_price_series(test_symbol(), base_time, &series_a);
     let (candles_b, ticks_b) = build_price_series(binance_symbol(), base_time, &series_b);
@@ -704,6 +706,10 @@ async fn pairs_trading_executes_cross_exchange_round_trip() -> Result<()> {
         entry_z = 1.5
         exit_z = 0.8
         symbols = ["bybit_linear:BTCUSDT", "binance_perp:BTCUSDT"]
+
+        [default_exit_strategy]
+        type = "hard_time_stop"
+        max_duration_secs = 60
         "#,
     )?;
     strategy.configure(config_value)?;
@@ -746,10 +752,12 @@ async fn control_plane_updates_pairs_exit_strategy() -> Result<()> {
         .with_balance(binance_account_balance(Decimal::new(10_000, 0)));
     let base_time = Utc::now();
     let series_a = [
-        100, 100, 100, 300, 110, 100, 98, 100, 100, 101, 99, 100, 100, 100, 100,
+        100, 100, 100, 300, 110, 100, 98, 100, 100, 101, 99, 100, 100, 100, 100, 100, 100, 100,
+        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
     ];
     let series_b = [
-        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
     ];
     let (candles_a, ticks_a) = build_price_series(test_symbol(), base_time, &series_a);
     let (candles_b, ticks_b) = build_price_series(binance_symbol(), base_time, &series_b);
