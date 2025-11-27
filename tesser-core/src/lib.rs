@@ -11,12 +11,14 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod identifiers;
+
+pub use identifiers::{AssetId, ExchangeId, IdentifierParseError, Symbol};
+
 /// Alias for price precision.
 pub type Price = Decimal;
 /// Alias for quantity precision.
 pub type Quantity = Decimal;
-/// Alias used for human-readable market symbols (e.g., `BTCUSDT`).
-pub type Symbol = String;
 
 /// Unique identifier assigned to orders (exchange or client provided).
 pub type OrderId = String;
@@ -34,10 +36,10 @@ pub enum InstrumentKind {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Instrument {
     pub symbol: Symbol,
-    pub base: Symbol,
-    pub quote: Symbol,
+    pub base: AssetId,
+    pub quote: AssetId,
     pub kind: InstrumentKind,
-    pub settlement_currency: Symbol,
+    pub settlement_currency: AssetId,
     pub tick_size: Price,
     pub lot_size: Quantity,
 }
@@ -45,7 +47,7 @@ pub struct Instrument {
 /// Represents a currency balance and its current conversion rate to the reporting currency.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Cash {
-    pub currency: Symbol,
+    pub currency: AssetId,
     pub quantity: Quantity,
     pub conversion_rate: Price,
 }
@@ -60,7 +62,7 @@ impl Cash {
 
 /// Multi-currency ledger keyed by currency symbol.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct CashBook(pub HashMap<Symbol, Cash>);
+pub struct CashBook(pub HashMap<AssetId, Cash>);
 
 impl CashBook {
     #[must_use]
@@ -69,12 +71,13 @@ impl CashBook {
     }
 
     pub fn upsert(&mut self, cash: Cash) {
-        self.0.insert(cash.currency.clone(), cash);
+        self.0.insert(cash.currency, cash);
     }
 
-    pub fn adjust(&mut self, currency: &str, delta: Quantity) -> Quantity {
-        let entry = self.0.entry(currency.to_string()).or_insert(Cash {
-            currency: currency.to_string(),
+    pub fn adjust(&mut self, currency: impl Into<AssetId>, delta: Quantity) -> Quantity {
+        let currency = currency.into();
+        let entry = self.0.entry(currency).or_insert(Cash {
+            currency,
             quantity: Decimal::ZERO,
             conversion_rate: Decimal::ZERO,
         });
@@ -82,9 +85,10 @@ impl CashBook {
         entry.quantity
     }
 
-    pub fn update_conversion_rate(&mut self, currency: &str, rate: Price) {
-        let entry = self.0.entry(currency.to_string()).or_insert(Cash {
-            currency: currency.to_string(),
+    pub fn update_conversion_rate(&mut self, currency: impl Into<AssetId>, rate: Price) {
+        let currency = currency.into();
+        let entry = self.0.entry(currency).or_insert(Cash {
+            currency,
             quantity: Decimal::ZERO,
             conversion_rate: Decimal::ZERO,
         });
@@ -97,16 +101,18 @@ impl CashBook {
     }
 
     #[must_use]
-    pub fn get(&self, currency: &str) -> Option<&Cash> {
-        self.0.get(currency)
+    pub fn get(&self, currency: impl Into<AssetId>) -> Option<&Cash> {
+        let currency = currency.into();
+        self.0.get(&currency)
     }
 
     #[must_use]
-    pub fn get_mut(&mut self, currency: &str) -> Option<&mut Cash> {
-        self.0.get_mut(currency)
+    pub fn get_mut(&mut self, currency: impl Into<AssetId>) -> Option<&mut Cash> {
+        let currency = currency.into();
+        self.0.get_mut(&currency)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&Symbol, &Cash)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&AssetId, &Cash)> {
         self.0.iter()
     }
 }
@@ -148,6 +154,26 @@ pub enum ExecutionHint {
     TrailingStop {
         activation_price: Price,
         callback_rate: Decimal,
+    },
+}
+
+/// Configurable exit management policies shared by strategies and control surfaces.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExitStrategy {
+    /// Exit once the z-score mean reverts to the configured level.
+    StandardZScore { exit_z: Decimal },
+    /// Force an exit once the holding period exceeds the configured duration.
+    HardTimeStop { max_duration_secs: u64 },
+    /// Force an exit after a multiple of the observed half-life (in candles).
+    HalfLifeTimeStop {
+        half_life_candles: u32,
+        multiplier: Decimal,
+    },
+    /// Gradually relax the exit threshold over time.
+    DecayingThreshold {
+        initial_exit_z: Decimal,
+        decay_rate_per_hour: Decimal,
     },
 }
 
@@ -643,6 +669,8 @@ pub struct Fill {
     pub fill_price: Price,
     pub fill_quantity: Quantity,
     pub fee: Option<Price>,
+    #[serde(default)]
+    pub fee_asset: Option<AssetId>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -679,10 +707,13 @@ impl Position {
     }
 }
 
-/// Simple representation of an account balance by currency.
+/// Simple representation of an account balance scoped to a specific exchange asset.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AccountBalance {
-    pub currency: String,
+    #[serde(default)]
+    pub exchange: ExchangeId,
+    #[serde(alias = "currency")]
+    pub asset: AssetId,
     pub total: Price,
     pub available: Price,
     pub updated_at: DateTime<Utc>,
@@ -695,6 +726,12 @@ pub struct Signal {
     pub symbol: Symbol,
     pub kind: SignalKind,
     pub confidence: f64,
+    #[serde(default)]
+    pub quantity: Option<Quantity>,
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
+    #[serde(default)]
+    pub panic_behavior: Option<SignalPanicBehavior>,
     pub generated_at: DateTime<Utc>,
     pub note: Option<String>,
     pub stop_loss: Option<Price>,
@@ -738,6 +775,9 @@ impl Signal {
             symbol: symbol.into(),
             kind,
             confidence,
+            quantity: None,
+            group_id: None,
+            panic_behavior: None,
             generated_at: Utc::now(),
             note: None,
             stop_loss: None,
@@ -752,6 +792,36 @@ impl Signal {
         self.execution_hint = Some(hint);
         self
     }
+
+    /// Override the default sizing logic with a fixed quantity.
+    #[must_use]
+    pub fn with_quantity(mut self, quantity: Quantity) -> Self {
+        self.quantity = Some(quantity);
+        self
+    }
+
+    /// Associate this signal with a multi-leg execution group.
+    #[must_use]
+    pub fn with_group(mut self, group_id: Uuid) -> Self {
+        self.group_id = Some(group_id);
+        self
+    }
+
+    /// Override the default panic close behavior for this signal's execution group.
+    #[must_use]
+    pub fn with_panic_behavior(mut self, behavior: SignalPanicBehavior) -> Self {
+        self.panic_behavior = Some(behavior);
+        self
+    }
+}
+
+/// Overrides applied to the orchestrator's panic close logic for a specific signal/group.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub enum SignalPanicBehavior {
+    /// Flatten positions using market orders.
+    Market,
+    /// Use an aggressive limit offset (in basis points) before falling back to market.
+    AggressiveLimit { offset_bps: Decimal },
 }
 
 #[cfg(test)]
@@ -768,7 +838,7 @@ mod tests {
     #[test]
     fn position_mark_price_updates_unrealized_pnl() {
         let mut position = Position {
-            symbol: "BTCUSDT".to_string(),
+            symbol: Symbol::from("BTCUSDT"),
             side: Some(Side::Buy),
             quantity: Decimal::from_f64(0.5).unwrap(),
             entry_price: Some(Decimal::from(60_000)),

@@ -5,7 +5,7 @@ use chrono::SecondsFormat;
 use rust_decimal::Decimal;
 use serde_json::to_string_pretty;
 use tesser_config::PersistenceEngine;
-use tesser_core::Side;
+use tesser_core::{CashBook, Position, Side, Symbol};
 use tesser_journal::LmdbJournal;
 use tesser_portfolio::{LiveState, PortfolioState, SqliteStateRepository, StateRepository};
 
@@ -85,7 +85,7 @@ fn print_summary(path: &Path, state: &LiveState) {
         println!("  none");
     } else {
         let mut entries: Vec<_> = state.last_prices.iter().collect();
-        entries.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+        entries.sort_by_key(|(symbol, _)| (symbol.exchange.as_raw(), symbol.market_id));
         for (symbol, price) in entries.into_iter().take(MAX_PRICE_ROWS) {
             println!("  {symbol}: {price}");
         }
@@ -109,7 +109,7 @@ fn print_portfolio(portfolio: &PortfolioState) {
     let realized = equity - portfolio.initial_equity - unrealized;
     let reporting_cash = portfolio
         .balances
-        .get(&portfolio.reporting_currency)
+        .get(portfolio.reporting_currency)
         .map(|cash| cash.quantity)
         .unwrap_or_default();
     println!("Portfolio snapshot:");
@@ -127,30 +127,64 @@ fn print_portfolio(portfolio: &PortfolioState) {
         println!("  Drawdown limit: {:.2}%", limit * Decimal::from(100));
     }
 
-    if portfolio
-        .balances
-        .iter()
-        .any(|(_, cash)| !cash.quantity.is_zero())
-    {
-        println!("  Balances:");
-        let mut balances: Vec<_> = portfolio.balances.iter().collect();
-        balances.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
-        for (currency, cash) in balances {
+    if !portfolio.sub_accounts.is_empty() {
+        println!("  Venue breakdown:");
+        let mut venues: Vec<_> = portfolio.sub_accounts.values().collect();
+        venues.sort_by_key(|acct| acct.exchange.as_raw());
+        for account in venues {
+            let unrealized: Decimal = account
+                .positions
+                .values()
+                .map(|pos| pos.unrealized_pnl)
+                .sum();
+            let equity = account.balances.total_value() + unrealized;
+            println!(
+                "    {:<12} equity={:.2} balances={} positions={}",
+                account.exchange,
+                equity,
+                account.balances.iter().count(),
+                account.positions.len()
+            );
+            print_balances("      Balances", &account.balances);
+            print_positions("      Positions", &account.positions);
+        }
+    }
+
+    print_balances("Balances", &portfolio.balances);
+    print_positions("Positions", &portfolio.positions);
+}
+
+fn format_side(side: Option<Side>) -> &'static str {
+    match side {
+        Some(Side::Buy) => "Buy",
+        Some(Side::Sell) => "Sell",
+        None => "Flat",
+    }
+}
+
+fn print_balances(label: &str, balances: &CashBook) {
+    if balances.iter().any(|(_, cash)| !cash.quantity.is_zero()) {
+        println!("  {label}:");
+        let mut entries: Vec<_> = balances.iter().collect();
+        entries.sort_by_key(|(asset, _)| (asset.exchange.as_raw(), asset.asset_id));
+        for (currency, cash) in entries {
             println!(
                 "    {:<8} qty={:.6} rate={:.6}",
                 currency, cash.quantity, cash.conversion_rate
             );
         }
     }
+}
 
-    if portfolio.positions.is_empty() {
-        println!("  Positions: none");
+fn print_positions(label: &str, positions: &std::collections::HashMap<Symbol, Position>) {
+    if positions.is_empty() {
+        println!("  {label}: none");
         return;
     }
-    println!("  Positions:");
-    let mut positions: Vec<_> = portfolio.positions.iter().collect();
-    positions.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
-    for (symbol, position) in positions {
+    println!("  {label}:");
+    let mut entries: Vec<_> = positions.iter().collect();
+    entries.sort_by_key(|(symbol, _)| (symbol.exchange.as_raw(), symbol.market_id));
+    for (symbol, position) in entries {
         println!(
             "    {:<12} side={} qty={:.4} entry={:.4?} unrealized={:.2} updated={}",
             symbol,
@@ -162,13 +196,5 @@ fn print_portfolio(portfolio: &PortfolioState) {
                 .updated_at
                 .to_rfc3339_opts(SecondsFormat::Secs, true)
         );
-    }
-}
-
-fn format_side(side: Option<Side>) -> &'static str {
-    match side {
-        Some(Side::Buy) => "Buy",
-        Some(Side::Sell) => "Sell",
-        None => "Flat",
     }
 }

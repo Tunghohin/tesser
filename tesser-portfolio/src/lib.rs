@@ -11,8 +11,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use rust_decimal::Decimal;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tesser_core::{
-    AccountBalance, Cash, CashBook, Fill, Instrument, InstrumentKind, Order, Position, Price,
-    Quantity, Side, Symbol,
+    AccountBalance, AssetId, Cash, CashBook, ExchangeId, Fill, Instrument, InstrumentKind, Order,
+    Position, Price, Quantity, Side, Symbol,
 };
 use tesser_markets::MarketRegistry;
 use thiserror::Error;
@@ -34,28 +34,53 @@ pub enum PortfolioError {
 /// Configuration used when instantiating a portfolio.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PortfolioConfig {
-    pub initial_balances: HashMap<Symbol, Price>,
-    pub reporting_currency: Symbol,
+    pub initial_balances: HashMap<AssetId, Price>,
+    pub reporting_currency: AssetId,
     pub max_drawdown: Option<Decimal>,
 }
 
 impl Default for PortfolioConfig {
     fn default() -> Self {
         let mut balances = HashMap::new();
-        balances.insert("USDT".to_string(), Decimal::from(10_000));
+        balances.insert(AssetId::from("USDT"), Decimal::from(10_000));
         Self {
             initial_balances: balances,
-            reporting_currency: "USDT".into(),
+            reporting_currency: AssetId::from("USDT"),
             max_drawdown: None,
         }
     }
 }
 
+/// Aggregated ledger and position data for a specific venue.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SubAccount {
+    pub exchange: ExchangeId,
+    pub balances: CashBook,
+    pub positions: HashMap<Symbol, Position>,
+}
+
+impl SubAccount {
+    fn new(exchange: ExchangeId) -> Self {
+        Self {
+            exchange,
+            balances: CashBook::new(),
+            positions: HashMap::new(),
+        }
+    }
+
+    fn ensure_currency(&mut self, reporting_currency: AssetId, currency: AssetId) {
+        self.balances.0.entry(currency).or_insert(Cash {
+            currency,
+            quantity: Decimal::ZERO,
+            conversion_rate: conversion_rate_for_currency(currency, reporting_currency),
+        });
+    }
+}
+
 /// Stores aggregate positions keyed by symbol.
 pub struct Portfolio {
-    positions: HashMap<Symbol, Position>,
-    balances: CashBook,
-    reporting_currency: Symbol,
+    sub_accounts: HashMap<ExchangeId, SubAccount>,
+    reporting_currency: AssetId,
     initial_equity: Price,
     drawdown_limit: Option<Decimal>,
     peak_equity: Price,
@@ -67,37 +92,32 @@ impl Portfolio {
     /// Instantiate a new portfolio with default configuration.
     pub fn new(config: PortfolioConfig, registry: Arc<MarketRegistry>) -> Self {
         let limit = config.max_drawdown.filter(|value| *value > Decimal::ZERO);
-        let mut balances = CashBook::new();
+        let mut sub_accounts: HashMap<ExchangeId, SubAccount> = HashMap::new();
         for (currency, amount) in &config.initial_balances {
-            balances.upsert(Cash {
-                currency: currency.clone(),
+            let exchange = currency.exchange;
+            let account = sub_accounts
+                .entry(exchange)
+                .or_insert_with(|| SubAccount::new(exchange));
+            account.ensure_currency(config.reporting_currency, *currency);
+            account.balances.upsert(Cash {
+                currency: *currency,
                 quantity: *amount,
-                conversion_rate: if currency == &config.reporting_currency {
-                    Decimal::ONE
-                } else {
-                    Decimal::ZERO
-                },
+                conversion_rate: conversion_rate_for_currency(*currency, config.reporting_currency),
             });
         }
-        balances
-            .0
-            .entry(config.reporting_currency.clone())
-            .or_insert(Cash {
-                currency: config.reporting_currency.clone(),
-                quantity: Decimal::ZERO,
-                conversion_rate: Decimal::ONE,
-            });
-        let initial_equity = balances.total_value();
-        Self {
-            positions: HashMap::new(),
-            balances,
+        let mut portfolio = Self {
+            sub_accounts,
             reporting_currency: config.reporting_currency,
-            initial_equity,
+            initial_equity: Decimal::ZERO,
             drawdown_limit: limit,
-            peak_equity: initial_equity,
+            peak_equity: Decimal::ZERO,
             liquidate_only: false,
             market_registry: registry,
-        }
+        };
+        portfolio.ensure_reporting_currency_entries();
+        portfolio.initial_equity = portfolio.cash_value();
+        portfolio.peak_equity = portfolio.initial_equity;
+        portfolio
     }
 
     /// Build a portfolio snapshot from live exchange balances and positions.
@@ -108,36 +128,32 @@ impl Portfolio {
         registry: Arc<MarketRegistry>,
     ) -> Self {
         let mut portfolio = Self::new(config, registry);
-        let mut position_map = HashMap::new();
+        portfolio.sub_accounts.clear();
         for position in positions.into_iter() {
             if position.quantity.is_zero() {
                 continue;
             }
-            position_map.insert(position.symbol.clone(), position);
+            let exchange = position.symbol.exchange;
+            let account = portfolio.account_mut(exchange);
+            account.positions.insert(position.symbol, position);
         }
-        let mut cash_book = CashBook::new();
         for balance in balances {
-            cash_book.upsert(Cash {
-                currency: balance.currency.clone(),
+            let exchange = if balance.exchange.is_specified() {
+                balance.exchange
+            } else {
+                balance.asset.exchange
+            };
+            let reporting = portfolio.reporting_currency;
+            let account = portfolio.account_mut(exchange);
+            account.ensure_currency(reporting, balance.asset);
+            account.balances.upsert(Cash {
+                currency: balance.asset,
                 quantity: balance.available,
-                conversion_rate: if balance.currency == portfolio.reporting_currency {
-                    Decimal::ONE
-                } else {
-                    Decimal::ZERO
-                },
+                conversion_rate: conversion_rate_for_currency(balance.asset, reporting),
             });
         }
-        cash_book
-            .0
-            .entry(portfolio.reporting_currency.clone())
-            .or_insert(Cash {
-                currency: portfolio.reporting_currency.clone(),
-                quantity: Decimal::ZERO,
-                conversion_rate: Decimal::ONE,
-            });
-        portfolio.positions = position_map;
-        portfolio.balances = cash_book;
-        portfolio.initial_equity = portfolio.balances.total_value();
+        portfolio.ensure_reporting_currency_entries();
+        portfolio.initial_equity = portfolio.cash_value();
         portfolio.peak_equity = portfolio.initial_equity;
         portfolio.update_drawdown_state();
         portfolio
@@ -147,24 +163,23 @@ impl Portfolio {
     pub fn apply_fill(&mut self, fill: &Fill) -> PortfolioResult<()> {
         let instrument = self
             .market_registry
-            .get(&fill.symbol)
-            .ok_or_else(|| PortfolioError::UnknownSymbol(fill.symbol.clone()))?;
-        self.ensure_currency(&instrument.settlement_currency);
-        self.ensure_currency(&instrument.base);
-        self.ensure_currency(&instrument.quote);
+            .get(fill.symbol)
+            .ok_or(PortfolioError::UnknownSymbol(fill.symbol))?;
+        let reporting = self.reporting_currency;
+        let account = self.account_mut(fill.symbol.exchange);
+        account.ensure_currency(reporting, instrument.settlement_currency);
+        account.ensure_currency(reporting, instrument.base);
+        account.ensure_currency(reporting, instrument.quote);
         let mut realized_delta = Decimal::ZERO;
         {
-            let entry = self
-                .positions
-                .entry(fill.symbol.clone())
-                .or_insert(Position {
-                    symbol: fill.symbol.clone(),
-                    side: Some(fill.side),
-                    quantity: Decimal::ZERO,
-                    entry_price: Some(fill.fill_price),
-                    unrealized_pnl: Decimal::ZERO,
-                    updated_at: fill.timestamp,
-                });
+            let entry = account.positions.entry(fill.symbol).or_insert(Position {
+                symbol: fill.symbol,
+                side: Some(fill.side),
+                quantity: Decimal::ZERO,
+                entry_price: Some(fill.fill_price),
+                unrealized_pnl: Decimal::ZERO,
+                updated_at: fill.timestamp,
+            });
 
             if entry.side.is_none() {
                 entry.side = Some(fill.side);
@@ -219,38 +234,50 @@ impl Portfolio {
             entry.updated_at = fill.timestamp;
         }
 
-        self.apply_cash_flow(&instrument, fill, realized_delta);
+        Self::apply_cash_flow(account, reporting, &instrument, fill, realized_delta);
         self.update_drawdown_state();
         Ok(())
     }
 
     /// Retrieve a position snapshot for a symbol.
     #[must_use]
-    pub fn position(&self, symbol: &str) -> Option<&Position> {
-        self.positions.get(symbol)
+    pub fn position(&self, symbol: impl Into<Symbol>) -> Option<&Position> {
+        let symbol = symbol.into();
+        self.sub_accounts
+            .get(&symbol.exchange)
+            .and_then(|account| account.positions.get(&symbol))
     }
 
     /// Total net asset value (cash + unrealized PnL).
     #[must_use]
     pub fn equity(&self) -> Price {
-        let unrealized: Price = self.positions.values().map(|p| p.unrealized_pnl).sum();
-        self.balances.total_value() + unrealized
+        let unrealized: Price = self
+            .sub_accounts
+            .values()
+            .flat_map(|account| account.positions.values())
+            .map(|p| p.unrealized_pnl)
+            .sum();
+        self.cash_value() + unrealized
     }
 
     /// Cash on hand that is not locked in positions.
     #[must_use]
     pub fn cash(&self) -> Price {
-        self.balances
-            .get(&self.reporting_currency)
-            .map(|cash| cash.quantity)
-            .unwrap_or_default()
+        let mut total = Decimal::ZERO;
+        for account in self.sub_accounts.values() {
+            for (currency, cash) in account.balances.iter() {
+                if matches_reporting_currency(*currency, self.reporting_currency) {
+                    total += cash.quantity;
+                }
+            }
+        }
+        total
     }
 
     /// Realized profit and loss across all closed positions.
     #[must_use]
     pub fn realized_pnl(&self) -> Price {
-        let unrealized: Price = self.positions.values().map(|p| p.unrealized_pnl).sum();
-        self.equity() - self.initial_equity - unrealized
+        self.equity() - self.initial_equity - self.total_unrealized()
     }
 
     /// Initial capital provided to the portfolio.
@@ -262,14 +289,44 @@ impl Portfolio {
     /// Clone all tracked positions for external consumers (e.g., strategies).
     #[must_use]
     pub fn positions(&self) -> Vec<Position> {
-        self.positions.values().cloned().collect()
+        self.sub_accounts
+            .values()
+            .flat_map(|account| account.positions.values().cloned())
+            .collect()
+    }
+
+    /// Return the available cash balance for a specific asset, if tracked.
+    #[must_use]
+    pub fn balance(&self, currency: impl Into<AssetId>) -> Option<Cash> {
+        let currency = currency.into();
+        self.sub_accounts
+            .get(&currency.exchange)
+            .and_then(|account| account.balances.get(currency).cloned())
+    }
+
+    /// Compute the aggregate equity for a single exchange.
+    #[must_use]
+    pub fn exchange_equity(&self, exchange: ExchangeId) -> Price {
+        self.sub_accounts
+            .get(&exchange)
+            .map(|account| {
+                let unrealized: Price = account
+                    .positions
+                    .values()
+                    .map(|position| position.unrealized_pnl)
+                    .sum();
+                account.balances.total_value() + unrealized
+            })
+            .unwrap_or_default()
     }
 
     /// Signed position quantity helper (long positive, short negative).
     #[must_use]
-    pub fn signed_position_qty(&self, symbol: &str) -> Quantity {
-        self.positions
-            .get(symbol)
+    pub fn signed_position_qty(&self, symbol: impl Into<Symbol>) -> Quantity {
+        let symbol = symbol.into();
+        self.sub_accounts
+            .get(&symbol.exchange)
+            .and_then(|account| account.positions.get(&symbol))
             .map(|position| match position.side {
                 Some(Side::Buy) => position.quantity,
                 Some(Side::Sell) => -position.quantity,
@@ -298,13 +355,27 @@ impl Portfolio {
     #[must_use]
     pub fn snapshot(&self) -> PortfolioState {
         PortfolioState {
-            positions: self.positions.clone(),
-            balances: self.balances.clone(),
-            reporting_currency: self.reporting_currency.clone(),
+            positions: self.aggregate_positions_map(),
+            balances: self.aggregate_balances(),
+            reporting_currency: self.reporting_currency,
             initial_equity: self.initial_equity,
             drawdown_limit: self.drawdown_limit,
             peak_equity: self.peak_equity,
             liquidate_only: self.liquidate_only,
+            sub_accounts: self
+                .sub_accounts
+                .iter()
+                .map(|(exchange, account)| {
+                    (
+                        *exchange,
+                        SubAccountState {
+                            exchange: *exchange,
+                            balances: account.balances.clone(),
+                            positions: account.positions.clone(),
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -318,38 +389,56 @@ impl Portfolio {
             .max_drawdown
             .filter(|value| *value > Decimal::ZERO)
             .or(state.drawdown_limit);
-        let peak_against_state = cmp::max(state.peak_equity, state.initial_equity);
         let mut portfolio = Self {
-            positions: state.positions,
-            balances: state.balances,
+            sub_accounts: HashMap::new(),
             reporting_currency: state.reporting_currency,
             initial_equity: state.initial_equity,
             drawdown_limit,
-            peak_equity: cmp::max(peak_against_state, state.initial_equity),
+            peak_equity: cmp::max(state.peak_equity, state.initial_equity),
             liquidate_only: state.liquidate_only,
             market_registry: registry,
         };
-        let reporting = portfolio.reporting_currency.clone();
-        portfolio.ensure_currency(&reporting);
-        portfolio
-            .balances
-            .update_conversion_rate(&reporting, Decimal::ONE);
+        if state.sub_accounts.is_empty() {
+            for (symbol, position) in state.positions {
+                let account = portfolio.account_mut(symbol.exchange);
+                account.positions.insert(symbol, position);
+            }
+            for (asset, cash) in state.balances.iter() {
+                let account = portfolio.account_mut(asset.exchange);
+                account.balances.upsert(cash.clone());
+            }
+        } else {
+            for (exchange, snapshot) in state.sub_accounts {
+                let mut account = SubAccount::new(exchange);
+                account.positions = snapshot.positions;
+                account.balances = snapshot.balances;
+                portfolio.sub_accounts.insert(exchange, account);
+            }
+        }
+        portfolio.ensure_reporting_currency_entries();
         portfolio.update_drawdown_state();
         portfolio
     }
 
     /// Refresh mark-to-market pricing and conversion rates for a symbol.
-    pub fn update_market_data(&mut self, symbol: &str, price: Price) -> PortfolioResult<bool> {
+    pub fn update_market_data(
+        &mut self,
+        symbol: impl Into<Symbol>,
+        price: Price,
+    ) -> PortfolioResult<bool> {
+        let symbol = symbol.into();
         let instrument = self
             .market_registry
             .get(symbol)
-            .ok_or_else(|| PortfolioError::UnknownSymbol(symbol.to_string()))?;
+            .ok_or(PortfolioError::UnknownSymbol(symbol))?;
+        let reporting = self.reporting_currency;
+        let account = self.account_mut(symbol.exchange);
         let mut updated = false;
-        if let Some(position) = self.positions.get_mut(symbol) {
+        if let Some(position) = account.positions.get_mut(&symbol) {
             update_unrealized(position, &instrument, price);
             updated = true;
         }
-        self.update_conversion_rates(&instrument, price);
+        Self::update_conversion_rates(account, reporting, &instrument, price);
         self.update_drawdown_state();
         Ok(updated)
     }
@@ -369,103 +458,181 @@ impl Portfolio {
         }
     }
 
-    fn apply_cash_flow(&mut self, instrument: &Instrument, fill: &Fill, realized: Price) {
+    fn apply_cash_flow(
+        account: &mut SubAccount,
+        reporting_currency: AssetId,
+        instrument: &Instrument,
+        fill: &Fill,
+        realized: Price,
+    ) {
         match instrument.kind {
-            InstrumentKind::Spot => self.apply_spot_flow(instrument, fill),
+            InstrumentKind::Spot => {
+                Self::apply_spot_flow(account, reporting_currency, instrument, fill)
+            }
             InstrumentKind::LinearPerpetual | InstrumentKind::InversePerpetual => {
-                self.apply_derivative_flow(instrument, fill, realized)
+                Self::apply_derivative_flow(account, reporting_currency, instrument, fill, realized)
             }
         }
         if let Some(fee) = fill.fee {
-            let fee_currency = match instrument.kind {
-                InstrumentKind::Spot => &instrument.quote,
-                _ => &instrument.settlement_currency,
-            };
-            self.ensure_currency(fee_currency);
-            self.balances.adjust(fee_currency, -fee);
+            let fee_currency = fill.fee_asset.unwrap_or(match instrument.kind {
+                InstrumentKind::Spot => instrument.quote,
+                _ => instrument.settlement_currency,
+            });
+            account.ensure_currency(reporting_currency, fee_currency);
+            account.balances.adjust(fee_currency, -fee);
         }
     }
 
-    fn apply_spot_flow(&mut self, instrument: &Instrument, fill: &Fill) {
+    fn apply_spot_flow(
+        account: &mut SubAccount,
+        reporting_currency: AssetId,
+        instrument: &Instrument,
+        fill: &Fill,
+    ) {
         let notional = fill.fill_price * fill.fill_quantity;
         match fill.side {
             Side::Buy => {
-                self.ensure_currency(&instrument.base);
-                self.ensure_currency(&instrument.quote);
-                self.balances.adjust(&instrument.base, fill.fill_quantity);
-                self.balances.adjust(&instrument.quote, -notional);
+                account.ensure_currency(reporting_currency, instrument.base);
+                account.ensure_currency(reporting_currency, instrument.quote);
+                account.balances.adjust(instrument.base, fill.fill_quantity);
+                account.balances.adjust(instrument.quote, -notional);
             }
             Side::Sell => {
-                self.ensure_currency(&instrument.base);
-                self.ensure_currency(&instrument.quote);
-                self.balances.adjust(&instrument.base, -fill.fill_quantity);
-                self.balances.adjust(&instrument.quote, notional);
+                account.ensure_currency(reporting_currency, instrument.base);
+                account.ensure_currency(reporting_currency, instrument.quote);
+                account
+                    .balances
+                    .adjust(instrument.base, -fill.fill_quantity);
+                account.balances.adjust(instrument.quote, notional);
             }
         }
     }
 
-    fn apply_derivative_flow(&mut self, instrument: &Instrument, fill: &Fill, realized: Price) {
+    fn apply_derivative_flow(
+        account: &mut SubAccount,
+        reporting_currency: AssetId,
+        instrument: &Instrument,
+        fill: &Fill,
+        realized: Price,
+    ) {
         let notional = fill.fill_price * fill.fill_quantity;
         let direction = Decimal::from(fill.side.as_i8());
         let settlement = &instrument.settlement_currency;
-        self.ensure_currency(settlement);
-        self.balances.adjust(settlement, -(notional * direction));
-        if !realized.is_zero() {
-            self.balances.adjust(settlement, realized);
-        }
-    }
-
-    fn ensure_currency(&mut self, currency: &str) {
-        self.balances.0.entry(currency.to_string()).or_insert(Cash {
-            currency: currency.to_string(),
-            quantity: Decimal::ZERO,
-            conversion_rate: if currency == self.reporting_currency {
-                Decimal::ONE
-            } else {
-                Decimal::ZERO
-            },
-        });
-    }
-
-    fn update_conversion_rates(&mut self, instrument: &Instrument, price: Price) {
-        if instrument.quote == self.reporting_currency {
-            self.ensure_currency(&instrument.base);
-            self.ensure_currency(&instrument.quote);
-            self.balances
-                .update_conversion_rate(&instrument.base, price);
-            self.balances
-                .update_conversion_rate(&instrument.quote, Decimal::ONE);
-            return;
-        }
-        if instrument.base == self.reporting_currency && !price.is_zero() {
-            self.ensure_currency(&instrument.quote);
-            self.ensure_currency(&instrument.base);
-            self.balances
-                .update_conversion_rate(&instrument.base, Decimal::ONE);
-            self.balances
-                .update_conversion_rate(&instrument.quote, Decimal::ONE / price);
-            return;
-        }
-        let quote_rate = self
+        account.ensure_currency(reporting_currency, *settlement);
+        account
             .balances
-            .get(&instrument.quote)
+            .adjust(*settlement, -(notional * direction));
+        if !realized.is_zero() {
+            account.balances.adjust(*settlement, realized);
+        }
+    }
+
+    fn update_conversion_rates(
+        account: &mut SubAccount,
+        reporting_currency: AssetId,
+        instrument: &Instrument,
+        price: Price,
+    ) {
+        if instrument.quote == reporting_currency {
+            account.ensure_currency(reporting_currency, instrument.base);
+            account.ensure_currency(reporting_currency, instrument.quote);
+            account
+                .balances
+                .update_conversion_rate(instrument.base, price);
+            account
+                .balances
+                .update_conversion_rate(instrument.quote, Decimal::ONE);
+            return;
+        }
+        if instrument.base == reporting_currency && !price.is_zero() {
+            account.ensure_currency(reporting_currency, instrument.quote);
+            account.ensure_currency(reporting_currency, instrument.base);
+            account
+                .balances
+                .update_conversion_rate(instrument.base, Decimal::ONE);
+            account
+                .balances
+                .update_conversion_rate(instrument.quote, Decimal::ONE / price);
+            return;
+        }
+        let quote_rate = account
+            .balances
+            .get(instrument.quote)
             .map(|cash| cash.conversion_rate)
             .unwrap_or(Decimal::ZERO);
         if quote_rate > Decimal::ZERO {
-            self.ensure_currency(&instrument.base);
-            self.balances
-                .update_conversion_rate(&instrument.base, price * quote_rate);
+            account.ensure_currency(reporting_currency, instrument.base);
+            account
+                .balances
+                .update_conversion_rate(instrument.base, price * quote_rate);
         }
-        let base_rate = self
+        let base_rate = account
             .balances
-            .get(&instrument.base)
+            .get(instrument.base)
             .map(|cash| cash.conversion_rate)
             .unwrap_or(Decimal::ZERO);
         if base_rate > Decimal::ZERO && !price.is_zero() {
-            self.ensure_currency(&instrument.quote);
-            self.balances
-                .update_conversion_rate(&instrument.quote, base_rate / price);
+            account.ensure_currency(reporting_currency, instrument.quote);
+            account
+                .balances
+                .update_conversion_rate(instrument.quote, base_rate / price);
         }
+    }
+
+    fn account_mut(&mut self, exchange: ExchangeId) -> &mut SubAccount {
+        self.sub_accounts.entry(exchange).or_insert_with(|| {
+            let mut account = SubAccount::new(exchange);
+            account.ensure_currency(self.reporting_currency, self.reporting_currency);
+            account
+        })
+    }
+
+    fn ensure_reporting_currency_entries(&mut self) {
+        let reporting = self.reporting_currency;
+        for account in self.sub_accounts.values_mut() {
+            account.ensure_currency(reporting, reporting);
+        }
+    }
+
+    fn aggregate_positions_map(&self) -> HashMap<Symbol, Position> {
+        self.sub_accounts
+            .values()
+            .flat_map(|account| account.positions.iter())
+            .map(|(symbol, position)| (*symbol, position.clone()))
+            .collect()
+    }
+
+    fn aggregate_balances(&self) -> CashBook {
+        let mut combined = CashBook::new();
+        for account in self.sub_accounts.values() {
+            for (asset, cash) in account.balances.iter() {
+                let entry = combined.0.entry(*asset).or_insert(Cash {
+                    currency: *asset,
+                    quantity: Decimal::ZERO,
+                    conversion_rate: cash.conversion_rate,
+                });
+                entry.quantity += cash.quantity;
+                if cash.conversion_rate > Decimal::ZERO {
+                    entry.conversion_rate = cash.conversion_rate;
+                }
+            }
+        }
+        combined
+    }
+
+    fn total_unrealized(&self) -> Price {
+        self.sub_accounts
+            .values()
+            .flat_map(|account| account.positions.values())
+            .map(|position| position.unrealized_pnl)
+            .sum()
+    }
+
+    fn cash_value(&self) -> Price {
+        self.sub_accounts
+            .values()
+            .map(|account| account.balances.total_value())
+            .sum()
     }
 }
 
@@ -528,16 +695,41 @@ fn update_unrealized(position: &mut Position, instrument: &Instrument, price: Pr
     position.updated_at = Utc::now();
 }
 
+fn matches_reporting_currency(currency: AssetId, reporting: AssetId) -> bool {
+    if currency == reporting {
+        return true;
+    }
+    reporting.exchange == ExchangeId::UNSPECIFIED && currency.code() == reporting.code()
+}
+
+fn conversion_rate_for_currency(currency: AssetId, reporting: AssetId) -> Price {
+    if matches_reporting_currency(currency, reporting) {
+        Decimal::ONE
+    } else {
+        Decimal::ZERO
+    }
+}
+
+/// Snapshot of a single venue's ledger/positions for persistence.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SubAccountState {
+    pub exchange: ExchangeId,
+    pub positions: HashMap<Symbol, Position>,
+    pub balances: CashBook,
+}
+
 /// Serializable representation of a portfolio used for persistence.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PortfolioState {
     pub positions: HashMap<Symbol, Position>,
     pub balances: CashBook,
-    pub reporting_currency: Symbol,
+    pub reporting_currency: AssetId,
     pub initial_equity: Price,
     pub drawdown_limit: Option<Decimal>,
     pub peak_equity: Price,
     pub liquidate_only: bool,
+    #[serde(default)]
+    pub sub_accounts: HashMap<ExchangeId, SubAccountState>,
 }
 
 /// Durable snapshot of the live trading runtime persisted on disk.
@@ -545,7 +737,7 @@ pub struct PortfolioState {
 pub struct LiveState {
     pub portfolio: Option<PortfolioState>,
     pub open_orders: Vec<Order>,
-    pub last_prices: HashMap<String, Price>,
+    pub last_prices: HashMap<Symbol, Price>,
     pub last_candle_ts: Option<DateTime<Utc>>,
     pub strategy_state: Option<serde_json::Value>,
 }
@@ -662,6 +854,7 @@ mod tests {
             fill_price: price,
             fill_quantity: qty,
             fee: None,
+            fee_asset: None,
             timestamp: Utc::now(),
         }
     }
@@ -700,7 +893,7 @@ mod tests {
         assert!(!portfolio.liquidate_only());
         // Price crash reduces equity by more than 2%
         portfolio
-            .update_market_data(&buy.symbol, Decimal::ZERO)
+            .update_market_data(buy.symbol, Decimal::ZERO)
             .unwrap();
         assert!(portfolio.liquidate_only());
     }

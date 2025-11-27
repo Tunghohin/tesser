@@ -26,7 +26,9 @@ use reqwest::Client;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tesser_broker::{BrokerError, BrokerInfo, BrokerResult, MarketStream};
-use tesser_core::{Candle, Interval, LocalOrderBook, OrderBook, OrderBookLevel, Side, Tick};
+use tesser_core::{
+    Candle, ExchangeId, Interval, LocalOrderBook, OrderBook, OrderBookLevel, Side, Symbol, Tick,
+};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
@@ -56,6 +58,7 @@ pub struct BinanceMarketStream {
     book_rx: Mutex<mpsc::Receiver<OrderBook>>,
     handles: Vec<StreamHandle>,
     _event_subscription: Option<Subscription>,
+    exchange: ExchangeId,
 }
 
 #[allow(dead_code)]
@@ -70,6 +73,7 @@ impl BinanceMarketStream {
         ws_url: &str,
         rest_url: &str,
         connection_status: Option<Arc<AtomicBool>>,
+        exchange: ExchangeId,
     ) -> BrokerResult<Self> {
         let cfg = ConfigurationWebsocketStreams::builder()
             .ws_url(ws_url.to_string())
@@ -124,6 +128,7 @@ impl BinanceMarketStream {
             book_rx: Mutex::new(book_rx),
             handles: Vec::new(),
             _event_subscription: event_subscription,
+            exchange,
         })
     }
 
@@ -137,8 +142,9 @@ impl BinanceMarketStream {
             .await
             .map_err(|err| BrokerError::Transport(err.to_string()))?;
         let tx = self.tick_tx.clone();
+        let exchange = self.exchange;
         stream.on_message(move |payload: AggregateTradeStreamsResponse| {
-            if let Some(tick) = convert_trade(&payload) {
+            if let Some(tick) = convert_trade(exchange, &payload) {
                 let _ = tx.try_send(tick);
             }
         });
@@ -157,8 +163,9 @@ impl BinanceMarketStream {
             .await
             .map_err(|err| BrokerError::Transport(err.to_string()))?;
         let tx = self.candle_tx.clone();
+        let exchange = self.exchange;
         stream.on_message(move |payload: KlineCandlestickStreamsResponse| {
-            if let Some(candle) = convert_kline(&payload) {
+            if let Some(candle) = convert_kline(exchange, &payload) {
                 let _ = tx.try_send(candle);
             }
         });
@@ -172,8 +179,9 @@ impl BinanceMarketStream {
         let http = self.http.clone();
         let tx = self.book_tx.clone();
         let depth = depth.max(1);
+        let exchange = self.exchange;
         let handle = tokio::spawn(async move {
-            let mut task = DiffDepthTask::new(symbol, depth, rest_url, ws_base, http, tx);
+            let mut task = DiffDepthTask::new(symbol, depth, rest_url, ws_base, http, tx, exchange);
             let symbol = task.symbol_upper().to_string();
             if let Err(err) = task.run().await {
                 warn!(symbol = %symbol, error = %err, "binance depth stream terminated");
@@ -236,7 +244,7 @@ impl MarketStream for BinanceMarketStream {
     }
 }
 
-fn convert_trade(payload: &AggregateTradeStreamsResponse) -> Option<Tick> {
+fn convert_trade(exchange: ExchangeId, payload: &AggregateTradeStreamsResponse) -> Option<Tick> {
     let symbol = payload.s.clone()?;
     let price = parse_decimal_opt(payload.p.as_deref())?;
     let quantity = parse_decimal_opt(payload.q.as_deref())?;
@@ -245,7 +253,7 @@ fn convert_trade(payload: &AggregateTradeStreamsResponse) -> Option<Tick> {
         false => Side::Buy,
     };
     Some(Tick {
-        symbol,
+        symbol: Symbol::from_code(exchange, symbol),
         price,
         size: quantity,
         side,
@@ -254,7 +262,10 @@ fn convert_trade(payload: &AggregateTradeStreamsResponse) -> Option<Tick> {
     })
 }
 
-fn convert_kline(payload: &KlineCandlestickStreamsResponse) -> Option<Candle> {
+fn convert_kline(
+    exchange: ExchangeId,
+    payload: &KlineCandlestickStreamsResponse,
+) -> Option<Candle> {
     let kline = payload.k.as_ref()?;
     let symbol = kline.s.clone()?;
     let interval = Interval::from_str(kline.i.as_deref().unwrap_or("1m")).ok()?;
@@ -264,7 +275,7 @@ fn convert_kline(payload: &KlineCandlestickStreamsResponse) -> Option<Candle> {
     let close = parse_decimal_opt(kline.c.as_deref())?;
     let volume = parse_decimal_opt(kline.v.as_deref()).unwrap_or(Decimal::ZERO);
     Some(Candle {
-        symbol,
+        symbol: Symbol::from_code(exchange, symbol),
         interval,
         open,
         high,
@@ -286,6 +297,7 @@ struct DiffDepthTask {
     tx: mpsc::Sender<OrderBook>,
     book: LocalOrderBook,
     last_update_id: u64,
+    exchange: ExchangeId,
 }
 
 impl DiffDepthTask {
@@ -296,6 +308,7 @@ impl DiffDepthTask {
         ws_base_url: String,
         http: Client,
         tx: mpsc::Sender<OrderBook>,
+        exchange: ExchangeId,
     ) -> Self {
         let upper = symbol.to_uppercase();
         let lower = symbol.to_lowercase();
@@ -310,6 +323,7 @@ impl DiffDepthTask {
             tx,
             book: LocalOrderBook::new(),
             last_update_id: 0,
+            exchange,
         }
     }
 
@@ -475,7 +489,7 @@ impl DiffDepthTask {
             .map(|(price, size)| OrderBookLevel { price, size })
             .collect::<Vec<_>>();
         Some(OrderBook {
-            symbol: self.symbol_upper.clone(),
+            symbol: Symbol::from_code(self.exchange, &self.symbol_upper),
             bids,
             asks,
             timestamp,
@@ -589,6 +603,7 @@ mod tests {
             .build()
             .expect("failed to build http client");
         let (tx, rx) = mpsc::channel(8);
+        let exchange = ExchangeId::from("binance_perp");
         let task = DiffDepthTask::new(
             "BTCUSDT".into(),
             depth,
@@ -596,6 +611,7 @@ mod tests {
             "wss://example.com".into(),
             client,
             tx,
+            exchange,
         );
         (task, rx)
     }
@@ -618,7 +634,7 @@ mod tests {
         .to_string();
         task.process_message(&message).await.expect("diff applied");
         let book = rx.recv().await.expect("order book emitted");
-        assert_eq!(book.symbol, "BTCUSDT");
+        assert_eq!(book.symbol, Symbol::from_code(task.exchange, "BTCUSDT"));
         assert_eq!(book.bids[0].price, Decimal::from(9));
         assert_eq!(book.asks[0].price, Decimal::from(11));
     }

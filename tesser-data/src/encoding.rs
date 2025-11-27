@@ -144,10 +144,12 @@ static SIGNAL_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
         Field::new("symbol", DataType::Utf8, false),
         Field::new("kind", DataType::Utf8, false),
         Field::new("confidence", DataType::Float64, false),
+        decimal_field("quantity", true),
         decimal_field("stop_loss", true),
         decimal_field("take_profit", true),
         timestamp_field("generated_at"),
         Field::new("metadata", DataType::Utf8, true),
+        Field::new("group_id", DataType::Utf8, true),
     ]))
 });
 
@@ -192,7 +194,7 @@ pub fn ticks_to_batch(rows: &[Tick]) -> Result<RecordBatch> {
     let mut received_ts = timestamp_builder(capacity);
 
     for tick in rows {
-        symbols.append_value(&tick.symbol);
+        symbols.append_value(tick.symbol);
         let price = decimal_to_i128(tick.price)?;
         prices.append_value(price);
         let size = decimal_to_i128(tick.size)?;
@@ -227,7 +229,7 @@ pub fn candles_to_batch(rows: &[Candle]) -> Result<RecordBatch> {
     let mut timestamps = timestamp_builder(capacity);
 
     for candle in rows {
-        symbols.append_value(&candle.symbol);
+        symbols.append_value(candle.symbol);
         intervals.append_value(interval_label(candle.interval));
         let open = decimal_to_i128(candle.open)?;
         opens.append_value(open);
@@ -269,7 +271,7 @@ pub fn fills_to_batch(rows: &[Fill]) -> Result<RecordBatch> {
 
     for fill in rows {
         order_ids.append_value(&fill.order_id);
-        symbols.append_value(&fill.symbol);
+        symbols.append_value(fill.symbol);
         sides.append_value(fill.side.as_i8());
         let price = decimal_to_i128(fill.fill_price)?;
         prices.append_value(price);
@@ -316,7 +318,7 @@ pub fn orders_to_batch(rows: &[Order]) -> Result<RecordBatch> {
     for order in rows {
         let req = &order.request;
         ids.append_value(&order.id);
-        symbols.append_value(&req.symbol);
+        symbols.append_value(req.symbol);
         sides.append_value(req.side.as_i8());
         types.append_value(order_type_label(req.order_type));
         statuses.append_value(status_code(order.status));
@@ -370,16 +372,19 @@ pub fn signals_to_batch(rows: &[Signal]) -> Result<RecordBatch> {
     let mut symbols = string_builder(capacity);
     let mut kinds = string_builder(capacity);
     let mut confidences = Float64Builder::with_capacity(capacity);
+    let mut quantities = decimal_builder(capacity);
     let mut stop_losses = decimal_builder(capacity);
     let mut take_profits = decimal_builder(capacity);
     let mut generated = timestamp_builder(capacity);
     let mut metadata = string_builder(capacity);
+    let mut group_ids = string_builder(capacity);
 
     for signal in rows {
         ids.append_value(signal.id.to_string());
-        symbols.append_value(&signal.symbol);
+        symbols.append_value(signal.symbol);
         kinds.append_value(signal_kind_label(signal.kind));
         confidences.append_value(signal.confidence);
+        append_decimal_option(&mut quantities, signal.quantity)?;
         append_decimal_option(&mut stop_losses, signal.stop_loss)?;
         append_decimal_option(&mut take_profits, signal.take_profit)?;
         generated.append_value(timestamp_to_nanos(&signal.generated_at));
@@ -388,6 +393,11 @@ pub fn signals_to_batch(rows: &[Signal]) -> Result<RecordBatch> {
         } else {
             metadata.append_null();
         }
+        if let Some(group_id) = signal.group_id {
+            group_ids.append_value(group_id.to_string());
+        } else {
+            group_ids.append_null();
+        }
     }
 
     let columns: Vec<ArrayRef> = vec![
@@ -395,10 +405,12 @@ pub fn signals_to_batch(rows: &[Signal]) -> Result<RecordBatch> {
         Arc::new(symbols.finish()),
         Arc::new(kinds.finish()),
         Arc::new(confidences.finish()),
+        Arc::new(quantities.finish()),
         Arc::new(stop_losses.finish()),
         Arc::new(take_profits.finish()),
         Arc::new(generated.finish()),
         Arc::new(metadata.finish()),
+        Arc::new(group_ids.finish()),
     ];
 
     RecordBatch::try_new(signal_schema(), columns).context("failed to build signal batch")
@@ -414,7 +426,7 @@ pub fn order_books_to_batch(rows: &[OrderBook]) -> Result<RecordBatch> {
 
     for book in rows {
         timestamps.append_value(timestamp_to_nanos(&book.timestamp));
-        symbols.append_value(&book.symbol);
+        symbols.append_value(book.symbol);
         append_order_book_levels(&mut bids, &book.bids)?;
         append_order_book_levels(&mut asks, &book.asks)?;
     }

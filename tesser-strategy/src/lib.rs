@@ -6,7 +6,7 @@ use async_trait::async_trait;
 pub use tesser_strategy_macros::register_strategy;
 pub use toml::Value;
 
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
 use once_cell::sync::Lazy;
 use rust_decimal::MathematicalOps;
 use rust_decimal::{
@@ -14,19 +14,23 @@ use rust_decimal::{
     Decimal,
 };
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tesser_core::{
-    Candle, ExecutionHint, Fill, OrderBook, Position, Signal, SignalKind, Symbol, Tick,
+    Candle, ExecutionHint, ExitStrategy, Fill, OrderBook, Position, Quantity, Signal, SignalKind,
+    Symbol, Tick,
 };
 use tesser_cortex::{CortexConfig, CortexDevice, CortexEngine, FeatureBuffer};
 use tesser_indicators::{
     indicators::{Atr, BollingerBands, Ichimoku, IchimokuOutput, Macd, Rsi, Sma},
     Indicator,
 };
+use tesser_markets::MarketRegistry;
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Result alias used within strategy implementations.
 pub type StrategyResult<T> = Result<T, StrategyError>;
@@ -51,7 +55,12 @@ pub struct StrategyContext {
     recent_ticks: VecDeque<Tick>,
     recent_order_books: VecDeque<OrderBook>,
     positions: Vec<Position>,
+    candle_index: HashMap<Symbol, VecDeque<Candle>>,
+    tick_index: HashMap<Symbol, VecDeque<Tick>>,
+    order_book_index: HashMap<Symbol, VecDeque<OrderBook>>,
+    position_index: HashMap<Symbol, Position>,
     max_history: usize,
+    market_registry: Option<Arc<MarketRegistry>>,
 }
 
 impl StrategyContext {
@@ -63,37 +72,63 @@ impl StrategyContext {
             recent_ticks: VecDeque::with_capacity(capacity),
             recent_order_books: VecDeque::with_capacity(capacity),
             positions: Vec::new(),
+            candle_index: HashMap::new(),
+            tick_index: HashMap::new(),
+            order_book_index: HashMap::new(),
+            position_index: HashMap::new(),
             max_history: capacity,
+            market_registry: None,
         }
+    }
+
+    fn push_with_capacity<T>(buffer: &mut VecDeque<T>, item: T, limit: usize) {
+        if buffer.len() >= limit {
+            buffer.pop_front();
+        }
+        buffer.push_back(item);
     }
 
     /// Push a candle while respecting the configured history size.
     pub fn push_candle(&mut self, candle: Candle) {
-        if self.recent_candles.len() >= self.max_history {
-            self.recent_candles.pop_front();
-        }
-        self.recent_candles.push_back(candle);
+        let symbol = candle.symbol;
+        Self::push_with_capacity(&mut self.recent_candles, candle.clone(), self.max_history);
+        let entry = self
+            .candle_index
+            .entry(symbol)
+            .or_insert_with(|| VecDeque::with_capacity(self.max_history));
+        Self::push_with_capacity(entry, candle, self.max_history);
     }
 
     /// Push a tick while respecting the configured history size.
     pub fn push_tick(&mut self, tick: Tick) {
-        if self.recent_ticks.len() >= self.max_history {
-            self.recent_ticks.pop_front();
-        }
-        self.recent_ticks.push_back(tick);
+        let symbol = tick.symbol;
+        Self::push_with_capacity(&mut self.recent_ticks, tick.clone(), self.max_history);
+        let entry = self
+            .tick_index
+            .entry(symbol)
+            .or_insert_with(|| VecDeque::with_capacity(self.max_history));
+        Self::push_with_capacity(entry, tick, self.max_history);
     }
 
     /// Push an order book snapshot while respecting the configured history size.
     pub fn push_order_book(&mut self, book: OrderBook) {
-        if self.recent_order_books.len() >= self.max_history {
-            self.recent_order_books.pop_front();
-        }
-        self.recent_order_books.push_back(book);
+        let symbol = book.symbol;
+        Self::push_with_capacity(&mut self.recent_order_books, book.clone(), self.max_history);
+        let entry = self
+            .order_book_index
+            .entry(symbol)
+            .or_insert_with(|| VecDeque::with_capacity(self.max_history));
+        Self::push_with_capacity(entry, book, self.max_history);
     }
 
     /// Replace the in-memory position snapshot.
     pub fn update_positions(&mut self, positions: Vec<Position>) {
         self.positions = positions;
+        self.position_index.clear();
+        for position in &self.positions {
+            self.position_index
+                .insert(position.symbol, position.clone());
+        }
     }
 
     /// Access recently observed candles.
@@ -102,16 +137,37 @@ impl StrategyContext {
         &self.recent_candles
     }
 
+    /// Access recent candles for a specific symbol.
+    #[must_use]
+    pub fn candles_for(&self, symbol: impl Into<Symbol>) -> Option<&VecDeque<Candle>> {
+        let symbol = symbol.into();
+        self.candle_index.get(&symbol)
+    }
+
     /// Access recently observed ticks.
     #[must_use]
     pub fn ticks(&self) -> &VecDeque<Tick> {
         &self.recent_ticks
     }
 
+    /// Access recent ticks for a specific symbol.
+    #[must_use]
+    pub fn ticks_for(&self, symbol: impl Into<Symbol>) -> Option<&VecDeque<Tick>> {
+        let symbol = symbol.into();
+        self.tick_index.get(&symbol)
+    }
+
     /// Access recently observed order books.
     #[must_use]
     pub fn order_books(&self) -> &VecDeque<OrderBook> {
         &self.recent_order_books
+    }
+
+    /// Access order book history for a specific symbol.
+    #[must_use]
+    pub fn order_books_for(&self, symbol: impl Into<Symbol>) -> Option<&VecDeque<OrderBook>> {
+        let symbol = symbol.into();
+        self.order_book_index.get(&symbol)
     }
 
     /// Access all tracked positions.
@@ -122,17 +178,36 @@ impl StrategyContext {
 
     /// Find the position for a specific symbol, if any.
     #[must_use]
-    pub fn position(&self, symbol: &str) -> Option<&Position> {
-        self.positions.iter().find(|p| p.symbol == symbol)
+    pub fn position(&self, symbol: impl Into<Symbol>) -> Option<&Position> {
+        let symbol = symbol.into();
+        self.position_index.get(&symbol)
     }
 
     /// Returns the latest order book snapshot for the specified symbol.
     #[must_use]
-    pub fn order_book(&self, symbol: &str) -> Option<&OrderBook> {
-        self.recent_order_books
-            .iter()
-            .rev()
-            .find(|book| book.symbol == symbol)
+    pub fn order_book(&self, symbol: impl Into<Symbol>) -> Option<&OrderBook> {
+        let symbol = symbol.into();
+        self.order_book_index
+            .get(&symbol)
+            .and_then(|books| books.back())
+    }
+
+    /// Attach a market registry so strategies can query instrument metadata.
+    pub fn attach_market_registry(&mut self, registry: Arc<MarketRegistry>) {
+        self.market_registry = Some(registry);
+    }
+
+    /// Normalize a target quantity to the coarsest lot size shared by two venues.
+    #[must_use]
+    pub fn normalize_pair_quantity(
+        &self,
+        first: Symbol,
+        second: Symbol,
+        quantity: Quantity,
+    ) -> Option<Quantity> {
+        self.market_registry
+            .as_ref()
+            .and_then(|registry| registry.normalize_pair_quantity(first, second, quantity))
     }
 }
 
@@ -144,16 +219,16 @@ impl Default for StrategyContext {
 
 /// Strategy lifecycle hooks used by engines that drive market data and fills.
 #[async_trait]
-pub trait Strategy: Send + Sync {
+pub trait Strategy: Send + Sync + Any {
     /// Human-friendly identifier used in logs and telemetry.
     fn name(&self) -> &str;
 
     /// The primary symbol operated on by the strategy.
-    fn symbol(&self) -> &str;
+    fn symbol(&self) -> Symbol;
 
     /// Return the set of symbols that should be routed to this strategy (defaults to the primary).
     fn subscriptions(&self) -> Vec<Symbol> {
-        vec![self.symbol().to_string()]
+        vec![self.symbol()]
     }
 
     /// Called once before the strategy is registered, allowing it to parse parameters.
@@ -325,14 +400,11 @@ fn normalize_name(name: &str) -> String {
 // Helpers
 // -------------------------------------------------------------------------------------------------
 
-fn collect_symbol_closes(candles: &VecDeque<Candle>, symbol: &str, limit: usize) -> Vec<Decimal> {
-    let mut values: Vec<Decimal> = candles
-        .iter()
-        .rev()
-        .filter(|c| c.symbol == symbol)
-        .take(limit)
-        .map(|c| c.close)
-        .collect();
+fn collect_symbol_closes(ctx: &StrategyContext, symbol: Symbol, limit: usize) -> Vec<Decimal> {
+    let Some(entries) = ctx.candles_for(symbol) else {
+        return Vec::new();
+    };
+    let mut values: Vec<Decimal> = entries.iter().rev().take(limit).map(|c| c.close).collect();
     values.reverse();
     values
 }
@@ -378,7 +450,7 @@ pub struct SmaCrossConfig {
 impl Default for SmaCrossConfig {
     fn default() -> Self {
         Self {
-            symbol: "BTCUSDT".to_string(),
+            symbol: "BTCUSDT".into(),
             fast_period: 5,
             slow_period: 20,
             min_samples: 25,
@@ -466,7 +538,7 @@ impl SmaCross {
             self.slow_last,
         ) {
             if fast_prev <= slow_prev && fast_curr > slow_curr {
-                let mut signal = Signal::new(self.cfg.symbol.clone(), SignalKind::EnterLong, 0.75);
+                let mut signal = Signal::new(self.cfg.symbol, SignalKind::EnterLong, 0.75);
                 let stop_loss_factor = Decimal::new(98, 2); // 0.98
                 signal.stop_loss = Some(candle.low * stop_loss_factor);
                 if let Some(duration_secs) = self.cfg.vwap_duration_secs.filter(|v| *v > 0) {
@@ -482,11 +554,8 @@ impl SmaCross {
                 }
                 self.signals.push(signal);
             } else if fast_prev >= slow_prev && fast_curr < slow_curr {
-                self.signals.push(Signal::new(
-                    self.cfg.symbol.clone(),
-                    SignalKind::ExitLong,
-                    0.75,
-                ));
+                self.signals
+                    .push(Signal::new(self.cfg.symbol, SignalKind::ExitLong, 0.75));
             }
         }
 
@@ -500,8 +569,8 @@ impl Strategy for SmaCross {
         "sma-cross"
     }
 
-    fn symbol(&self) -> &str {
-        &self.cfg.symbol
+    fn symbol(&self) -> Symbol {
+        self.cfg.symbol
     }
 
     fn configure(&mut self, params: toml::Value) -> StrategyResult<()> {
@@ -551,7 +620,7 @@ pub struct RsiReversionConfig {
 impl Default for RsiReversionConfig {
     fn default() -> Self {
         Self {
-            symbol: "BTCUSDT".to_string(),
+            symbol: "BTCUSDT".into(),
             period: 14,
             oversold: Decimal::from(30),
             overbought: Decimal::from(70),
@@ -608,17 +677,11 @@ impl RsiReversion {
         }
         if let Some(rsi_value) = value {
             if rsi_value <= self.oversold_level {
-                self.signals.push(Signal::new(
-                    self.cfg.symbol.clone(),
-                    SignalKind::EnterLong,
-                    0.8,
-                ));
+                self.signals
+                    .push(Signal::new(self.cfg.symbol, SignalKind::EnterLong, 0.8));
             } else if rsi_value >= self.overbought_level {
-                self.signals.push(Signal::new(
-                    self.cfg.symbol.clone(),
-                    SignalKind::ExitLong,
-                    0.8,
-                ));
+                self.signals
+                    .push(Signal::new(self.cfg.symbol, SignalKind::ExitLong, 0.8));
             }
         }
         Ok(())
@@ -631,8 +694,8 @@ impl Strategy for RsiReversion {
         "rsi-reversion"
     }
 
-    fn symbol(&self) -> &str {
-        &self.cfg.symbol
+    fn symbol(&self) -> Symbol {
+        self.cfg.symbol
     }
 
     fn configure(&mut self, params: toml::Value) -> StrategyResult<()> {
@@ -683,7 +746,7 @@ pub struct BollingerBreakoutConfig {
 impl Default for BollingerBreakoutConfig {
     fn default() -> Self {
         Self {
-            symbol: "BTCUSDT".to_string(),
+            symbol: "BTCUSDT".into(),
             period: 20,
             std_multiplier: Decimal::from(2),
             lookback: 200,
@@ -746,23 +809,14 @@ impl BollingerBreakout {
         }
         let price = candle.close;
         if price > bands.upper {
-            self.signals.push(Signal::new(
-                self.cfg.symbol.clone(),
-                SignalKind::EnterLong,
-                0.7,
-            ));
+            self.signals
+                .push(Signal::new(self.cfg.symbol, SignalKind::EnterLong, 0.7));
         } else if price < bands.lower {
-            self.signals.push(Signal::new(
-                self.cfg.symbol.clone(),
-                SignalKind::EnterShort,
-                0.7,
-            ));
+            self.signals
+                .push(Signal::new(self.cfg.symbol, SignalKind::EnterShort, 0.7));
         } else if (price - bands.middle).abs() <= self.neutral_band {
-            self.signals.push(Signal::new(
-                self.cfg.symbol.clone(),
-                SignalKind::Flatten,
-                0.6,
-            ));
+            self.signals
+                .push(Signal::new(self.cfg.symbol, SignalKind::Flatten, 0.6));
         }
         Ok(())
     }
@@ -774,8 +828,8 @@ impl Strategy for BollingerBreakout {
         "bollinger-breakout"
     }
 
-    fn symbol(&self) -> &str {
-        &self.cfg.symbol
+    fn symbol(&self) -> Symbol {
+        self.cfg.symbol
     }
 
     fn configure(&mut self, params: toml::Value) -> StrategyResult<()> {
@@ -837,7 +891,7 @@ pub struct MlClassifierConfig {
 impl Default for MlClassifierConfig {
     fn default() -> Self {
         Self {
-            symbol: "BTCUSDT".to_string(),
+            symbol: "BTCUSDT".into(),
             model_path: "./model.toml".to_string(),
             lookback: 20,
             threshold_long: 0.25,
@@ -856,8 +910,7 @@ pub struct MlClassifier {
 impl MlClassifier {
     fn score(&self, ctx: &StrategyContext) -> Option<f64> {
         let model = self.model.as_ref()?;
-        let raw_closes =
-            collect_symbol_closes(ctx.candles(), &self.cfg.symbol, self.cfg.lookback + 1);
+        let raw_closes = collect_symbol_closes(ctx, self.cfg.symbol, self.cfg.lookback + 1);
         if raw_closes.len() < self.cfg.lookback + 1 {
             return None;
         }
@@ -892,8 +945,8 @@ impl Strategy for MlClassifier {
         "ml-classifier"
     }
 
-    fn symbol(&self) -> &str {
-        &self.cfg.symbol
+    fn symbol(&self) -> Symbol {
+        self.cfg.symbol
     }
 
     fn configure(&mut self, params: toml::Value) -> StrategyResult<()> {
@@ -932,17 +985,11 @@ impl Strategy for MlClassifier {
         }
         if let Some(score) = self.score(ctx) {
             if score >= self.cfg.threshold_long {
-                self.signals.push(Signal::new(
-                    self.cfg.symbol.clone(),
-                    SignalKind::EnterLong,
-                    0.85,
-                ));
+                self.signals
+                    .push(Signal::new(self.cfg.symbol, SignalKind::EnterLong, 0.85));
             } else if score <= self.cfg.threshold_short {
-                self.signals.push(Signal::new(
-                    self.cfg.symbol.clone(),
-                    SignalKind::EnterShort,
-                    0.85,
-                ));
+                self.signals
+                    .push(Signal::new(self.cfg.symbol, SignalKind::EnterShort, 0.85));
             }
         }
         Ok(())
@@ -977,7 +1024,7 @@ pub struct LstmCortexConfig {
 impl Default for LstmCortexConfig {
     fn default() -> Self {
         Self {
-            symbol: "BTCUSDT".to_string(),
+            symbol: "BTCUSDT".into(),
             model_path: "research/models/lstm_v1.onnx".to_string(),
             input_name: "input".to_string(),
             window: 10,
@@ -1057,8 +1104,8 @@ impl Strategy for LstmCortex {
         "lstm-cortex"
     }
 
-    fn symbol(&self) -> &str {
-        &self.cfg.symbol
+    fn symbol(&self) -> Symbol {
+        self.cfg.symbol
     }
 
     fn configure(&mut self, params: toml::Value) -> StrategyResult<()> {
@@ -1098,12 +1145,12 @@ impl Strategy for LstmCortex {
                         if *probability >= 0.6 {
                             match idx {
                                 0 => self.signals.push(Signal::new(
-                                    self.cfg.symbol.clone(),
+                                    self.cfg.symbol,
                                     SignalKind::EnterLong,
                                     f64::from(*probability),
                                 )),
                                 1 => self.signals.push(Signal::new(
-                                    self.cfg.symbol.clone(),
+                                    self.cfg.symbol,
                                     SignalKind::EnterShort,
                                     f64::from(*probability),
                                 )),
@@ -1140,15 +1187,84 @@ pub struct PairsTradingConfig {
     pub lookback: usize,
     pub entry_z: Decimal,
     pub exit_z: Decimal,
+    pub clip_size: Decimal,
+    pub default_exit_strategy: Option<ExitStrategy>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum PairTradeDirection {
+    ShortFirst,
+    LongFirst,
+}
+
+impl PairTradeDirection {
+    fn entry_kinds(self) -> (SignalKind, SignalKind) {
+        match self {
+            Self::ShortFirst => (SignalKind::EnterShort, SignalKind::EnterLong),
+            Self::LongFirst => (SignalKind::EnterLong, SignalKind::EnterShort),
+        }
+    }
+
+    fn exit_kinds(self) -> (SignalKind, SignalKind) {
+        match self {
+            Self::ShortFirst => (SignalKind::ExitShort, SignalKind::ExitLong),
+            Self::LongFirst => (SignalKind::ExitLong, SignalKind::ExitShort),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ManagedPairTrade {
+    id: Uuid,
+    direction: PairTradeDirection,
+    entry_timestamp: DateTime<Utc>,
+    entry_candle_index: u64,
+    entry_z_score: Decimal,
+    exit_strategy: ExitStrategy,
+    clip: Option<Decimal>,
+    symbols: [Symbol; 2],
+}
+
+impl ManagedPairTrade {
+    fn snapshot(&self, candles_held: u64) -> PairTradeSnapshot {
+        PairTradeSnapshot {
+            trade_id: self.id,
+            direction: self.direction,
+            entry_timestamp: self.entry_timestamp,
+            entry_z_score: self.entry_z_score,
+            exit_strategy: self.exit_strategy.clone(),
+            candles_held,
+            symbols: self.symbols,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PairsTradingState {
+    trades: Vec<ManagedPairTrade>,
+    candle_counter: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PairTradeSnapshot {
+    pub trade_id: Uuid,
+    pub direction: PairTradeDirection,
+    pub entry_timestamp: DateTime<Utc>,
+    pub entry_z_score: Decimal,
+    pub exit_strategy: ExitStrategy,
+    pub candles_held: u64,
+    pub symbols: [Symbol; 2],
 }
 
 impl Default for PairsTradingConfig {
     fn default() -> Self {
         Self {
-            symbols: ["BTCUSDT".to_string(), "ETHUSDT".to_string()],
+            symbols: ["binance_perp:BTCUSDT".into(), "binance_perp:ETHUSDT".into()],
             lookback: 200,
             entry_z: Decimal::from(2),
             exit_z: Decimal::new(5, 1),
+            clip_size: Decimal::ZERO,
+            default_exit_strategy: None,
         }
     }
 }
@@ -1157,7 +1273,9 @@ pub struct PairsTradingArbitrage {
     cfg: PairsTradingConfig,
     signals: Vec<Signal>,
     entry_z_level: Decimal,
-    exit_z_level: Decimal,
+    default_exit_strategy: ExitStrategy,
+    active_trades: HashMap<Uuid, ManagedPairTrade>,
+    candle_counter: u64,
 }
 
 impl Default for PairsTradingArbitrage {
@@ -1169,32 +1287,96 @@ impl Default for PairsTradingArbitrage {
 
 impl PairsTradingArbitrage {
     fn from_config(cfg: PairsTradingConfig) -> StrategyResult<Self> {
+        Self::validate_symbols(&cfg)?;
         let mut strategy = Self {
             cfg,
             signals: Vec::new(),
             entry_z_level: Decimal::ZERO,
-            exit_z_level: Decimal::ZERO,
+            default_exit_strategy: ExitStrategy::StandardZScore {
+                exit_z: Decimal::new(5, 1),
+            },
+            active_trades: HashMap::new(),
+            candle_counter: 0,
         };
         strategy.rebuild_thresholds()?;
         Ok(strategy)
     }
 
-    fn rebuild_thresholds(&mut self) -> StrategyResult<()> {
-        self.entry_z_level = self.cfg.entry_z;
-        self.exit_z_level = self.cfg.exit_z;
-        if self.entry_z_level <= self.exit_z_level {
+    fn validate_symbols(cfg: &PairsTradingConfig) -> StrategyResult<()> {
+        if cfg.symbols[0] == cfg.symbols[1] {
             return Err(StrategyError::InvalidConfig(
-                "`entry_z` must be greater than `exit_z`".into(),
+                "`symbols` entries must be distinct".into(),
             ));
+        }
+        for symbol in cfg.symbols {
+            if !symbol.exchange.is_specified() {
+                return Err(StrategyError::InvalidConfig(
+                    "symbols must include an exchange prefix (e.g., binance_perp:BTCUSDT)".into(),
+                ));
+            }
         }
         Ok(())
     }
 
+    fn rebuild_thresholds(&mut self) -> StrategyResult<()> {
+        self.entry_z_level = self.cfg.entry_z;
+        let exit = self
+            .cfg
+            .default_exit_strategy
+            .clone()
+            .unwrap_or(ExitStrategy::StandardZScore {
+                exit_z: self.cfg.exit_z,
+            });
+        if self.entry_z_level <= Decimal::ZERO {
+            return Err(StrategyError::InvalidConfig(
+                "`entry_z` must be positive".into(),
+            ));
+        }
+        match &exit {
+            ExitStrategy::StandardZScore { exit_z } => {
+                if self.entry_z_level <= *exit_z {
+                    return Err(StrategyError::InvalidConfig(
+                        "`entry_z` must be greater than `exit_z` for z-score exits".into(),
+                    ));
+                }
+            }
+            ExitStrategy::DecayingThreshold { initial_exit_z, .. } => {
+                if self.entry_z_level <= *initial_exit_z {
+                    return Err(StrategyError::InvalidConfig(
+                        "`entry_z` must start above the decaying threshold".into(),
+                    ));
+                }
+            }
+            ExitStrategy::HalfLifeTimeStop {
+                half_life_candles,
+                multiplier,
+            } => {
+                if *half_life_candles == 0 {
+                    return Err(StrategyError::InvalidConfig(
+                        "`half_life_candles` must be greater than zero".into(),
+                    ));
+                }
+                if multiplier <= &Decimal::ZERO {
+                    return Err(StrategyError::InvalidConfig(
+                        "`multiplier` must be positive for half-life exits".into(),
+                    ));
+                }
+            }
+            ExitStrategy::HardTimeStop { max_duration_secs } => {
+                if *max_duration_secs == 0 {
+                    return Err(StrategyError::InvalidConfig(
+                        "`max_duration_secs` must be greater than zero".into(),
+                    ));
+                }
+            }
+        }
+        self.default_exit_strategy = exit;
+        Ok(())
+    }
+
     fn spreads(&self, ctx: &StrategyContext) -> Option<Vec<Decimal>> {
-        let closes_a =
-            collect_symbol_closes(ctx.candles(), &self.cfg.symbols[0], self.cfg.lookback);
-        let closes_b =
-            collect_symbol_closes(ctx.candles(), &self.cfg.symbols[1], self.cfg.lookback);
+        let closes_a = collect_symbol_closes(ctx, self.cfg.symbols[0], self.cfg.lookback);
+        let closes_b = collect_symbol_closes(ctx, self.cfg.symbols[1], self.cfg.lookback);
         if closes_a.len() < self.cfg.lookback || closes_b.len() < self.cfg.lookback {
             return None;
         }
@@ -1207,6 +1389,146 @@ impl PairsTradingArbitrage {
         }
         Some(spreads)
     }
+
+    fn manual_clip(&self, ctx: &StrategyContext) -> Option<Decimal> {
+        if self.cfg.clip_size <= Decimal::ZERO {
+            return None;
+        }
+        ctx.normalize_pair_quantity(self.cfg.symbols[0], self.cfg.symbols[1], self.cfg.clip_size)
+            .or(Some(self.cfg.clip_size))
+    }
+
+    fn push_signal_with_clip(
+        &mut self,
+        symbol: Symbol,
+        kind: SignalKind,
+        confidence: f64,
+        clip: Option<Decimal>,
+        group_id: Option<Uuid>,
+    ) {
+        let mut signal = Signal::new(symbol, kind, confidence);
+        if let Some(qty) = clip {
+            signal = signal.with_quantity(qty);
+        }
+        if let Some(id) = group_id {
+            signal = signal.with_group(id);
+        }
+        self.signals.push(signal);
+    }
+
+    fn should_exit_trade(&self, trade: &ManagedPairTrade, z: Decimal, now: DateTime<Utc>) -> bool {
+        match &trade.exit_strategy {
+            ExitStrategy::StandardZScore { exit_z } => z.abs() <= *exit_z,
+            ExitStrategy::HardTimeStop { max_duration_secs } => {
+                let elapsed = now
+                    .signed_duration_since(trade.entry_timestamp)
+                    .num_seconds()
+                    .max(0);
+                (elapsed as u64) >= *max_duration_secs
+            }
+            ExitStrategy::HalfLifeTimeStop {
+                half_life_candles,
+                multiplier,
+            } => {
+                let elapsed = self.candle_counter.saturating_sub(trade.entry_candle_index);
+                let multiple =
+                    Decimal::from_u32(*half_life_candles).unwrap_or(Decimal::ZERO) * *multiplier;
+                let threshold = multiple.ceil().to_u64().unwrap_or(u64::MAX).max(1);
+                elapsed >= threshold
+            }
+            ExitStrategy::DecayingThreshold {
+                initial_exit_z,
+                decay_rate_per_hour,
+            } => {
+                let elapsed_ms = now
+                    .signed_duration_since(trade.entry_timestamp)
+                    .num_milliseconds()
+                    .max(0);
+                let elapsed_decimal = Decimal::from_i64(elapsed_ms).unwrap_or(Decimal::ZERO)
+                    / Decimal::new(3_600_000, 0);
+                let threshold =
+                    *initial_exit_z + (*decay_rate_per_hour * elapsed_decimal.max(Decimal::ZERO));
+                if threshold <= Decimal::ZERO {
+                    true
+                } else {
+                    z.abs() <= threshold
+                }
+            }
+        }
+    }
+
+    fn evaluate_trades(&mut self, ctx: &StrategyContext, z: Decimal, now: DateTime<Utc>) {
+        let mut completed = Vec::new();
+        for trade in self.active_trades.values() {
+            if self.should_exit_trade(trade, z, now) {
+                completed.push(trade.id);
+            }
+        }
+        for trade_id in completed {
+            if let Some(trade) = self.active_trades.remove(&trade_id) {
+                let group_id = Some(trade.id);
+                let clip = trade.clip.or_else(|| self.manual_clip(ctx));
+                let (first_kind, second_kind) = trade.direction.exit_kinds();
+                self.push_signal_with_clip(self.cfg.symbols[0], first_kind, 0.6, clip, group_id);
+                self.push_signal_with_clip(self.cfg.symbols[1], second_kind, 0.6, clip, group_id);
+            }
+        }
+    }
+
+    fn should_open_short(&self, z: Decimal) -> bool {
+        self.active_trades.is_empty() && z >= self.entry_z_level
+    }
+
+    fn should_open_long(&self, z: Decimal) -> bool {
+        self.active_trades.is_empty() && z <= -self.entry_z_level
+    }
+
+    fn open_trade(
+        &mut self,
+        ctx: &StrategyContext,
+        z: Decimal,
+        now: DateTime<Utc>,
+        direction: PairTradeDirection,
+    ) {
+        let group_id = Uuid::new_v4();
+        let clip = self.manual_clip(ctx);
+        let (first_kind, second_kind) = direction.entry_kinds();
+        self.push_signal_with_clip(self.cfg.symbols[0], first_kind, 0.8, clip, Some(group_id));
+        self.push_signal_with_clip(self.cfg.symbols[1], second_kind, 0.8, clip, Some(group_id));
+        let trade = ManagedPairTrade {
+            id: group_id,
+            direction,
+            entry_timestamp: now,
+            entry_candle_index: self.candle_counter,
+            entry_z_score: z,
+            exit_strategy: self.default_exit_strategy.clone(),
+            clip,
+            symbols: self.cfg.symbols,
+        };
+        self.active_trades.insert(group_id, trade);
+    }
+
+    pub fn managed_trades(&self) -> Vec<PairTradeSnapshot> {
+        self.active_trades
+            .values()
+            .map(|trade| {
+                let candles_held = self.candle_counter.saturating_sub(trade.entry_candle_index);
+                trade.snapshot(candles_held)
+            })
+            .collect()
+    }
+
+    pub fn update_trade_exit_strategy(
+        &mut self,
+        trade_id: Uuid,
+        new_strategy: ExitStrategy,
+    ) -> StrategyResult<()> {
+        let trade = self.active_trades.get_mut(&trade_id).ok_or_else(|| {
+            StrategyError::InvalidConfig(format!("unknown managed trade: {trade_id}"))
+        })?;
+        trade.exit_strategy = new_strategy;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1215,8 +1537,8 @@ impl Strategy for PairsTradingArbitrage {
         "pairs-trading"
     }
 
-    fn symbol(&self) -> &str {
-        &self.cfg.symbols[0]
+    fn symbol(&self) -> Symbol {
+        self.cfg.symbols[0]
     }
 
     fn subscriptions(&self) -> Vec<Symbol> {
@@ -1234,8 +1556,12 @@ impl Strategy for PairsTradingArbitrage {
                 "lookback must be at least 2".into(),
             ));
         }
+        Self::validate_symbols(&cfg)?;
         self.cfg = cfg;
-        self.rebuild_thresholds()
+        self.rebuild_thresholds()?;
+        self.active_trades.clear();
+        self.candle_counter = 0;
+        Ok(())
     }
 
     async fn on_tick(&mut self, _ctx: &StrategyContext, _tick: &Tick) -> StrategyResult<()> {
@@ -1243,42 +1569,19 @@ impl Strategy for PairsTradingArbitrage {
     }
 
     async fn on_candle(&mut self, ctx: &StrategyContext, candle: &Candle) -> StrategyResult<()> {
-        if self.cfg.symbols.contains(&candle.symbol) {
-            if let Some(spreads) = self.spreads(ctx) {
-                if let Some(z) = z_score(&spreads) {
-                    if z >= self.entry_z_level {
-                        // Asset A rich: short A, long B.
-                        self.signals.push(Signal::new(
-                            self.cfg.symbols[0].clone(),
-                            SignalKind::EnterShort,
-                            0.8,
-                        ));
-                        self.signals.push(Signal::new(
-                            self.cfg.symbols[1].clone(),
-                            SignalKind::EnterLong,
-                            0.8,
-                        ));
-                    } else if z <= -self.entry_z_level {
-                        // Asset B rich: long A, short B.
-                        self.signals.push(Signal::new(
-                            self.cfg.symbols[0].clone(),
-                            SignalKind::EnterLong,
-                            0.8,
-                        ));
-                        self.signals.push(Signal::new(
-                            self.cfg.symbols[1].clone(),
-                            SignalKind::EnterShort,
-                            0.8,
-                        ));
-                    } else if z.abs() <= self.exit_z_level {
-                        for symbol in &self.cfg.symbols {
-                            self.signals.push(Signal::new(
-                                symbol.clone(),
-                                SignalKind::Flatten,
-                                0.6,
-                            ));
-                        }
-                    }
+        if !self.cfg.symbols.contains(&candle.symbol) {
+            return Ok(());
+        }
+        self.candle_counter = self.candle_counter.saturating_add(1);
+        if let Some(spreads) = self.spreads(ctx) {
+            if let Some(z) = z_score(&spreads) {
+                tracing::info!(target: "strategy", %z, "pairs-trading z-score");
+                let now = candle.timestamp;
+                self.evaluate_trades(ctx, z, now);
+                if self.should_open_short(z) {
+                    self.open_trade(ctx, z, now, PairTradeDirection::ShortFirst);
+                } else if self.should_open_long(z) {
+                    self.open_trade(ctx, z, now, PairTradeDirection::LongFirst);
                 }
             }
         }
@@ -1291,6 +1594,32 @@ impl Strategy for PairsTradingArbitrage {
 
     fn drain_signals(&mut self) -> Vec<Signal> {
         std::mem::take(&mut self.signals)
+    }
+
+    fn snapshot(&self) -> StrategyResult<serde_json::Value> {
+        let state = PairsTradingState {
+            trades: self.active_trades.values().cloned().collect(),
+            candle_counter: self.candle_counter,
+        };
+        serde_json::to_value(state).map_err(|err| {
+            StrategyError::Internal(format!("failed to serialize pairs trading state: {err}"))
+        })
+    }
+
+    fn restore(&mut self, state: serde_json::Value) -> StrategyResult<()> {
+        if state.is_null() {
+            return Ok(());
+        }
+        let restored: PairsTradingState = serde_json::from_value(state).map_err(|err| {
+            StrategyError::Internal(format!("failed to restore pairs trading state: {err}"))
+        })?;
+        self.active_trades = restored
+            .trades
+            .into_iter()
+            .map(|trade| (trade.id, trade))
+            .collect();
+        self.candle_counter = restored.candle_counter;
+        Ok(())
     }
 }
 
@@ -1314,7 +1643,7 @@ pub struct OrderBookImbalanceConfig {
 impl Default for OrderBookImbalanceConfig {
     fn default() -> Self {
         Self {
-            symbol: "BTCUSDT".to_string(),
+            symbol: "BTCUSDT".into(),
             depth: 5,
             long_threshold: 0.2,
             short_threshold: -0.2,
@@ -1335,8 +1664,8 @@ impl Strategy for OrderBookImbalance {
         "orderbook-imbalance"
     }
 
-    fn symbol(&self) -> &str {
-        &self.cfg.symbol
+    fn symbol(&self) -> Symbol {
+        self.cfg.symbol
     }
 
     fn configure(&mut self, params: toml::Value) -> StrategyResult<()> {
@@ -1377,23 +1706,14 @@ impl Strategy for OrderBookImbalance {
         if let Some(imbalance) = book.imbalance(self.cfg.depth) {
             if let Some(imbalance_f64) = imbalance.to_f64() {
                 if imbalance_f64 >= self.cfg.long_threshold {
-                    self.signals.push(Signal::new(
-                        self.cfg.symbol.clone(),
-                        SignalKind::EnterLong,
-                        0.9,
-                    ));
+                    self.signals
+                        .push(Signal::new(self.cfg.symbol, SignalKind::EnterLong, 0.9));
                 } else if imbalance_f64 <= self.cfg.short_threshold {
-                    self.signals.push(Signal::new(
-                        self.cfg.symbol.clone(),
-                        SignalKind::EnterShort,
-                        0.9,
-                    ));
+                    self.signals
+                        .push(Signal::new(self.cfg.symbol, SignalKind::EnterShort, 0.9));
                 } else if imbalance_f64.abs() <= self.cfg.neutral_zone {
-                    self.signals.push(Signal::new(
-                        self.cfg.symbol.clone(),
-                        SignalKind::Flatten,
-                        0.6,
-                    ));
+                    self.signals
+                        .push(Signal::new(self.cfg.symbol, SignalKind::Flatten, 0.6));
                 }
             }
         }
@@ -1430,7 +1750,7 @@ pub struct OrderBookScalperConfig {
 impl Default for OrderBookScalperConfig {
     fn default() -> Self {
         Self {
-            symbol: "BTCUSDT".to_string(),
+            symbol: "BTCUSDT".into(),
             depth: 10,
             imbalance_threshold: 0.25,
             neutral_zone: 0.05,
@@ -1489,8 +1809,8 @@ impl Strategy for OrderBookScalper {
         "orderbook-scalper"
     }
 
-    fn symbol(&self) -> &str {
-        &self.cfg.symbol
+    fn symbol(&self) -> Symbol {
+        self.cfg.symbol
     }
 
     fn configure(&mut self, params: toml::Value) -> StrategyResult<()> {
@@ -1544,7 +1864,7 @@ impl Strategy for OrderBookScalper {
             if let Some(im) = balance.to_f64() {
                 let kind = self.imbalance_supports_entry(im, macd);
                 if !matches!(kind, SignalKind::Flatten) || im.abs() <= self.cfg.neutral_zone {
-                    let mut signal = Signal::new(self.cfg.symbol.clone(), kind, 0.9);
+                    let mut signal = Signal::new(self.cfg.symbol, kind, 0.9);
                     signal.execution_hint = Some(ExecutionHint::PeggedBest {
                         offset_bps: self.cfg.peg_offset_bps,
                         clip_size: Some(self.cfg.clip_size.max(Decimal::ONE)),
@@ -1631,7 +1951,7 @@ impl CrossExchangeArb {
     fn emit_pair_trade(&mut self, long_a: bool) {
         let duration = Duration::seconds(30);
         let mut signal_a = Signal::new(
-            self.cfg.symbol_a.clone(),
+            self.cfg.symbol_a,
             if long_a {
                 SignalKind::EnterLong
             } else {
@@ -1641,7 +1961,7 @@ impl CrossExchangeArb {
         );
         signal_a.execution_hint = Some(ExecutionHint::Twap { duration });
         let mut signal_b = Signal::new(
-            self.cfg.symbol_b.clone(),
+            self.cfg.symbol_b,
             if long_a {
                 SignalKind::EnterShort
             } else {
@@ -1661,12 +1981,12 @@ impl Strategy for CrossExchangeArb {
         "cross-exchange-arb"
     }
 
-    fn symbol(&self) -> &str {
-        &self.cfg.symbol_a
+    fn symbol(&self) -> Symbol {
+        self.cfg.symbol_a
     }
 
     fn subscriptions(&self) -> Vec<Symbol> {
-        vec![self.cfg.symbol_a.clone(), self.cfg.symbol_b.clone()]
+        vec![self.cfg.symbol_a, self.cfg.symbol_b]
     }
 
     fn configure(&mut self, params: toml::Value) -> StrategyResult<()> {
@@ -1713,16 +2033,10 @@ impl Strategy for CrossExchangeArb {
             } else if spread <= -(self.cfg.spread_bps / Decimal::from(10_000)) {
                 self.emit_pair_trade(true);
             } else if spread.abs() <= self.cfg.exit_bps / Decimal::from(10_000) {
-                self.signals.push(Signal::new(
-                    self.cfg.symbol_a.clone(),
-                    SignalKind::Flatten,
-                    0.6,
-                ));
-                self.signals.push(Signal::new(
-                    self.cfg.symbol_b.clone(),
-                    SignalKind::Flatten,
-                    0.6,
-                ));
+                self.signals
+                    .push(Signal::new(self.cfg.symbol_a, SignalKind::Flatten, 0.6));
+                self.signals
+                    .push(Signal::new(self.cfg.symbol_b, SignalKind::Flatten, 0.6));
             }
         }
         Ok(())
@@ -1802,12 +2116,12 @@ impl Strategy for VolatilitySkew {
         "volatility-skew"
     }
 
-    fn symbol(&self) -> &str {
-        &self.cfg.underlying
+    fn symbol(&self) -> Symbol {
+        self.cfg.underlying
     }
 
     fn subscriptions(&self) -> Vec<Symbol> {
-        vec![self.cfg.underlying.clone(), self.cfg.vol_symbol.clone()]
+        vec![self.cfg.underlying, self.cfg.vol_symbol]
     }
 
     fn configure(&mut self, params: toml::Value) -> StrategyResult<()> {
@@ -1845,16 +2159,14 @@ impl Strategy for VolatilitySkew {
                     threshold * (Decimal::ONE - self.cfg.implied_premium / Decimal::from(100));
                 let timeout = Some(Duration::seconds(self.cfg.sniper_timeout_secs as i64));
                 if implied >= premium {
-                    let mut signal =
-                        Signal::new(self.cfg.underlying.clone(), SignalKind::EnterShort, 0.8);
+                    let mut signal = Signal::new(self.cfg.underlying, SignalKind::EnterShort, 0.8);
                     signal.execution_hint = Some(ExecutionHint::Sniper {
                         trigger_price: candle.close,
                         timeout,
                     });
                     self.signals.push(signal);
                 } else if implied <= discount {
-                    let mut signal =
-                        Signal::new(self.cfg.underlying.clone(), SignalKind::EnterLong, 0.8);
+                    let mut signal = Signal::new(self.cfg.underlying, SignalKind::EnterLong, 0.8);
                     signal.execution_hint = Some(ExecutionHint::Sniper {
                         trigger_price: candle.close,
                         timeout,

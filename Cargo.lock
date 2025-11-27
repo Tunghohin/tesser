@@ -4087,13 +4087,17 @@ name = "tesser-broker"
 version = "0.9.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "governor",
  "nonzero_ext",
  "once_cell",
+ "rust_decimal",
  "serde",
  "serde_json",
  "tesser-core",
  "thiserror 1.0.69",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -4166,6 +4170,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -4186,6 +4191,8 @@ version = "0.9.0"
 dependencies = [
  "chrono",
  "crc32fast",
+ "once_cell",
+ "parking_lot",
  "rust_decimal",
  "serde",
  "uuid",
@@ -4243,6 +4250,7 @@ name = "tesser-execution"
 version = "0.9.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "rusqlite",
  "rust_decimal",
@@ -4290,6 +4298,7 @@ dependencies = [
 name = "tesser-markets"
 version = "0.9.0"
 dependencies = [
+ "rust_decimal",
  "serde",
  "tesser-broker",
  "tesser-core",
@@ -4373,10 +4382,12 @@ dependencies = [
  "tesser-core",
  "tesser-cortex",
  "tesser-indicators",
+ "tesser-markets",
  "tesser-strategy-macros",
  "thiserror 1.0.69",
  "toml",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

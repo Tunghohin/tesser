@@ -62,6 +62,8 @@ pub struct LiveMetrics {
     signals_total: IntCounter,
     orders_total: IntCounter,
     order_failures: IntCounter,
+    panic_closes: IntCounter,
+    router_failures: IntCounterVec,
     equity_gauge: Gauge,
     price_gauge: GaugeVec,
     data_gap_gauge: Gauge,
@@ -83,6 +85,8 @@ impl LiveMetrics {
         let orders_total =
             IntCounter::new("orders_total", "Orders submitted to execution").unwrap();
         let order_failures = IntCounter::new("order_failures_total", "Execution failures").unwrap();
+        let panic_closes =
+            IntCounter::new("tesser_panic_closes_total", "Execution group panic closes").unwrap();
         let equity_gauge = Gauge::new("portfolio_equity", "Current portfolio equity").unwrap();
         let price_gauge = GaugeVec::new(
             prometheus::Opts::new("symbol_price", "Latest observed price per symbol"),
@@ -131,12 +135,21 @@ impl LiveMetrics {
             &["driver", "symbol"],
         )
         .unwrap();
+        let router_failures = IntCounterVec::new(
+            prometheus::Opts::new(
+                "tesser_router_failures_total",
+                "Router-level execution failures grouped by reason",
+            ),
+            &["reason"],
+        )
+        .unwrap();
 
         registry.register(Box::new(ticks_total.clone())).unwrap();
         registry.register(Box::new(candles_total.clone())).unwrap();
         registry.register(Box::new(signals_total.clone())).unwrap();
         registry.register(Box::new(orders_total.clone())).unwrap();
         registry.register(Box::new(order_failures.clone())).unwrap();
+        registry.register(Box::new(panic_closes.clone())).unwrap();
         registry.register(Box::new(equity_gauge.clone())).unwrap();
         registry.register(Box::new(price_gauge.clone())).unwrap();
         registry.register(Box::new(data_gap_gauge.clone())).unwrap();
@@ -155,6 +168,9 @@ impl LiveMetrics {
         registry
             .register(Box::new(checksum_mismatches.clone()))
             .unwrap();
+        registry
+            .register(Box::new(router_failures.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -171,6 +187,8 @@ impl LiveMetrics {
             connection_status,
             last_data_timestamp,
             checksum_mismatches,
+            panic_closes,
+            router_failures,
         }
     }
 
@@ -196,6 +214,14 @@ impl LiveMetrics {
 
     pub fn inc_order_failure(&self) {
         self.order_failures.inc();
+    }
+
+    pub fn inc_panic_close(&self) {
+        self.panic_closes.inc();
+    }
+
+    pub fn inc_router_failure(&self, reason: &str) {
+        self.router_failures.with_label_values(&[reason]).inc();
     }
 
     pub fn update_equity(&self, equity: f64) {

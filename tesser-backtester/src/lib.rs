@@ -15,7 +15,8 @@ use reporting::{PerformanceReport, Reporter};
 use rust_decimal::Decimal;
 use tesser_broker::MarketStream;
 use tesser_core::{
-    Candle, DepthUpdate, Fill, Order, OrderBook, Price, Quantity, Side, Symbol, Tick,
+    AssetId, Candle, DepthUpdate, Fill, InstrumentKind, Order, OrderBook, Price, Quantity, Side,
+    Symbol, Tick,
 };
 use tesser_data::merger::{UnifiedEvent, UnifiedEventKind};
 use tesser_execution::{ExecutionEngine, RiskContext};
@@ -30,8 +31,8 @@ pub struct BacktestConfig {
     pub symbol: Symbol,
     pub order_quantity: Quantity,
     pub history: usize,
-    pub initial_balances: HashMap<Symbol, Decimal>,
-    pub reporting_currency: Symbol,
+    pub initial_balances: HashMap<AssetId, Decimal>,
+    pub reporting_currency: AssetId,
     pub execution: ExecutionModel,
     pub mode: BacktestMode,
 }
@@ -43,8 +44,8 @@ impl BacktestConfig {
             symbol,
             order_quantity: Decimal::ONE,
             history: 512,
-            initial_balances: HashMap::from([(String::from("USDT"), Decimal::new(10_000, 0))]),
-            reporting_currency: "USDT".into(),
+            initial_balances: HashMap::from([(AssetId::from("USDT"), Decimal::new(10_000, 0))]),
+            reporting_currency: AssetId::from("USDT"),
             execution: ExecutionModel::default(),
             mode: BacktestMode::Candle,
         }
@@ -144,6 +145,7 @@ pub struct Backtester {
     market_stream: Option<BacktestStream>,
     lob_stream: Option<MarketEventStream>,
     candle_index: usize,
+    market_registry: Arc<MarketRegistry>,
 }
 
 struct PendingFill {
@@ -164,12 +166,14 @@ impl Backtester {
     ) -> Self {
         let portfolio_config = PortfolioConfig {
             initial_balances: config.initial_balances.clone(),
-            reporting_currency: config.reporting_currency.clone(),
+            reporting_currency: config.reporting_currency,
             max_drawdown: None, // Disable liquidate-only for backtests for now
         };
+        let mut strategy_ctx = StrategyContext::new(config.history);
+        strategy_ctx.attach_market_registry(market_registry.clone());
         Self {
-            strategy_ctx: StrategyContext::new(config.history),
-            portfolio: Portfolio::new(portfolio_config, market_registry),
+            strategy_ctx,
+            portfolio: Portfolio::new(portfolio_config, market_registry.clone()),
             config,
             strategy,
             execution,
@@ -178,6 +182,7 @@ impl Backtester {
             market_stream,
             lob_stream,
             candle_index: 0,
+            market_registry,
         }
     }
 
@@ -249,7 +254,7 @@ impl Backtester {
             .on_tick(&self.strategy_ctx, &tick)
             .await
             .context("strategy failed on tick")?;
-        if let Err(err) = self.portfolio.update_market_data(&tick.symbol, tick.price) {
+        if let Err(err) = self.portfolio.update_market_data(tick.symbol, tick.price) {
             warn!(symbol = %tick.symbol, error = %err, "failed to refresh market data");
         }
         Ok(())
@@ -297,11 +302,40 @@ impl Backtester {
             .context("strategy failed on candle")?;
         let signals = self.strategy.drain_signals();
         for signal in signals {
+            let Some(instrument) = self.market_registry.get(signal.symbol) else {
+                warn!(symbol = %signal.symbol, "instrument metadata missing; skipping signal");
+                continue;
+            };
+            let base_available = self
+                .portfolio
+                .balance(instrument.base)
+                .map(|cash| cash.quantity)
+                .unwrap_or_default();
+            let quote_available = self
+                .portfolio
+                .balance(instrument.quote)
+                .map(|cash| cash.quantity)
+                .unwrap_or_default();
+            let settlement_available = self
+                .portfolio
+                .balance(instrument.settlement_currency)
+                .map(|cash| cash.quantity)
+                .unwrap_or_default();
             let ctx = RiskContext {
-                signed_position_qty: self.portfolio.signed_position_qty(&signal.symbol),
+                symbol: signal.symbol,
+                exchange: signal.symbol.exchange,
+                signed_position_qty: self.portfolio.signed_position_qty(signal.symbol),
                 portfolio_equity: self.portfolio.equity(),
+                exchange_equity: self.portfolio.exchange_equity(signal.symbol.exchange),
                 last_price: candle.close,
                 liquidate_only: false,
+                instrument_kind: Some(instrument.kind),
+                base_asset: instrument.base,
+                quote_asset: instrument.quote,
+                settlement_asset: instrument.settlement_currency,
+                base_available,
+                quote_available,
+                settlement_available,
             };
             if let Some(order) = self.execution.handle_signal(signal, ctx).await? {
                 let latency = self.config.execution.latency_candles.max(1);
@@ -312,7 +346,7 @@ impl Backtester {
 
         if let Err(err) = self
             .portfolio
-            .update_market_data(&candle.symbol, candle.close)
+            .update_market_data(candle.symbol, candle.close)
         {
             warn!(
                 symbol = %candle.symbol,
@@ -381,13 +415,21 @@ impl Backtester {
         } else {
             None
         };
+        let fee_asset = self
+            .market_registry
+            .get(order.request.symbol)
+            .map(|instrument| match instrument.kind {
+                InstrumentKind::Spot => instrument.quote,
+                _ => instrument.settlement_currency,
+            });
         Fill {
             order_id: order.id.clone(),
-            symbol: order.request.symbol.clone(),
+            symbol: order.request.symbol,
             side: order.request.side,
             fill_price: price,
             fill_quantity: order.request.quantity,
             fee,
+            fee_asset,
             timestamp: candle.timestamp,
         }
     }
@@ -431,7 +473,7 @@ impl Backtester {
                         .process_trade(tick.side, tick.price, tick.size, tick.exchange_timestamp)
                         .await;
                     last_trade_price = Some(tick.price);
-                    if let Err(err) = self.portfolio.update_market_data(&tick.symbol, tick.price) {
+                    if let Err(err) = self.portfolio.update_market_data(tick.symbol, tick.price) {
                         warn!(symbol = %tick.symbol, error = %err, "failed to refresh market data");
                     }
                     self.strategy_ctx.push_tick(tick.clone());
@@ -461,23 +503,52 @@ impl Backtester {
                 .last_tick_price(&signal.symbol)
                 .or(fallback_price)
                 .unwrap_or(Decimal::ZERO);
+            let Some(instrument) = self.market_registry.get(signal.symbol) else {
+                warn!(symbol = %signal.symbol, "instrument metadata missing; skipping signal");
+                continue;
+            };
+            let base_available = self
+                .portfolio
+                .balance(instrument.base)
+                .map(|cash| cash.quantity)
+                .unwrap_or_default();
+            let quote_available = self
+                .portfolio
+                .balance(instrument.quote)
+                .map(|cash| cash.quantity)
+                .unwrap_or_default();
+            let settlement_available = self
+                .portfolio
+                .balance(instrument.settlement_currency)
+                .map(|cash| cash.quantity)
+                .unwrap_or_default();
             let ctx = RiskContext {
-                signed_position_qty: self.portfolio.signed_position_qty(&signal.symbol),
+                symbol: signal.symbol,
+                exchange: signal.symbol.exchange,
+                signed_position_qty: self.portfolio.signed_position_qty(signal.symbol),
                 portfolio_equity: self.portfolio.equity(),
+                exchange_equity: self.portfolio.exchange_equity(signal.symbol.exchange),
                 last_price: reference_price,
                 liquidate_only: false,
+                instrument_kind: Some(instrument.kind),
+                base_asset: instrument.base,
+                quote_asset: instrument.quote,
+                settlement_asset: instrument.settlement_currency,
+                base_available,
+                quote_available,
+                settlement_available,
             };
             let _ = self.execution.handle_signal(signal, ctx).await?;
         }
         Ok(())
     }
 
-    fn last_tick_price(&self, symbol: &str) -> Option<Price> {
+    fn last_tick_price(&self, symbol: &Symbol) -> Option<Price> {
         self.strategy_ctx
             .ticks()
             .iter()
             .rev()
-            .find(|tick| tick.symbol == symbol)
+            .find(|tick| tick.symbol == *symbol)
             .map(|tick| tick.price)
     }
 

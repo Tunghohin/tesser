@@ -8,4 +8,4 @@ pub mod websocket;
 
 pub use exchange::MockExchange;
 pub use scenario::{OrderFillStep, Scenario, ScenarioAction, ScenarioManager, ScenarioTrigger};
-pub use state::{AccountConfig, MockExchangeConfig, MockExchangeState};
+pub use state::{AccountConfig, AutoFillConfig, MockExchangeConfig, MockExchangeState};

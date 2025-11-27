@@ -92,6 +92,7 @@ message Fill {
   Decimal fill_quantity = 5;
   Decimal fee = 6;
   google.protobuf.Timestamp timestamp = 7;
+  string fee_asset = 8;
 }
 
 // Execution Hints
@@ -140,6 +141,8 @@ message Signal {
   Decimal take_profit = 5;
   ExecutionHint execution_hint = 6;
   string note = 7;
+  Decimal quantity = 8;
+  string group_id = 9;
 }
 
 message SignalList {

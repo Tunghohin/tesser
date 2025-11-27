@@ -68,8 +68,8 @@ impl Resampler {
     /// Ingest one candle into the resampler. Completed buckets are pushed into the output buffer.
     pub fn push(&mut self, candle: Candle) {
         let bucket_start = align_timestamp(candle.timestamp, self.interval_nanos);
-        let symbol = candle.symbol.clone();
-        match self.active.entry(symbol.clone()) {
+        let symbol = candle.symbol;
+        match self.active.entry(symbol) {
             Entry::Vacant(slot) => {
                 slot.insert(Bucket::from_candle(
                     symbol,
@@ -85,12 +85,7 @@ impl Resampler {
                         // Out-of-order candle; flush the existing bucket before rewinding.
                         let finished = mem::replace(
                             entry,
-                            Bucket::from_candle(
-                                symbol.clone(),
-                                bucket_start,
-                                self.interval,
-                                &candle,
-                            ),
+                            Bucket::from_candle(symbol, bucket_start, self.interval, &candle),
                         );
                         self.output.push(finished.into_candle());
                     }
@@ -101,12 +96,7 @@ impl Resampler {
                         // Finalize the previous bucket and start a new one.
                         let finished = mem::replace(
                             entry,
-                            Bucket::from_candle(
-                                symbol.clone(),
-                                bucket_start,
-                                self.interval,
-                                &candle,
-                            ),
+                            Bucket::from_candle(symbol, bucket_start, self.interval, &candle),
                         );
                         self.output.push(finished.into_candle());
                     }
@@ -123,7 +113,8 @@ impl Resampler {
         self.output.sort_by(|a, b| {
             let ts = a.timestamp.cmp(&b.timestamp);
             if ts == Ordering::Equal {
-                a.symbol.cmp(&b.symbol)
+                (a.symbol.exchange.as_raw(), a.symbol.market_id)
+                    .cmp(&(b.symbol.exchange.as_raw(), b.symbol.market_id))
             } else {
                 ts
             }

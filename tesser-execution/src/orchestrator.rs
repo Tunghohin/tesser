@@ -13,9 +13,10 @@ use crate::algorithm::{
     PeggedBestAlgorithm, SniperAlgorithm, TrailingStopAlgorithm, TwapAlgorithm, VwapAlgorithm,
 };
 use crate::repository::{AlgoStateRepository, StoredAlgoState};
-use crate::{ExecutionEngine, RiskContext};
+use crate::{ExecutionEngine, PanicCloseConfig, PanicCloseMode, PanicObserver, RiskContext};
 use tesser_core::{
-    ExecutionHint, Fill, Order, OrderRequest, OrderStatus, Price, Quantity, Signal, Tick,
+    ExecutionHint, Fill, Order, OrderRequest, OrderStatus, OrderType, Price, Quantity, Side,
+    Signal, SignalPanicBehavior, Symbol, Tick, TimeInForce,
 };
 
 /// Maps order IDs to their parent algorithm IDs for routing fills.
@@ -25,6 +26,100 @@ type OrderToAlgoMap = HashMap<String, Uuid>;
 struct PendingOrder {
     request: OrderRequest,
     placed_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutionLegStatus {
+    Pending,
+    Filled,
+    Failed,
+    Closed,
+}
+
+#[derive(Clone, Debug)]
+struct ExecutionGroupLeg {
+    symbol: Symbol,
+    side: Side,
+    target: Quantity,
+    filled: Quantity,
+    status: ExecutionLegStatus,
+}
+
+impl ExecutionGroupLeg {
+    fn new(symbol: Symbol, side: Side) -> Self {
+        Self {
+            symbol,
+            side,
+            target: Decimal::ZERO,
+            filled: Decimal::ZERO,
+            status: ExecutionLegStatus::Pending,
+        }
+    }
+}
+
+struct ExecutionGroupState {
+    legs: HashMap<Symbol, ExecutionGroupLeg>,
+    panic_config: PanicCloseConfig,
+    panic_triggered: bool,
+}
+
+impl ExecutionGroupState {
+    fn new(config: PanicCloseConfig) -> Self {
+        Self {
+            legs: HashMap::new(),
+            panic_config: config,
+            panic_triggered: false,
+        }
+    }
+
+    fn leg_entry(&mut self, symbol: Symbol, side: Side) -> &mut ExecutionGroupLeg {
+        self.legs
+            .entry(symbol)
+            .or_insert_with(|| ExecutionGroupLeg::new(symbol, side))
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.legs.is_empty()
+            && self
+                .legs
+                .values()
+                .all(|leg| leg.status == ExecutionLegStatus::Filled)
+    }
+
+    fn is_finished(&self) -> bool {
+        self.legs.values().all(|leg| {
+            matches!(
+                leg.status,
+                ExecutionLegStatus::Filled
+                    | ExecutionLegStatus::Failed
+                    | ExecutionLegStatus::Closed
+            )
+        })
+    }
+
+    fn panic_actions(&mut self) -> Option<Vec<(Symbol, Side, Quantity)>> {
+        if self.panic_triggered {
+            return None;
+        }
+        let actions: Vec<_> = self
+            .legs
+            .values_mut()
+            .filter(|leg| leg.filled > Decimal::ZERO)
+            .map(|leg| {
+                leg.status = ExecutionLegStatus::Closed;
+                (leg.symbol, leg.side, leg.filled)
+            })
+            .collect();
+        if actions.is_empty() {
+            return None;
+        }
+        self.panic_triggered = true;
+        Some(actions)
+    }
+
+    fn override_config(&mut self, config: PanicCloseConfig) {
+        self.panic_config = config;
+    }
 }
 
 pub const ORDER_TIMEOUT: StdDuration = StdDuration::from_secs(60);
@@ -48,13 +143,21 @@ pub struct OrderOrchestrator {
     pending_orders: Arc<Mutex<HashMap<String, PendingOrder>>>,
 
     /// Cached risk context per symbol supplied by the portfolio.
-    risk_contexts: Arc<Mutex<HashMap<String, RiskContext>>>,
+    risk_contexts: Arc<Mutex<HashMap<Symbol, RiskContext>>>,
 
     /// Underlying execution engine for placing child orders.
     execution_engine: Arc<ExecutionEngine>,
 
     /// State persistence backend.
     state_repo: Arc<dyn AlgoStateRepository<State = StoredAlgoState>>,
+
+    panic_config: PanicCloseConfig,
+    panic_observer: Option<Arc<dyn PanicObserver>>,
+
+    /// Active multi-leg execution groups keyed by identifier.
+    execution_groups: Arc<Mutex<HashMap<Uuid, ExecutionGroupState>>>,
+    /// Maps order IDs to their execution group identifiers.
+    group_order_mapping: Arc<Mutex<HashMap<String, (Uuid, Symbol)>>>,
 }
 
 impl OrderOrchestrator {
@@ -63,6 +166,8 @@ impl OrderOrchestrator {
         execution_engine: Arc<ExecutionEngine>,
         state_repo: Arc<dyn AlgoStateRepository<State = StoredAlgoState>>,
         open_orders: Vec<Order>,
+        panic_config: PanicCloseConfig,
+        panic_observer: Option<Arc<dyn PanicObserver>>,
     ) -> Result<Self> {
         let algorithms = Arc::new(Mutex::new(HashMap::new()));
         let order_mapping = Arc::new(Mutex::new(HashMap::new()));
@@ -76,6 +181,10 @@ impl OrderOrchestrator {
             risk_contexts,
             execution_engine,
             state_repo,
+            panic_config,
+            panic_observer,
+            execution_groups: Arc::new(Mutex::new(HashMap::new())),
+            group_order_mapping: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Restore algorithms from persistent state
@@ -219,14 +328,204 @@ impl OrderOrchestrator {
     }
 
     /// Update the latest risk context for a symbol.
-    pub fn update_risk_context(&self, symbol: impl Into<String>, ctx: RiskContext) {
+    pub fn update_risk_context(&self, symbol: Symbol, ctx: RiskContext) {
         let mut contexts = self.risk_contexts.lock().unwrap();
-        contexts.insert(symbol.into(), ctx);
+        contexts.insert(symbol, ctx);
     }
 
-    fn cached_risk_context(&self, symbol: &str) -> Option<RiskContext> {
+    fn cached_risk_context(&self, symbol: Symbol) -> Option<RiskContext> {
         let contexts = self.risk_contexts.lock().unwrap();
-        contexts.get(symbol).copied()
+        contexts.get(&symbol).copied()
+    }
+
+    fn register_group_signal(&self, signal: &Signal) {
+        if let Some(group_id) = signal.group_id {
+            let mut groups = self.execution_groups.lock().unwrap();
+            let default_config = self.panic_config;
+            let state = groups
+                .entry(group_id)
+                .or_insert_with(|| ExecutionGroupState::new(default_config));
+            if let Some(override_cfg) = self.panic_override_from_signal(signal) {
+                state.override_config(override_cfg);
+            }
+            state.leg_entry(signal.symbol, signal.kind.side());
+        }
+    }
+
+    fn panic_override_from_signal(&self, signal: &Signal) -> Option<PanicCloseConfig> {
+        signal.panic_behavior.map(|behavior| match behavior {
+            SignalPanicBehavior::Market => PanicCloseConfig {
+                mode: PanicCloseMode::Market,
+                ..self.panic_config
+            },
+            SignalPanicBehavior::AggressiveLimit { offset_bps } => PanicCloseConfig {
+                mode: PanicCloseMode::AggressiveLimit,
+                limit_offset_bps: offset_bps.max(Decimal::ZERO),
+            },
+        })
+    }
+
+    fn track_group_order(&self, group_id: Uuid, order: &Order) {
+        {
+            let mut groups = self.execution_groups.lock().unwrap();
+            if let Some(state) = groups.get_mut(&group_id) {
+                let leg = state.leg_entry(order.request.symbol, order.request.side);
+                leg.target = order.request.quantity.abs();
+                leg.side = order.request.side;
+                leg.status = ExecutionLegStatus::Pending;
+            }
+        }
+        let mut mapping = self.group_order_mapping.lock().unwrap();
+        mapping.insert(order.id.clone(), (group_id, order.request.symbol));
+    }
+
+    fn purge_group_orders(&self, group_id: Uuid) {
+        let mut mapping = self.group_order_mapping.lock().unwrap();
+        mapping.retain(|_, (gid, _)| *gid != group_id);
+    }
+
+    fn handle_group_fill(&self, fill: &Fill) {
+        let key = {
+            let mapping = self.group_order_mapping.lock().unwrap();
+            mapping.get(&fill.order_id).copied()
+        };
+        let Some((group_id, symbol)) = key else {
+            return;
+        };
+        let mut remove_group = false;
+        {
+            let mut groups = self.execution_groups.lock().unwrap();
+            if let Some(state) = groups.get_mut(&group_id) {
+                if let Some(leg) = state.legs.get_mut(&symbol) {
+                    leg.filled += fill.fill_quantity.abs();
+                    if leg.filled >= leg.target && leg.status == ExecutionLegStatus::Pending {
+                        leg.status = ExecutionLegStatus::Filled;
+                        self.group_order_mapping
+                            .lock()
+                            .unwrap()
+                            .remove(&fill.order_id);
+                    }
+                }
+                if state.is_complete() {
+                    remove_group = true;
+                }
+            }
+            if remove_group {
+                groups.remove(&group_id);
+            }
+        }
+        if remove_group {
+            self.purge_group_orders(group_id);
+        }
+    }
+
+    async fn fail_group_leg_by_order(&self, order_id: &str, reason: &str) -> Result<()> {
+        let key = {
+            let mut mapping = self.group_order_mapping.lock().unwrap();
+            mapping.remove(order_id)
+        };
+        if let Some((group_id, symbol)) = key {
+            self.fail_group_leg(group_id, symbol, reason).await?;
+        }
+        Ok(())
+    }
+
+    async fn fail_group_leg(&self, group_id: Uuid, symbol: Symbol, reason: &str) -> Result<()> {
+        let mut maybe_actions = None;
+        let mut group_config = None;
+        {
+            let mut groups = self.execution_groups.lock().unwrap();
+            if let Some(state) = groups.get_mut(&group_id) {
+                if let Some(leg) = state.legs.get_mut(&symbol) {
+                    leg.status = ExecutionLegStatus::Failed;
+                }
+                group_config = Some(state.panic_config);
+                if let Some(actions) = state.panic_actions() {
+                    maybe_actions = Some(actions);
+                } else if state.is_finished() {
+                    groups.remove(&group_id);
+                }
+            }
+        }
+        if let Some(actions) = maybe_actions {
+            let config = group_config.unwrap_or(self.panic_config);
+            self.execute_panic_actions(group_id, reason, actions, config)
+                .await?;
+            self.purge_group_orders(group_id);
+        } else if group_config.is_some() {
+            self.notify_panic(group_id, symbol, Decimal::ZERO, reason);
+        }
+        Ok(())
+    }
+
+    async fn execute_panic_actions(
+        &self,
+        group_id: Uuid,
+        reason: &str,
+        actions: Vec<(Symbol, Side, Quantity)>,
+        config: PanicCloseConfig,
+    ) -> Result<()> {
+        for (symbol, original_side, qty) in actions {
+            if qty <= Decimal::ZERO {
+                continue;
+            }
+            let panic_side = match original_side {
+                Side::Buy => Side::Sell,
+                Side::Sell => Side::Buy,
+            };
+            let Some(ctx) = self.cached_risk_context(symbol) else {
+                tracing::warn!(
+                    %symbol,
+                    group = %group_id,
+                    "skipping panic close due to missing risk context"
+                );
+                continue;
+            };
+            let (order_type, price, time_in_force) =
+                self.panic_order_parameters(config, panic_side, &ctx);
+            let mut request = OrderRequest {
+                symbol,
+                side: panic_side,
+                order_type,
+                quantity: qty,
+                price,
+                trigger_price: None,
+                time_in_force,
+                client_order_id: Some(format!("panic-{group_id}")),
+                take_profit: None,
+                stop_loss: None,
+                display_quantity: None,
+            };
+            let mut sent = self
+                .execution_engine
+                .send_order(request.clone(), &ctx)
+                .await;
+            if sent.is_err() && matches!(order_type, OrderType::Limit) {
+                request.order_type = OrderType::Market;
+                request.price = None;
+                request.time_in_force = None;
+                sent = self.execution_engine.send_order(request, &ctx).await;
+            }
+            if let Err(err) = sent {
+                tracing::error!(
+                    %symbol,
+                    qty = %qty,
+                    group = %group_id,
+                    error = %err,
+                    "failed to place panic close order"
+                );
+            } else {
+                self.notify_panic(group_id, symbol, qty, reason);
+                tracing::error!(
+                    %symbol,
+                    qty = %qty,
+                    group = %group_id,
+                    reason = reason,
+                    "issued panic close to unwind stranded leg"
+                );
+            }
+        }
+        Ok(())
     }
 
     fn is_active_order_status(status: OrderStatus) -> bool {
@@ -234,6 +533,57 @@ impl OrderOrchestrator {
             status,
             OrderStatus::PendingNew | OrderStatus::Accepted | OrderStatus::PartiallyFilled
         )
+    }
+
+    fn panic_order_parameters(
+        &self,
+        config: PanicCloseConfig,
+        side: Side,
+        ctx: &RiskContext,
+    ) -> (OrderType, Option<Price>, Option<TimeInForce>) {
+        match config.mode {
+            PanicCloseMode::Market => (OrderType::Market, None, None),
+            PanicCloseMode::AggressiveLimit => {
+                if let Some(price) = self.panic_limit_price(config, side, ctx) {
+                    (
+                        OrderType::Limit,
+                        Some(price),
+                        Some(TimeInForce::ImmediateOrCancel),
+                    )
+                } else {
+                    (OrderType::Market, None, None)
+                }
+            }
+        }
+    }
+
+    fn panic_limit_price(
+        &self,
+        config: PanicCloseConfig,
+        side: Side,
+        ctx: &RiskContext,
+    ) -> Option<Price> {
+        let last = ctx.last_price;
+        if last <= Decimal::ZERO {
+            return None;
+        }
+        let offset_fraction = (config.limit_offset_bps.max(Decimal::ZERO)
+            / Decimal::from(10_000u32))
+        .max(Decimal::ZERO);
+        let multiplier = match side {
+            Side::Buy => Decimal::ONE + offset_fraction,
+            Side::Sell => Decimal::ONE - offset_fraction,
+        };
+        if multiplier <= Decimal::ZERO {
+            return None;
+        }
+        Some(last * multiplier)
+    }
+
+    fn notify_panic(&self, group_id: Uuid, symbol: Symbol, qty: Quantity, reason: &str) {
+        if let Some(observer) = &self.panic_observer {
+            observer.on_group_event(group_id, symbol, qty, reason);
+        }
     }
 
     fn extract_algo_id(client_id: &str) -> Option<Uuid> {
@@ -260,6 +610,15 @@ impl OrderOrchestrator {
             return Uuid::parse_str(rest).ok();
         }
         None
+    }
+
+    fn group_from_request(request: &OrderRequest) -> Option<Uuid> {
+        request
+            .client_order_id
+            .as_deref()
+            .and_then(|value| value.split("|grp:").nth(1))
+            .and_then(|suffix| suffix.split('|').next())
+            .and_then(|raw| Uuid::parse_str(raw).ok())
     }
 
     /// Handle a signal from a strategy.
@@ -320,14 +679,47 @@ impl OrderOrchestrator {
             }
             None => {
                 // Handle normal, non-algorithmic orders
-                if let Some(order) = self
+                self.register_group_signal(signal);
+                match self
                     .execution_engine
                     .handle_signal(signal.clone(), *ctx)
-                    .await?
+                    .await
                 {
-                    self.register_pending(&order);
+                    Ok(Some(order)) => {
+                        if let Some(group_id) = signal.group_id {
+                            self.track_group_order(group_id, &order);
+                        }
+                        self.register_pending(&order);
+                        Ok(())
+                    }
+                    Ok(None) => {
+                        if let Some(group_id) = signal.group_id {
+                            self.fail_group_leg(
+                                group_id,
+                                signal.symbol,
+                                "order size resolved to zero",
+                            )
+                            .await?;
+                        }
+                        Ok(())
+                    }
+                    Err(err) => {
+                        if let Some(group_id) = signal.group_id {
+                            if let Err(panic_err) = self
+                                .fail_group_leg(group_id, signal.symbol, "order routing error")
+                                .await
+                            {
+                                tracing::error!(
+                                    %panic_err,
+                                    %group_id,
+                                    symbol = %signal.symbol,
+                                    "failed to trigger panic-close after routing failure"
+                                );
+                            }
+                        }
+                        Err(err.into())
+                    }
                 }
-                Ok(())
             }
         }
     }
@@ -339,12 +731,9 @@ impl OrderOrchestrator {
         duration: Duration,
         ctx: &RiskContext,
     ) -> Result<()> {
-        self.update_risk_context(signal.symbol.clone(), *ctx);
-        // Calculate total quantity using the execution engine's sizer
-        let total_quantity =
-            self.execution_engine
-                .sizer()
-                .size(&signal, ctx.portfolio_equity, ctx.last_price)?;
+        self.update_risk_context(signal.symbol, *ctx);
+        // Calculate total quantity using the execution engine's sizing logic
+        let total_quantity = self.execution_engine.determine_quantity(&signal, ctx)?;
 
         if total_quantity <= Decimal::ZERO {
             tracing::warn!("TWAP order size is zero, skipping");
@@ -399,11 +788,8 @@ impl OrderOrchestrator {
         participation_rate: Option<Decimal>,
         ctx: &RiskContext,
     ) -> Result<()> {
-        self.update_risk_context(signal.symbol.clone(), *ctx);
-        let total_quantity =
-            self.execution_engine
-                .sizer()
-                .size(&signal, ctx.portfolio_equity, ctx.last_price)?;
+        self.update_risk_context(signal.symbol, *ctx);
+        let total_quantity = self.execution_engine.determine_quantity(&signal, ctx)?;
         if total_quantity <= Decimal::ZERO {
             tracing::warn!("VWAP order size is zero, skipping");
             return Ok(());
@@ -437,11 +823,8 @@ impl OrderOrchestrator {
         limit_offset_bps: Option<Decimal>,
         ctx: &RiskContext,
     ) -> Result<()> {
-        self.update_risk_context(signal.symbol.clone(), *ctx);
-        let total_quantity =
-            self.execution_engine
-                .sizer()
-                .size(&signal, ctx.portfolio_equity, ctx.last_price)?;
+        self.update_risk_context(signal.symbol, *ctx);
+        let total_quantity = self.execution_engine.determine_quantity(&signal, ctx)?;
         if total_quantity <= Decimal::ZERO {
             tracing::warn!("Iceberg order size is zero, skipping");
             return Ok(());
@@ -492,11 +875,8 @@ impl OrderOrchestrator {
         min_chase_distance: Option<Price>,
         ctx: &RiskContext,
     ) -> Result<()> {
-        self.update_risk_context(signal.symbol.clone(), *ctx);
-        let total_quantity =
-            self.execution_engine
-                .sizer()
-                .size(&signal, ctx.portfolio_equity, ctx.last_price)?;
+        self.update_risk_context(signal.symbol, *ctx);
+        let total_quantity = self.execution_engine.determine_quantity(&signal, ctx)?;
         if total_quantity <= Decimal::ZERO {
             tracing::warn!("Pegged order size is zero, skipping");
             return Ok(());
@@ -538,11 +918,8 @@ impl OrderOrchestrator {
         timeout: Option<Duration>,
         ctx: &RiskContext,
     ) -> Result<()> {
-        self.update_risk_context(signal.symbol.clone(), *ctx);
-        let total_quantity =
-            self.execution_engine
-                .sizer()
-                .size(&signal, ctx.portfolio_equity, ctx.last_price)?;
+        self.update_risk_context(signal.symbol, *ctx);
+        let total_quantity = self.execution_engine.determine_quantity(&signal, ctx)?;
         if total_quantity <= Decimal::ZERO {
             tracing::warn!("Sniper order size is zero, skipping");
             return Ok(());
@@ -569,11 +946,8 @@ impl OrderOrchestrator {
         callback_rate: Decimal,
         ctx: &RiskContext,
     ) -> Result<()> {
-        self.update_risk_context(signal.symbol.clone(), *ctx);
-        let total_quantity =
-            self.execution_engine
-                .sizer()
-                .size(&signal, ctx.portfolio_equity, ctx.last_price)?;
+        self.update_risk_context(signal.symbol, *ctx);
+        let total_quantity = self.execution_engine.determine_quantity(&signal, ctx)?;
         if total_quantity <= Decimal::ZERO {
             tracing::warn!("Trailing stop order size is zero, skipping");
             return Ok(());
@@ -609,23 +983,37 @@ impl OrderOrchestrator {
         let parent_algo_id = child_req.parent_algo_id;
         match child_req.action {
             ChildOrderAction::Place(order_request) => {
-                let symbol = order_request.symbol.clone();
+                let symbol = order_request.symbol;
+                tracing::debug!(%symbol, "Sending child order");
                 let resolved_ctx = ctx
-                    .or_else(|| self.cached_risk_context(&symbol))
+                    .or_else(|| self.cached_risk_context(symbol))
                     .ok_or_else(|| anyhow!("missing risk context for symbol {}", symbol))?;
                 // Keep cache warm with the latest context.
-                self.update_risk_context(symbol.clone(), resolved_ctx);
-
-                let order = self
+                self.update_risk_context(symbol, resolved_ctx);
+                let group_hint = Self::group_from_request(&order_request);
+                let order = match self
                     .execution_engine
-                    .send_order(order_request, &resolved_ctx)
-                    .await?;
+                    .send_order(order_request.clone(), &resolved_ctx)
+                    .await
+                {
+                    Ok(order) => order,
+                    Err(err) => {
+                        if let Some(group_id) = group_hint {
+                            let message = format!("order placement failed: {err}");
+                            self.fail_group_leg(group_id, symbol, &message).await?;
+                        }
+                        return Err(anyhow!(err.to_string()));
+                    }
+                };
 
                 {
                     let mut mapping = self.order_mapping.lock().unwrap();
                     mapping.insert(order.id.clone(), parent_algo_id);
                 }
                 self.register_pending(&order);
+                if let Some(group_id) = group_hint {
+                    self.track_group_order(group_id, &order);
+                }
                 self.notify_algo_child(parent_algo_id, &order);
                 Ok(order)
             }
@@ -647,9 +1035,10 @@ impl OrderOrchestrator {
             mapping.get(&fill.order_id).copied()
         };
         self.clear_pending(&fill.order_id);
+        self.handle_group_fill(fill);
 
         let Some(algo_id) = parent_algo_id else {
-            // This fill doesn't belong to any algorithm, ignore it
+            // Non-algorithmic fill handled via group bookkeeping
             return Ok(());
         };
 
@@ -923,12 +1312,16 @@ impl OrderOrchestrator {
     }
 
     /// Remove a pending order when an update arrives.
-    pub fn on_order_update(&self, order: &Order) {
+    pub async fn on_order_update(&self, order: &Order) {
         if matches!(
             order.status,
             OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected
         ) {
             self.clear_pending(&order.id);
+            if matches!(order.status, OrderStatus::Canceled | OrderStatus::Rejected) {
+                let reason = format!("order marked {:?}", order.status);
+                let _ = self.fail_group_leg_by_order(&order.id, &reason).await;
+            }
         }
     }
 
@@ -957,7 +1350,7 @@ impl OrderOrchestrator {
         let mut updates = Vec::new();
         for (order_id, entry) in stale {
             let client = self.execution_engine.client();
-            let synthesized = match client.list_open_orders(&entry.request.symbol).await {
+            let synthesized = match client.list_open_orders(entry.request.symbol).await {
                 Ok(remote_orders) => {
                     if let Some(existing) =
                         remote_orders.into_iter().find(|order| order.id == order_id)
@@ -970,7 +1363,7 @@ impl OrderOrchestrator {
                                 | OrderStatus::PartiallyFilled
                         ) {
                             let _ = client
-                                .cancel_order(order_id.clone(), &entry.request.symbol)
+                                .cancel_order(order_id.clone(), entry.request.symbol)
                                 .await;
                             let mut canceled = existing.clone();
                             canceled.status = OrderStatus::Canceled;
@@ -995,7 +1388,7 @@ impl OrderOrchestrator {
                         "failed to query stale order; canceling defensively"
                     );
                     let _ = client
-                        .cancel_order(order_id.clone(), &entry.request.symbol)
+                        .cancel_order(order_id.clone(), entry.request.symbol)
                         .await;
                     Some(build_timeout_order(
                         order_id.clone(),
@@ -1006,7 +1399,7 @@ impl OrderOrchestrator {
             };
 
             if let Some(order) = synthesized {
-                self.on_order_update(&order);
+                self.on_order_update(&order).await;
                 self.clear_order_mapping(&order_id);
                 updates.push(order);
             }

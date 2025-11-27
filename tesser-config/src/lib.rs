@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use config::{Config, ConfigError, Environment, File};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,8 @@ pub struct AppConfig {
     pub backtest: BacktestConfig,
     #[serde(default)]
     pub exchange: HashMap<String, ExchangeConfig>,
+    #[serde(default)]
+    pub exchanges: Vec<NamedExchangeConfig>,
     #[serde(default)]
     pub live: LiveRuntimeConfig,
     #[serde(default)]
@@ -53,6 +55,13 @@ pub struct ExchangeConfig {
     pub driver: String,
     #[serde(default, flatten)]
     pub params: Value,
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize)]
+pub struct NamedExchangeConfig {
+    pub name: String,
+    #[serde(flatten)]
+    pub config: ExchangeConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -124,6 +133,13 @@ impl Default for LiveRuntimeConfig {
     }
 }
 
+impl LiveRuntimeConfig {
+    /// Resolve the persistence settings, falling back to the legacy `state_path` when needed.
+    pub fn persistence_config(&self) -> PersistenceConfig {
+        self.persistence.with_fallback(&self.state_path)
+    }
+}
+
 impl Default for AlertingConfig {
     fn default() -> Self {
         Self {
@@ -146,13 +162,16 @@ impl Default for RiskManagementConfig {
     }
 }
 
-impl LiveRuntimeConfig {
-    /// Return persistence settings, preserving legacy `state_path` overrides.
-    pub fn persistence_config(&self) -> PersistenceConfig {
-        self.persistence.with_fallback(&self.state_path)
+impl AppConfig {
+    /// Merge `[exchange]` tables and `[[exchanges]]` arrays into a single lookup map.
+    pub fn exchange_profiles(&self) -> HashMap<String, ExchangeConfig> {
+        let mut merged = self.exchange.clone();
+        for entry in &self.exchanges {
+            merged.insert(entry.name.clone(), entry.config.clone());
+        }
+        merged
     }
 }
-
 #[derive(Debug, Deserialize, Clone)]
 pub struct PersistenceConfig {
     #[serde(default = "default_persistence_engine")]
@@ -292,7 +311,20 @@ pub fn load_config(env: Option<&str>) -> Result<AppConfig> {
     );
 
     let config = builder.build()?;
-    config
+    let mut app: AppConfig = config
         .try_deserialize()
-        .map_err(|err: ConfigError| err.into())
+        .map_err(|err: ConfigError| anyhow!(err))?;
+    app.merge_inline_exchanges();
+    Ok(app)
+}
+
+impl AppConfig {
+    fn merge_inline_exchanges(&mut self) {
+        if self.exchanges.is_empty() {
+            return;
+        }
+        for entry in self.exchanges.drain(..) {
+            self.exchange.insert(entry.name, entry.config);
+        }
+    }
 }

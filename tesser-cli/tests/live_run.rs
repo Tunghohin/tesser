@@ -9,7 +9,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use hyper::{
     body::to_bytes,
     service::{make_service_fn, service_fn},
@@ -25,21 +25,26 @@ use tonic::transport::Channel;
 
 use async_trait::async_trait;
 use tesser_cli::live::{
-    run_live_with_shutdown, ExecutionBackend, LiveSessionSettings, PersistenceSettings,
-    ShutdownSignal,
+    run_live_with_shutdown, ExecutionBackend, LiveSessionSettings, NamedExchange,
+    PersistenceSettings, ShutdownSignal,
 };
 use tesser_cli::PublicChannel;
 use tesser_config::{AlertingConfig, ExchangeConfig, PersistenceEngine, RiskManagementConfig};
-use tesser_core::{AccountBalance, Candle, Interval, Position, Side, Signal, SignalKind, Tick};
+use tesser_core::{
+    AccountBalance, AssetId, Candle, ExchangeId, ExitStrategy, Interval, Position, Side, Signal,
+    SignalKind, Symbol, Tick,
+};
+use tesser_execution::PanicCloseConfig;
 use tesser_portfolio::{SqliteStateRepository, StateRepository};
 use tesser_rpc::proto::control_service_client::ControlServiceClient;
 use tesser_rpc::proto::{
     CancelAllRequest, GetOpenOrdersRequest, GetPortfolioRequest, GetStatusRequest,
+    ListManagedTradesRequest, UpdateTradeExitStrategyRequest,
 };
-use tesser_strategy::{Strategy, StrategyContext, StrategyResult};
+use tesser_strategy::{PairsTradingArbitrage, Strategy, StrategyContext, StrategyResult};
 use tesser_test_utils::{
-    AccountConfig, MockExchange, MockExchangeConfig, OrderFillStep, Scenario, ScenarioAction,
-    ScenarioManager, ScenarioTrigger,
+    AccountConfig, AutoFillConfig, MockExchange, MockExchangeConfig, OrderFillStep, Scenario,
+    ScenarioAction, ScenarioManager, ScenarioTrigger,
 };
 
 const SYMBOL: &str = "BTCUSDT";
@@ -49,6 +54,143 @@ fn next_control_addr() -> SocketAddr {
     let addr = listener.local_addr().expect("local addr");
     drop(listener);
     addr
+}
+
+fn bybit_exchange() -> ExchangeId {
+    ExchangeId::from("bybit_linear")
+}
+
+fn test_symbol() -> Symbol {
+    Symbol::from_code(bybit_exchange(), SYMBOL)
+}
+
+fn usdt_asset() -> AssetId {
+    AssetId::from_code(bybit_exchange(), "USDT")
+}
+
+fn binance_exchange() -> ExchangeId {
+    ExchangeId::from("binance_perp")
+}
+
+fn binance_symbol() -> Symbol {
+    Symbol::from_code(binance_exchange(), SYMBOL)
+}
+
+fn binance_asset() -> AssetId {
+    AssetId::from_code(binance_exchange(), "USDT")
+}
+
+fn build_price_series(
+    symbol: Symbol,
+    base_time: DateTime<Utc>,
+    closes: &[i64],
+) -> (Vec<Candle>, Vec<Tick>) {
+    let mut candles = Vec::with_capacity(closes.len());
+    let mut ticks = Vec::with_capacity(closes.len());
+    for (index, close) in closes.iter().enumerate() {
+        let timestamp = base_time + ChronoDuration::minutes(index as i64);
+        let price = Decimal::new(*close, 0);
+        candles.push(Candle {
+            symbol,
+            interval: Interval::OneMinute,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: Decimal::ONE,
+            timestamp,
+        });
+        ticks.push(Tick {
+            symbol,
+            price,
+            size: Decimal::ONE,
+            side: Side::Buy,
+            exchange_timestamp: timestamp,
+            received_at: timestamp,
+        });
+    }
+    (candles, ticks)
+}
+
+async fn wait_for_fill_sides(exchange: &MockExchange, timeout_dur: Duration) -> Result<()> {
+    let state = exchange.state();
+    let since = Utc::now() - ChronoDuration::minutes(1);
+    timeout(timeout_dur, async move {
+        loop {
+            let fills = state.executions_between("test-key", since, None).await?;
+            let mut net = Decimal::ZERO;
+            let mut seen_buy = false;
+            let mut seen_sell = false;
+            for fill in &fills {
+                match fill.side {
+                    Side::Buy => {
+                        seen_buy = true;
+                        net += fill.fill_quantity;
+                    }
+                    Side::Sell => {
+                        seen_sell = true;
+                        net -= fill.fill_quantity;
+                    }
+                }
+            }
+            if seen_buy && seen_sell && net.is_zero() {
+                return Ok::<(), anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for entry + exit fills")??;
+    Ok(())
+}
+
+fn account_balance(total: Decimal) -> AccountBalance {
+    let asset = usdt_asset();
+    AccountBalance {
+        exchange: asset.exchange,
+        asset,
+        total,
+        available: total,
+        updated_at: Utc::now(),
+    }
+}
+
+fn default_initial_balances() -> HashMap<AssetId, Decimal> {
+    HashMap::from([(usdt_asset(), Decimal::new(10_000, 0))])
+}
+
+fn dual_initial_balances() -> HashMap<AssetId, Decimal> {
+    HashMap::from([
+        (usdt_asset(), Decimal::new(10_000, 0)),
+        (binance_asset(), Decimal::new(10_000, 0)),
+    ])
+}
+
+fn binance_account_balance(total: Decimal) -> AccountBalance {
+    let asset = binance_asset();
+    AccountBalance {
+        exchange: asset.exchange,
+        asset,
+        total,
+        available: total,
+        updated_at: Utc::now(),
+    }
+}
+
+fn spawn_live_runtime(
+    strategy: Box<dyn Strategy>,
+    symbols: Vec<Symbol>,
+    exchanges: Vec<NamedExchange>,
+    settings: LiveSessionSettings,
+    shutdown: ShutdownSignal,
+) -> JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        let result = run_live_with_shutdown(strategy, symbols, exchanges, settings, shutdown).await;
+        if let Err(err) = &result {
+            eprintln!("live runtime exited with error: {err:?}");
+        }
+        result
+    })
 }
 
 async fn connect_control_client(addr: SocketAddr) -> Result<ControlServiceClient<Channel>> {
@@ -70,15 +212,11 @@ async fn connect_control_client(addr: SocketAddr) -> Result<ControlServiceClient
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mock_exchange_starts() -> Result<()> {
-    let account = AccountConfig::new("test-key", "test-secret").with_balance(AccountBalance {
-        currency: "USDT".into(),
-        total: Decimal::new(10000, 0),
-        available: Decimal::new(10000, 0),
-        updated_at: Utc::now(),
-    });
+    let account = AccountConfig::new("test-key", "test-secret")
+        .with_balance(account_balance(Decimal::new(10_000, 0)));
 
     let candles = vec![Candle {
-        symbol: SYMBOL.into(),
+        symbol: test_symbol(),
         interval: Interval::OneMinute,
         open: Decimal::new(1000, 0),
         high: Decimal::new(1010, 0),
@@ -89,7 +227,7 @@ async fn mock_exchange_starts() -> Result<()> {
     }];
 
     let ticks = vec![Tick {
-        symbol: SYMBOL.into(),
+        symbol: test_symbol(),
         price: Decimal::new(1005, 0),
         size: Decimal::ONE,
         side: Side::Buy,
@@ -98,6 +236,7 @@ async fn mock_exchange_starts() -> Result<()> {
     }];
 
     let config = MockExchangeConfig::new()
+        .with_exchange(bybit_exchange())
         .with_account(account)
         .with_candles(candles)
         .with_ticks(ticks);
@@ -110,16 +249,12 @@ async fn mock_exchange_starts() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn live_run_executes_round_trip() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
-    let account = AccountConfig::new("test-key", "test-secret").with_balance(AccountBalance {
-        currency: "USDT".into(),
-        total: Decimal::new(10_000, 0),
-        available: Decimal::new(10_000, 0),
-        updated_at: Utc::now(),
-    });
+    let account = AccountConfig::new("test-key", "test-secret")
+        .with_balance(account_balance(Decimal::new(10_000, 0)));
     let base_time = Utc::now();
     let candles = (0..6)
         .map(|i| Candle {
-            symbol: SYMBOL.into(),
+            symbol: test_symbol(),
             interval: Interval::OneMinute,
             open: Decimal::new(1_000 + i as i64, 0),
             high: Decimal::new(1_010 + i as i64, 0),
@@ -131,7 +266,7 @@ async fn live_run_executes_round_trip() -> Result<()> {
         .collect::<Vec<_>>();
     let ticks = (0..6)
         .map(|i| Tick {
-            symbol: SYMBOL.into(),
+            symbol: test_symbol(),
             price: Decimal::new(1_005 + i as i64, 0),
             size: Decimal::ONE,
             side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
@@ -141,6 +276,7 @@ async fn live_run_executes_round_trip() -> Result<()> {
         .collect::<Vec<_>>();
 
     let config = MockExchangeConfig::new()
+        .with_exchange(bybit_exchange())
         .with_account(account)
         .with_candles(candles)
         .with_ticks(ticks);
@@ -176,6 +312,10 @@ async fn live_run_executes_round_trip() -> Result<()> {
     let temp = tempdir()?;
     let state_path = temp.path().join("live_state.db");
     let markets_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config/markets.toml");
+    let risk = RiskManagementConfig {
+        max_drawdown: Decimal::ZERO,
+        ..RiskManagementConfig::default()
+    };
     let settings = LiveSessionSettings {
         category: PublicChannel::Linear,
         interval: Interval::OneMinute,
@@ -185,18 +325,18 @@ async fn live_run_executes_round_trip() -> Result<()> {
         history: 8,
         metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         persistence: PersistenceSettings::new(PersistenceEngine::Sqlite, state_path.clone()),
-        initial_balances: HashMap::from([(String::from("USDT"), Decimal::new(10_000, 0))]),
-        reporting_currency: "USDT".into(),
+        initial_balances: default_initial_balances(),
+        reporting_currency: usdt_asset(),
         markets_file: Some(markets_file),
         alerting: AlertingConfig::default(),
         exec_backend: ExecutionBackend::Live,
-        risk: RiskManagementConfig::default(),
-        reconciliation_interval: Duration::from_secs(1),
-        reconciliation_threshold: Decimal::new(1, 3),
-        driver: "bybit".into(),
+        risk,
+        reconciliation_interval: Duration::from_secs(60),
+        reconciliation_threshold: Decimal::ONE,
         orderbook_depth: 50,
         record_path: None,
         control_addr: "127.0.0.1:0".parse().unwrap(),
+        panic_close: PanicCloseConfig::default(),
     };
     let exchange_cfg = ExchangeConfig {
         rest_url: exchange.rest_url(),
@@ -206,15 +346,19 @@ async fn live_run_executes_round_trip() -> Result<()> {
         driver: "bybit".into(),
         params: JsonValue::Null,
     };
-    let (strategy, monitor) = ScriptedStrategy::new(SYMBOL);
+    let exchanges = vec![NamedExchange {
+        name: "bybit_linear".into(),
+        config: exchange_cfg,
+    }];
+    let (strategy, monitor) = ScriptedStrategy::new(test_symbol());
     let shutdown = ShutdownSignal::new();
-    let run_handle = tokio::spawn(run_live_with_shutdown(
+    let run_handle = spawn_live_runtime(
         Box::new(strategy),
-        vec![SYMBOL.to_string()],
-        exchange_cfg,
+        vec![test_symbol()],
+        exchanges,
         settings,
         shutdown.clone(),
-    ));
+    );
 
     match timeout(Duration::from_secs(10), monitor.wait_for_fills(2)).await {
         Ok(result) => result?,
@@ -250,7 +394,7 @@ async fn live_run_executes_round_trip() -> Result<()> {
         .account_balances("test-key")
         .await
         .expect("balances");
-    let usdt = balances.iter().find(|b| b.currency == "USDT").unwrap();
+    let usdt = balances.iter().find(|b| b.asset == usdt_asset()).unwrap();
     assert_eq!(usdt.available, Decimal::new(10_001, 0));
 
     exchange.shutdown().await;
@@ -258,15 +402,522 @@ async fn live_run_executes_round_trip() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn live_run_executes_round_trip_multi_exchange() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let account = AccountConfig::new("test-key", "test-secret")
+        .with_balance(account_balance(Decimal::new(10_000, 0)));
+    let account_b = AccountConfig::new("test-key", "test-secret")
+        .with_balance(binance_account_balance(Decimal::new(10_000, 0)));
+    let base_time = Utc::now();
+    let candles = (0..6)
+        .map(|i| Candle {
+            symbol: test_symbol(),
+            interval: Interval::OneMinute,
+            open: Decimal::new(1_000 + i as i64, 0),
+            high: Decimal::new(1_010 + i as i64, 0),
+            low: Decimal::new(995 + i as i64, 0),
+            close: Decimal::new(1_005 + i as i64, 0),
+            volume: Decimal::ONE,
+            timestamp: base_time + ChronoDuration::minutes(i as i64),
+        })
+        .collect::<Vec<_>>();
+    let ticks = (0..6)
+        .map(|i| Tick {
+            symbol: test_symbol(),
+            price: Decimal::new(1_005 + i as i64, 0),
+            size: Decimal::ONE,
+            side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
+            exchange_timestamp: base_time + ChronoDuration::seconds(i as i64),
+            received_at: Utc::now(),
+        })
+        .collect::<Vec<_>>();
+    let config_a = MockExchangeConfig::new()
+        .with_exchange(bybit_exchange())
+        .with_account(account)
+        .with_candles(candles.clone())
+        .with_ticks(ticks.clone());
+    let mut exchange_a = MockExchange::start(config_a).await?;
+    let candles_b = candles
+        .iter()
+        .map(|c| Candle {
+            symbol: binance_symbol(),
+            interval: c.interval,
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close,
+            volume: c.volume,
+            timestamp: c.timestamp,
+        })
+        .collect::<Vec<_>>();
+    let ticks_b = ticks
+        .iter()
+        .map(|t| Tick {
+            symbol: binance_symbol(),
+            price: t.price,
+            size: t.size,
+            side: t.side,
+            exchange_timestamp: t.exchange_timestamp,
+            received_at: t.received_at,
+        })
+        .collect::<Vec<_>>();
+    let config_b = MockExchangeConfig::new()
+        .with_exchange(binance_exchange())
+        .with_account(account_b)
+        .with_candles(candles_b)
+        .with_ticks(ticks_b);
+    let mut exchange_b = MockExchange::start(config_b).await?;
+    for ex in [&exchange_a, &exchange_b] {
+        let scenarios = ex.state().scenarios();
+        scenarios
+            .push(Scenario {
+                name: "entry-fill".into(),
+                trigger: ScenarioTrigger::OrderCreate,
+                action: ScenarioAction::FillPlan {
+                    steps: vec![OrderFillStep {
+                        after: Duration::from_millis(25),
+                        quantity: Decimal::ONE,
+                        price: Some(Decimal::new(1_001, 0)),
+                    }],
+                },
+            })
+            .await;
+        scenarios
+            .push(Scenario {
+                name: "exit-fill".into(),
+                trigger: ScenarioTrigger::OrderCreate,
+                action: ScenarioAction::FillPlan {
+                    steps: vec![OrderFillStep {
+                        after: Duration::from_millis(25),
+                        quantity: Decimal::ONE,
+                        price: Some(Decimal::new(1_002, 0)),
+                    }],
+                },
+            })
+            .await;
+    }
+    let temp = tempdir()?;
+    let state_path = temp.path().join("live_state.db");
+    let markets_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config/markets.toml");
+    let risk = RiskManagementConfig {
+        max_drawdown: Decimal::ZERO,
+        ..RiskManagementConfig::default()
+    };
+    let settings = LiveSessionSettings {
+        category: PublicChannel::Linear,
+        interval: Interval::OneMinute,
+        quantity: Decimal::ONE,
+        slippage_bps: Decimal::ZERO,
+        fee_bps: Decimal::ZERO,
+        history: 8,
+        metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        persistence: PersistenceSettings::new(PersistenceEngine::Sqlite, state_path.clone()),
+        initial_balances: dual_initial_balances(),
+        reporting_currency: usdt_asset(),
+        markets_file: Some(markets_file),
+        alerting: AlertingConfig::default(),
+        exec_backend: ExecutionBackend::Live,
+        risk,
+        reconciliation_interval: Duration::from_secs(60),
+        reconciliation_threshold: Decimal::ONE,
+        orderbook_depth: 50,
+        record_path: None,
+        control_addr: "127.0.0.1:0".parse().unwrap(),
+        panic_close: PanicCloseConfig::default(),
+    };
+    let exchanges = vec![
+        NamedExchange {
+            name: "bybit_linear".into(),
+            config: ExchangeConfig {
+                rest_url: exchange_a.rest_url(),
+                ws_url: exchange_a.ws_url(),
+                api_key: "test-key".into(),
+                api_secret: "test-secret".into(),
+                driver: "bybit".into(),
+                params: JsonValue::Null,
+            },
+        },
+        NamedExchange {
+            name: "binance_perp".into(),
+            config: ExchangeConfig {
+                rest_url: exchange_b.rest_url(),
+                ws_url: exchange_b.ws_url(),
+                api_key: "test-key".into(),
+                api_secret: "test-secret".into(),
+                // Reuse the Bybit connector stack for the mock Binance venue to avoid
+                // implementing the full Binance API surface in tests.
+                driver: "bybit".into(),
+                params: JsonValue::Null,
+            },
+        },
+    ];
+    let symbols = vec![test_symbol(), binance_symbol()];
+    let (strategy, monitor) = MultiScriptedStrategy::new(symbols.clone());
+    let shutdown = ShutdownSignal::new();
+    let run_handle = spawn_live_runtime(
+        Box::new(strategy),
+        symbols,
+        exchanges,
+        settings,
+        shutdown.clone(),
+    );
+    match timeout(Duration::from_secs(10), monitor.wait_for_fills(4)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(anyhow!(
+                "strategy only observed {} fills before timing out",
+                monitor.fills()
+            ));
+        }
+    }
+    shutdown.trigger();
+    run_handle.await??;
+    for ex in [&exchange_a, &exchange_b] {
+        let positions = ex
+            .state()
+            .account_positions("test-key")
+            .await
+            .expect("positions");
+        assert!(positions
+            .into_iter()
+            .all(|position| position.quantity.is_zero()));
+    }
+    let balances_a = exchange_a
+        .state()
+        .account_balances("test-key")
+        .await
+        .expect("balances");
+    let usdt = balances_a.iter().find(|b| b.asset == usdt_asset()).unwrap();
+    assert_eq!(usdt.available, Decimal::new(10_001, 0));
+    let balances_b = exchange_b
+        .state()
+        .account_balances("test-key")
+        .await
+        .expect("balances");
+    let busdt = balances_b
+        .iter()
+        .find(|b| b.asset == binance_asset())
+        .unwrap();
+    assert_eq!(busdt.available, Decimal::new(10_001, 0));
+    exchange_a.shutdown().await;
+    exchange_b.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pairs_trading_executes_cross_exchange_round_trip() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let account_a = AccountConfig::new("test-key", "test-secret")
+        .with_balance(account_balance(Decimal::new(10_000, 0)));
+    let account_b = AccountConfig::new("test-key", "test-secret")
+        .with_balance(binance_account_balance(Decimal::new(10_000, 0)));
+    let base_time = Utc::now();
+    let series_a = [
+        100, 100, 100, 300, 110, 100, 98, 100, 100, 101, 99, 100, 100, 100, 100, 100, 100, 100,
+        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+    ];
+    let series_b = [
+        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+    ];
+    let (candles_a, ticks_a) = build_price_series(test_symbol(), base_time, &series_a);
+    let (candles_b, ticks_b) = build_price_series(binance_symbol(), base_time, &series_b);
+    let config_a = MockExchangeConfig::new()
+        .with_exchange(bybit_exchange())
+        .with_account(account_a)
+        .with_candles(candles_a)
+        .with_ticks(ticks_a)
+        .with_auto_fill(AutoFillConfig {
+            delay: Duration::from_millis(25),
+            price: Some(Decimal::new(10_000, 0)),
+        });
+    let config_b = MockExchangeConfig::new()
+        .with_exchange(binance_exchange())
+        .with_account(account_b)
+        .with_candles(candles_b)
+        .with_ticks(ticks_b)
+        .with_auto_fill(AutoFillConfig {
+            delay: Duration::from_millis(25),
+            price: Some(Decimal::new(9_950, 0)),
+        });
+    let mut exchange_a = MockExchange::start(config_a).await?;
+    let mut exchange_b = MockExchange::start(config_b).await?;
+    let temp = tempdir()?;
+    let state_path = temp.path().join("live_state.db");
+    let markets_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config/markets.toml");
+    let alerting = AlertingConfig {
+        max_drawdown: Decimal::new(2, 0),
+        ..AlertingConfig::default()
+    };
+    let risk = RiskManagementConfig {
+        max_drawdown: Decimal::new(2, 0),
+        ..RiskManagementConfig::default()
+    };
+    let settings = LiveSessionSettings {
+        category: PublicChannel::Linear,
+        interval: Interval::OneMinute,
+        quantity: Decimal::ONE,
+        slippage_bps: Decimal::ZERO,
+        fee_bps: Decimal::ZERO,
+        history: 16,
+        metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        persistence: PersistenceSettings::new(PersistenceEngine::Sqlite, state_path.clone()),
+        initial_balances: dual_initial_balances(),
+        reporting_currency: usdt_asset(),
+        markets_file: Some(markets_file),
+        alerting,
+        exec_backend: ExecutionBackend::Live,
+        risk,
+        reconciliation_interval: Duration::from_secs(30),
+        reconciliation_threshold: Decimal::new(1, 1),
+        orderbook_depth: 50,
+        record_path: None,
+        control_addr: "127.0.0.1:0".parse().unwrap(),
+        panic_close: PanicCloseConfig::default(),
+    };
+    let exchanges = vec![
+        NamedExchange {
+            name: "bybit_linear".into(),
+            config: ExchangeConfig {
+                rest_url: exchange_a.rest_url(),
+                ws_url: exchange_a.ws_url(),
+                api_key: "test-key".into(),
+                api_secret: "test-secret".into(),
+                driver: "bybit".into(),
+                params: JsonValue::Null,
+            },
+        },
+        NamedExchange {
+            name: "binance_perp".into(),
+            config: ExchangeConfig {
+                rest_url: exchange_b.rest_url(),
+                ws_url: exchange_b.ws_url(),
+                api_key: "test-key".into(),
+                api_secret: "test-secret".into(),
+                driver: "bybit".into(),
+                params: JsonValue::Null,
+            },
+        },
+    ];
+    let mut strategy = PairsTradingArbitrage::default();
+    let config_value: toml::Value = toml::from_str(
+        r#"
+        lookback = 4
+        entry_z = 1.5
+        exit_z = 0.8
+        symbols = ["bybit_linear:BTCUSDT", "binance_perp:BTCUSDT"]
+
+        [default_exit_strategy]
+        type = "hard_time_stop"
+        max_duration_secs = 60
+        "#,
+    )?;
+    strategy.configure(config_value)?;
+    let symbols = strategy.subscriptions();
+    let shutdown = ShutdownSignal::new();
+    let run_handle = spawn_live_runtime(
+        Box::new(strategy),
+        symbols,
+        exchanges,
+        settings,
+        shutdown.clone(),
+    );
+    tokio::try_join!(
+        wait_for_fill_sides(&exchange_a, Duration::from_secs(10)),
+        wait_for_fill_sides(&exchange_b, Duration::from_secs(10))
+    )?;
+    shutdown.trigger();
+    run_handle.await??;
+    for exchange in [&exchange_a, &exchange_b] {
+        let positions = exchange
+            .state()
+            .account_positions("test-key")
+            .await
+            .expect("positions");
+        assert!(positions
+            .into_iter()
+            .all(|position| position.quantity.is_zero()));
+    }
+    exchange_a.shutdown().await;
+    exchange_b.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn control_plane_updates_pairs_exit_strategy() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let account_a = AccountConfig::new("test-key", "test-secret")
+        .with_balance(account_balance(Decimal::new(10_000, 0)));
+    let account_b = AccountConfig::new("test-key", "test-secret")
+        .with_balance(binance_account_balance(Decimal::new(10_000, 0)));
+    let base_time = Utc::now();
+    let series_a = [
+        100, 100, 100, 300, 110, 100, 98, 100, 100, 101, 99, 100, 100, 100, 100, 100, 100, 100,
+        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+    ];
+    let series_b = [
+        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+        100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+    ];
+    let (candles_a, ticks_a) = build_price_series(test_symbol(), base_time, &series_a);
+    let (candles_b, ticks_b) = build_price_series(binance_symbol(), base_time, &series_b);
+    let config_a = MockExchangeConfig::new()
+        .with_exchange(bybit_exchange())
+        .with_account(account_a)
+        .with_candles(candles_a)
+        .with_ticks(ticks_a)
+        .with_auto_fill(AutoFillConfig {
+            delay: Duration::from_millis(25),
+            price: Some(Decimal::new(10_000, 0)),
+        });
+    let config_b = MockExchangeConfig::new()
+        .with_exchange(binance_exchange())
+        .with_account(account_b)
+        .with_candles(candles_b)
+        .with_ticks(ticks_b)
+        .with_auto_fill(AutoFillConfig {
+            delay: Duration::from_millis(25),
+            price: Some(Decimal::new(9_950, 0)),
+        });
+    let mut exchange_a = MockExchange::start(config_a).await?;
+    let mut exchange_b = MockExchange::start(config_b).await?;
+    let control_addr = next_control_addr();
+    let temp = tempdir()?;
+    let state_path = temp.path().join("live_state.db");
+    let markets_file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config/markets.toml");
+    let alerting = AlertingConfig {
+        max_drawdown: Decimal::new(2, 0),
+        ..AlertingConfig::default()
+    };
+    let risk = RiskManagementConfig {
+        max_drawdown: Decimal::new(2, 0),
+        ..RiskManagementConfig::default()
+    };
+    let settings = LiveSessionSettings {
+        category: PublicChannel::Linear,
+        interval: Interval::OneMinute,
+        quantity: Decimal::ONE,
+        slippage_bps: Decimal::ZERO,
+        fee_bps: Decimal::ZERO,
+        history: 16,
+        metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        persistence: PersistenceSettings::new(PersistenceEngine::Sqlite, state_path.clone()),
+        initial_balances: dual_initial_balances(),
+        reporting_currency: usdt_asset(),
+        markets_file: Some(markets_file),
+        alerting,
+        exec_backend: ExecutionBackend::Live,
+        risk,
+        reconciliation_interval: Duration::from_secs(30),
+        reconciliation_threshold: Decimal::new(1, 1),
+        orderbook_depth: 50,
+        record_path: None,
+        control_addr,
+        panic_close: PanicCloseConfig::default(),
+    };
+    let exchanges = vec![
+        NamedExchange {
+            name: "bybit_linear".into(),
+            config: ExchangeConfig {
+                rest_url: exchange_a.rest_url(),
+                ws_url: exchange_a.ws_url(),
+                api_key: "test-key".into(),
+                api_secret: "test-secret".into(),
+                driver: "bybit".into(),
+                params: JsonValue::Null,
+            },
+        },
+        NamedExchange {
+            name: "binance_perp".into(),
+            config: ExchangeConfig {
+                rest_url: exchange_b.rest_url(),
+                ws_url: exchange_b.ws_url(),
+                api_key: "test-key".into(),
+                api_secret: "test-secret".into(),
+                driver: "bybit".into(),
+                params: JsonValue::Null,
+            },
+        },
+    ];
+    let mut strategy = PairsTradingArbitrage::default();
+    let config_value: toml::Value = toml::from_str(
+        r#"
+        lookback = 4
+        entry_z = 1.5
+        exit_z = 0.8
+        symbols = ["bybit_linear:BTCUSDT", "binance_perp:BTCUSDT"]
+
+        [default_exit_strategy]
+        type = "half_life_time_stop"
+        half_life_candles = 200
+        multiplier = 10
+        "#,
+    )?;
+    strategy.configure(config_value)?;
+    let symbols = strategy.subscriptions();
+    let shutdown = ShutdownSignal::new();
+    let run_handle = spawn_live_runtime(
+        Box::new(strategy),
+        symbols,
+        exchanges,
+        settings,
+        shutdown.clone(),
+    );
+
+    let mut client = connect_control_client(control_addr).await?;
+    let trade_id = timeout(Duration::from_secs(10), async {
+        loop {
+            let response = client
+                .list_managed_trades(ListManagedTradesRequest {})
+                .await?
+                .into_inner();
+            if let Some(trade) = response.trades.first() {
+                return Ok::<String, anyhow::Error>(trade.trade_id.clone());
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for managed trade")??;
+
+    let new_exit = ExitStrategy::StandardZScore {
+        exit_z: Decimal::new(3, 1),
+    };
+    let update_request = UpdateTradeExitStrategyRequest {
+        trade_id: trade_id.clone(),
+        new_strategy_json: serde_json::to_string(&new_exit)?,
+    };
+    let response = client
+        .update_trade_exit_strategy(update_request)
+        .await?
+        .into_inner();
+    assert!(response.success);
+
+    let updated = client
+        .list_managed_trades(ListManagedTradesRequest {})
+        .await?
+        .into_inner();
+    let current = updated
+        .trades
+        .iter()
+        .find(|trade| trade.trade_id == trade_id)
+        .expect("managed trade still active");
+    let parsed: ExitStrategy = serde_json::from_str(&current.exit_strategy_json)?;
+    assert_eq!(parsed, new_exit, "exit strategy should reflect update");
+
+    shutdown.trigger();
+    run_handle.await??;
+    exchange_a.shutdown().await;
+    exchange_b.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn control_plane_reports_status() -> Result<()> {
-    let account = AccountConfig::new("test-key", "test-secret").with_balance(AccountBalance {
-        currency: "USDT".into(),
-        total: Decimal::new(10_000, 0),
-        available: Decimal::new(10_000, 0),
-        updated_at: Utc::now(),
-    });
+    let account = AccountConfig::new("test-key", "test-secret")
+        .with_balance(account_balance(Decimal::new(10_000, 0)));
     let candles = vec![Candle {
-        symbol: SYMBOL.into(),
+        symbol: test_symbol(),
         interval: Interval::OneMinute,
         open: Decimal::new(1_000, 0),
         high: Decimal::new(1_010, 0),
@@ -276,7 +927,7 @@ async fn control_plane_reports_status() -> Result<()> {
         timestamp: Utc::now(),
     }];
     let ticks = vec![Tick {
-        symbol: SYMBOL.into(),
+        symbol: test_symbol(),
         price: Decimal::new(1_005, 0),
         size: Decimal::ONE,
         side: Side::Buy,
@@ -284,6 +935,7 @@ async fn control_plane_reports_status() -> Result<()> {
         received_at: Utc::now(),
     }];
     let config = MockExchangeConfig::new()
+        .with_exchange(bybit_exchange())
         .with_account(account)
         .with_candles(candles)
         .with_ticks(ticks);
@@ -302,18 +954,18 @@ async fn control_plane_reports_status() -> Result<()> {
         history: 8,
         metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         persistence: PersistenceSettings::new(PersistenceEngine::Sqlite, state_path.clone()),
-        initial_balances: HashMap::from([(String::from("USDT"), Decimal::new(10_000, 0))]),
-        reporting_currency: "USDT".into(),
+        initial_balances: default_initial_balances(),
+        reporting_currency: usdt_asset(),
         markets_file: Some(markets_file),
         alerting: AlertingConfig::default(),
         exec_backend: ExecutionBackend::Live,
         risk: RiskManagementConfig::default(),
         reconciliation_interval: Duration::from_secs(1),
         reconciliation_threshold: Decimal::new(1, 3),
-        driver: "bybit".into(),
         orderbook_depth: 50,
         record_path: None,
         control_addr,
+        panic_close: PanicCloseConfig::default(),
     };
     let exchange_cfg = ExchangeConfig {
         rest_url: exchange.rest_url(),
@@ -323,15 +975,19 @@ async fn control_plane_reports_status() -> Result<()> {
         driver: "bybit".into(),
         params: JsonValue::Null,
     };
-    let strategy: Box<dyn Strategy> = Box::new(PassiveStrategy::new(SYMBOL));
+    let exchanges = vec![NamedExchange {
+        name: "bybit_linear".into(),
+        config: exchange_cfg,
+    }];
+    let strategy: Box<dyn Strategy> = Box::new(PassiveStrategy::new(test_symbol()));
     let shutdown = ShutdownSignal::new();
-    let run_handle = tokio::spawn(run_live_with_shutdown(
+    let run_handle = spawn_live_runtime(
         strategy,
-        vec![SYMBOL.to_string()],
-        exchange_cfg,
+        vec![test_symbol()],
+        exchanges,
         settings,
         shutdown.clone(),
-    ));
+    );
 
     let mut client = connect_control_client(control_addr).await?;
     let status = client.get_status(GetStatusRequest {}).await?.into_inner();
@@ -343,7 +999,7 @@ async fn control_plane_reports_status() -> Result<()> {
         .await?
         .into_inner();
     let snapshot = portfolio.portfolio.expect("snapshot");
-    assert_eq!(snapshot.reporting_currency, "USDT");
+    assert_eq!(snapshot.reporting_currency, usdt_asset().to_string());
     assert!(!snapshot.liquidate_only);
 
     let open_orders = client
@@ -363,16 +1019,12 @@ async fn control_plane_reports_status() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
-    let account = AccountConfig::new("test-key", "test-secret").with_balance(AccountBalance {
-        currency: "USDT".into(),
-        total: Decimal::new(10_000, 0),
-        available: Decimal::new(10_000, 0),
-        updated_at: Utc::now(),
-    });
+    let account = AccountConfig::new("test-key", "test-secret")
+        .with_balance(account_balance(Decimal::new(10_000, 0)));
     let base_time = Utc::now();
     let candles = (0..3)
         .map(|i| Candle {
-            symbol: SYMBOL.into(),
+            symbol: test_symbol(),
             interval: Interval::OneMinute,
             open: Decimal::new(1_000 + i as i64, 0),
             high: Decimal::new(1_010 + i as i64, 0),
@@ -384,7 +1036,7 @@ async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
         .collect::<Vec<_>>();
     let ticks = (0..3)
         .map(|i| Tick {
-            symbol: SYMBOL.into(),
+            symbol: test_symbol(),
             price: Decimal::new(1_005 + i as i64, 0),
             size: Decimal::ONE,
             side: if i % 2 == 0 { Side::Buy } else { Side::Sell },
@@ -416,18 +1068,18 @@ async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
         history: 4,
         metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         persistence: PersistenceSettings::new(PersistenceEngine::Sqlite, state_path.clone()),
-        initial_balances: HashMap::from([(String::from("USDT"), Decimal::new(10_000, 0))]),
-        reporting_currency: "USDT".into(),
+        initial_balances: default_initial_balances(),
+        reporting_currency: usdt_asset(),
         markets_file: Some(markets_file),
         alerting,
         exec_backend: ExecutionBackend::Live,
         risk: RiskManagementConfig::default(),
         reconciliation_interval: Duration::from_millis(200),
         reconciliation_threshold: Decimal::new(1, 4),
-        driver: "bybit".into(),
         orderbook_depth: 50,
         record_path: None,
         control_addr: "127.0.0.1:0".parse().unwrap(),
+        panic_close: PanicCloseConfig::default(),
     };
     let exchange_cfg = ExchangeConfig {
         rest_url: exchange.rest_url(),
@@ -437,24 +1089,28 @@ async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
         driver: "bybit".into(),
         params: JsonValue::Null,
     };
-    let strategy: Box<dyn Strategy> = Box::new(PassiveStrategy::new(SYMBOL));
+    let exchanges = vec![NamedExchange {
+        name: "bybit_linear".into(),
+        config: exchange_cfg,
+    }];
+    let strategy: Box<dyn Strategy> = Box::new(PassiveStrategy::new(test_symbol()));
     let shutdown = ShutdownSignal::new();
-    let run_handle = tokio::spawn(run_live_with_shutdown(
+    let run_handle = spawn_live_runtime(
         strategy,
-        vec![SYMBOL.to_string()],
-        exchange_cfg,
+        vec![test_symbol()],
+        exchanges,
         settings,
         shutdown.clone(),
-    ));
+    );
 
     sleep(Duration::from_millis(300)).await;
     exchange
         .state()
         .with_account_mut("test-key", |account| {
             account.positions.insert(
-                SYMBOL.into(),
+                test_symbol(),
                 Position {
-                    symbol: SYMBOL.into(),
+                    symbol: test_symbol(),
                     side: Some(Side::Buy),
                     quantity: Decimal::new(5, 0),
                     entry_price: Some(Decimal::new(1_000, 0)),
@@ -462,7 +1118,7 @@ async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
                     updated_at: Utc::now(),
                 },
             );
-            if let Some(balance) = account.balances.get_mut("USDT") {
+            if let Some(balance) = account.balances.get_mut(&usdt_asset()) {
                 balance.available += Decimal::new(500, 0);
                 balance.total = balance.available;
                 balance.updated_at = Utc::now();
@@ -491,16 +1147,12 @@ async fn reconciliation_enters_liquidate_only_on_divergence() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn alerts_on_rejected_order() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
-    let account = AccountConfig::new("test-key", "test-secret").with_balance(AccountBalance {
-        currency: "USDT".into(),
-        total: Decimal::new(10_000, 0),
-        available: Decimal::new(10_000, 0),
-        updated_at: Utc::now(),
-    });
+    let account = AccountConfig::new("test-key", "test-secret")
+        .with_balance(account_balance(Decimal::new(10_000, 0)));
     let base_time = Utc::now();
     let candles = (0..2)
         .map(|i| Candle {
-            symbol: SYMBOL.into(),
+            symbol: test_symbol(),
             interval: Interval::OneMinute,
             open: Decimal::new(1_000 + i as i64, 0),
             high: Decimal::new(1_010 + i as i64, 0),
@@ -512,7 +1164,7 @@ async fn alerts_on_rejected_order() -> Result<()> {
         .collect::<Vec<_>>();
     let ticks = (0..2)
         .map(|i| Tick {
-            symbol: SYMBOL.into(),
+            symbol: test_symbol(),
             price: Decimal::new(1_005 + i as i64, 0),
             size: Decimal::ONE,
             side: Side::Buy,
@@ -538,6 +1190,7 @@ async fn alerts_on_rejected_order() -> Result<()> {
         })
         .await;
     let config = MockExchangeConfig::new()
+        .with_exchange(bybit_exchange())
         .with_account(account)
         .with_candles(candles)
         .with_ticks(ticks)
@@ -563,18 +1216,18 @@ async fn alerts_on_rejected_order() -> Result<()> {
         history: 4,
         metrics_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         persistence: PersistenceSettings::new(PersistenceEngine::Sqlite, state_path),
-        initial_balances: HashMap::from([(String::from("USDT"), Decimal::new(10_000, 0))]),
-        reporting_currency: "USDT".into(),
+        initial_balances: default_initial_balances(),
+        reporting_currency: usdt_asset(),
         markets_file: Some(markets_file),
         alerting,
         exec_backend: ExecutionBackend::Live,
         risk: RiskManagementConfig::default(),
         reconciliation_interval: Duration::from_secs(1),
         reconciliation_threshold: Decimal::new(1, 3),
-        driver: "bybit".into(),
         orderbook_depth: 50,
         record_path: None,
         control_addr: "127.0.0.1:0".parse().unwrap(),
+        panic_close: PanicCloseConfig::default(),
     };
     let exchange_cfg = ExchangeConfig {
         rest_url: exchange.rest_url(),
@@ -584,15 +1237,19 @@ async fn alerts_on_rejected_order() -> Result<()> {
         driver: "bybit".into(),
         params: JsonValue::Null,
     };
-    let (strategy, monitor) = ScriptedStrategy::new(SYMBOL);
+    let exchanges = vec![NamedExchange {
+        name: "bybit_linear".into(),
+        config: exchange_cfg,
+    }];
+    let (strategy, monitor) = ScriptedStrategy::new(test_symbol());
     let shutdown = ShutdownSignal::new();
-    let run_handle = tokio::spawn(run_live_with_shutdown(
+    let run_handle = spawn_live_runtime(
         Box::new(strategy),
-        vec![SYMBOL.to_string()],
-        exchange_cfg,
+        vec![test_symbol()],
+        exchanges,
         settings,
         shutdown.clone(),
-    ));
+    );
 
     // Wait for a rejection alert
     let alert = timeout(Duration::from_secs(10), async {
@@ -683,21 +1340,26 @@ async fn wait_for_liquidate_only(path: &Path, timeout: Duration) -> Result<()> {
 }
 
 struct ScriptedStrategy {
-    symbol: String,
+    symbol: Symbol,
     stage: usize,
     pending: Vec<Signal>,
     state: Arc<StrategyState>,
 }
 
+struct MultiScriptedStrategy {
+    symbols: Vec<Symbol>,
+    stages: HashMap<Symbol, usize>,
+    pending: Vec<Signal>,
+    state: Arc<StrategyState>,
+}
+
 struct PassiveStrategy {
-    symbol: String,
+    symbol: Symbol,
 }
 
 impl PassiveStrategy {
-    fn new(symbol: &str) -> Self {
-        Self {
-            symbol: symbol.to_string(),
-        }
+    fn new(symbol: Symbol) -> Self {
+        Self { symbol }
     }
 }
 
@@ -707,8 +1369,8 @@ impl Strategy for PassiveStrategy {
         "passive-test"
     }
 
-    fn symbol(&self) -> &str {
-        &self.symbol
+    fn symbol(&self) -> Symbol {
+        self.symbol
     }
 
     fn configure(&mut self, _params: toml::Value) -> StrategyResult<()> {
@@ -737,14 +1399,14 @@ impl Strategy for PassiveStrategy {
 }
 
 impl ScriptedStrategy {
-    fn new(symbol: &str) -> (Self, StrategyMonitor) {
+    fn new(symbol: Symbol) -> (Self, StrategyMonitor) {
         let state = Arc::new(StrategyState {
             fills: AtomicUsize::new(0),
             notify: Notify::new(),
         });
         (
             Self {
-                symbol: symbol.to_string(),
+                symbol,
                 stage: 0,
                 pending: Vec::new(),
                 state: state.clone(),
@@ -760,8 +1422,8 @@ impl Strategy for ScriptedStrategy {
         "scripted-test"
     }
 
-    fn symbol(&self) -> &str {
-        &self.symbol
+    fn symbol(&self) -> Symbol {
+        self.symbol
     }
 
     fn configure(&mut self, _params: toml::Value) -> StrategyResult<()> {
@@ -775,12 +1437,91 @@ impl Strategy for ScriptedStrategy {
     async fn on_candle(&mut self, _ctx: &StrategyContext, _candle: &Candle) -> StrategyResult<()> {
         if self.stage == 0 {
             self.pending
-                .push(Signal::new(self.symbol.clone(), SignalKind::EnterLong, 1.0));
+                .push(Signal::new(self.symbol, SignalKind::EnterLong, 1.0));
             self.stage = 1;
         } else if self.stage == 1 {
             self.pending
-                .push(Signal::new(self.symbol.clone(), SignalKind::ExitLong, 1.0));
+                .push(Signal::new(self.symbol, SignalKind::ExitLong, 1.0));
             self.stage = 2;
+        }
+        Ok(())
+    }
+
+    async fn on_fill(
+        &mut self,
+        _ctx: &StrategyContext,
+        fill: &tesser_core::Fill,
+    ) -> StrategyResult<()> {
+        eprintln!("multi-scripted fill received for {}", fill.symbol);
+        self.state.fills.fetch_add(1, Ordering::SeqCst);
+        self.state.notify.notify_waiters();
+        Ok(())
+    }
+
+    fn drain_signals(&mut self) -> Vec<Signal> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+impl MultiScriptedStrategy {
+    fn new(symbols: Vec<Symbol>) -> (Self, StrategyMonitor) {
+        let state = Arc::new(StrategyState {
+            fills: AtomicUsize::new(0),
+            notify: Notify::new(),
+        });
+        let mut stages = HashMap::new();
+        for symbol in &symbols {
+            stages.insert(*symbol, 0);
+        }
+        (
+            Self {
+                symbols,
+                stages,
+                pending: Vec::new(),
+                state: state.clone(),
+            },
+            StrategyMonitor { inner: state },
+        )
+    }
+}
+
+#[async_trait]
+impl Strategy for MultiScriptedStrategy {
+    fn name(&self) -> &str {
+        "multi-scripted-test"
+    }
+
+    fn symbol(&self) -> Symbol {
+        self.symbols[0]
+    }
+
+    fn subscriptions(&self) -> Vec<Symbol> {
+        self.symbols.clone()
+    }
+
+    fn configure(&mut self, _params: toml::Value) -> StrategyResult<()> {
+        Ok(())
+    }
+
+    async fn on_tick(&mut self, _ctx: &StrategyContext, _tick: &Tick) -> StrategyResult<()> {
+        Ok(())
+    }
+
+    async fn on_candle(&mut self, _ctx: &StrategyContext, candle: &Candle) -> StrategyResult<()> {
+        if let Some(stage) = self.stages.get_mut(&candle.symbol) {
+            match *stage {
+                0 => {
+                    self.pending
+                        .push(Signal::new(candle.symbol, SignalKind::EnterLong, 1.0));
+                    *stage = 1;
+                }
+                1 => {
+                    self.pending
+                        .push(Signal::new(candle.symbol, SignalKind::ExitLong, 1.0));
+                    *stage = 2;
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -815,5 +1556,9 @@ impl StrategyMonitor {
             self.inner.notify.notified().await;
         }
         Ok(())
+    }
+
+    fn fills(&self) -> usize {
+        self.inner.fills.load(Ordering::SeqCst)
     }
 }

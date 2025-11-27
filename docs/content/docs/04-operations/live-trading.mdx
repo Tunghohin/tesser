@@ -40,6 +40,7 @@ cargo run -p tesser-cli -- \
 What you get:
 
 - **Status header** showing equity, realized PnL, last data timestamp, and whether Liquidate-Only is active.
+- **Venue breakdown** that aggregates balances and unrealized PnL per exchange so you can see which venue is carrying which sub-account in real time.
 - **Positions / Active Orders** tables that stream updates over gRPC so you instantly see fills and algo progress.
 - **Live Log** that color-codes Signals, Order events, and Fills, keeping the event bus visible while the runtime stays headless.
 - **Help & Shortcuts** footer explaining the available key bindings so on-call operators know what to do at a glance.
@@ -75,6 +76,28 @@ weight_limit_per_minute = 600  # default is 1200, lower it for testing
 
 Each connector now waits for the appropriate token bucket before issuing HTTP calls, shielding your API keys from accidental bans while still allowing you to dial in higher tiers as your VIP level increases.
 
+### Inline Exchange Blocks
+
+You can also declare additional exchange profiles inline without inventing new `[exchange.NAME]` tables by using TOML arrays:
+
+```toml
+[[exchanges]]
+name = "sim_primary"
+driver = "paper"
+rest_url = "sandbox"
+ws_url = "sandbox"
+
+[[exchanges]]
+name = "binance_hedge"
+driver = "binance"
+rest_url = "https://fapi.binance.com"
+ws_url = "wss://fstream.binance.com/stream"
+api_key = "..."
+api_secret = "..."
+```
+
+These entries merge into the same `exchange` map that the CLI expects, so `--exchange sim_primary --exchanges binance_hedge` works whether the profile lives under `[exchange.sim_primary]` or in a `[[exchanges]]` block.
+
 ## Native Order Amendments
 
 High-frequency strategies no longer need to spam cancel + replace cycles just to keep a passive order near the touch. The Bybit, Binance Futures, and paper connectors now implement the exchanges’ native `amend` endpoints, and the execution engine’s `PeggedBest` algorithm chases by mutating the resting child order in place. This cuts the REST call count roughly in half and preserves queue position during volatile bursts.
@@ -84,6 +107,35 @@ Tips:
 - Exchanges still meter amend calls separately, so size your `min_chase_distance` (new hint field) to match the venue’s tick size and weight rules.
 - Amendments inherit the existing order ID/state. When the process restarts, the orchestrator rebinds open children and resumes chasing without resubmitting fresh orders.
 - If an exchange rejects an amend (e.g., because the order already filled), the runtime automatically falls back to placing a new child order on the next tick.
+
+### Panic Close Modes
+
+Multi-leg executions now inherit an explicit “panic close” strategy so a partial fill on one venue doesn’t leave you naked:
+
+- `--panic-mode market` (default) fires market orders that immediately flatten the filled legs.
+- `--panic-mode aggressive-limit --panic-limit-offset-bps 25` uses an IOC limit priced 25 bps past the last mark, giving the book a chance to cross naturally before paying taker fees.
+
+Both modes generate group-aware client order IDs (the router tags each venue’s `client_order_id` with the execution group) so exchange logs and alerts show which legs belong together when something goes wrong.
+
+Every panic-close increments `tesser_panic_closes_total` (exposed on the Prometheus endpoint) and emits an alert via the existing webhook, so operators see the unwind in Grafana and PagerDuty immediately.
+
+```bash
+cargo run -p tesser-cli -- \
+  live run \
+  --exchange bybit_linear \
+  --panic-mode aggressive-limit \
+  --panic-limit-offset-bps 35
+```
+
+Per-signal overrides win over the global defaults—call `Signal::with_panic_behavior` to force a specific mode for a given leg while leaving the runtime default unchanged.
+
+### Router Health Metrics
+
+When you enable the `RouterExecutionClient` (multiple `--exchange` entries), the CLI exposes `tesser_router_failures_total{reason="..."}` for visibility into reconciled vs. orphaned events. If a private stream delivers a fill for an order the router never saw, the runtime drops the fill (to avoid double-counting) and bumps `reason="orphan_fill"`. Alert on this metric to catch exchanges that send stale events after restarts or when credentials point at the wrong sub-account.
+
+### Venue Snapshots
+
+Both `state inspect` and `tesser-cli live monitor` now surface per-exchange views so you can see where equity lives at a glance. The state inspector renders a “Venue breakdown” section listing each exchange’s equity, balances, and positions; the live TUI mirrors that layout with a per-exchange equity table above the cash balance table in the left panel. When one venue is margin constrained while another is flush with collateral, you’ll spot it immediately.
 
 ## Flight Recorder
 

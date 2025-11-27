@@ -2,12 +2,13 @@ use crate::proto;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde_json::{json, Map};
+use std::collections::HashMap;
 use std::str::FromStr;
 use tesser_core::{
-    Candle, Cash, ExecutionHint, Fill, Interval, Order, OrderBook, OrderBookLevel, OrderStatus,
-    OrderType, Position, Side, Signal, SignalKind, Tick,
+    AssetId, Candle, Cash, CashBook, ExchangeId, ExecutionHint, Fill, Interval, Order, OrderBook,
+    OrderBookLevel, OrderStatus, OrderType, Position, Side, Signal, SignalKind, Symbol, Tick,
 };
-use tesser_portfolio::{Portfolio, PortfolioState};
+use tesser_portfolio::{Portfolio, PortfolioState, SubAccountState};
 use tesser_strategy::StrategyContext;
 use uuid::Uuid;
 
@@ -82,7 +83,7 @@ fn order_status_to_proto(status: OrderStatus) -> proto::OrderStatus {
 impl From<Tick> for proto::Tick {
     fn from(t: Tick) -> Self {
         Self {
-            symbol: t.symbol,
+            symbol: t.symbol.code().to_string(),
             price: Some(to_decimal_proto(t.price)),
             size: Some(to_decimal_proto(t.size)),
             side: side_to_proto(t.side) as i32,
@@ -95,7 +96,7 @@ impl From<Tick> for proto::Tick {
 impl From<Candle> for proto::Candle {
     fn from(c: Candle) -> Self {
         Self {
-            symbol: c.symbol,
+            symbol: c.symbol.code().to_string(),
             interval: interval_to_proto(c.interval) as i32,
             open: Some(to_decimal_proto(c.open)),
             high: Some(to_decimal_proto(c.high)),
@@ -110,7 +111,7 @@ impl From<Candle> for proto::Candle {
 impl From<OrderBook> for proto::OrderBook {
     fn from(b: OrderBook) -> Self {
         Self {
-            symbol: b.symbol,
+            symbol: b.symbol.code().to_string(),
             bids: b.bids.into_iter().map(Into::into).collect(),
             asks: b.asks.into_iter().map(Into::into).collect(),
             timestamp: Some(to_timestamp_proto(b.timestamp)),
@@ -133,7 +134,7 @@ impl From<Fill> for proto::Fill {
     fn from(f: Fill) -> Self {
         Self {
             order_id: f.order_id,
-            symbol: f.symbol,
+            symbol: f.symbol.code().to_string(),
             side: side_to_proto(f.side) as i32,
             fill_price: Some(to_decimal_proto(f.fill_price)),
             fill_quantity: Some(to_decimal_proto(f.fill_quantity)),
@@ -142,6 +143,10 @@ impl From<Fill> for proto::Fill {
                     .map(to_decimal_proto)
                     .unwrap_or_else(|| to_decimal_proto(Decimal::ZERO)),
             ),
+            fee_asset: f
+                .fee_asset
+                .map(|asset| asset.to_string())
+                .unwrap_or_default(),
             timestamp: Some(to_timestamp_proto(f.timestamp)),
         }
     }
@@ -151,7 +156,7 @@ impl From<&Order> for proto::OrderSnapshot {
     fn from(order: &Order) -> Self {
         Self {
             id: order.id.clone(),
-            symbol: order.request.symbol.clone(),
+            symbol: order.request.symbol.code().to_string(),
             side: side_to_proto(order.request.side) as i32,
             order_type: order_type_to_proto(order.request.order_type) as i32,
             quantity: Some(to_decimal_proto(order.request.quantity)),
@@ -198,7 +203,7 @@ impl From<Signal> for proto::Signal {
     fn from(signal: Signal) -> Self {
         let metadata = signal_metadata(&signal).unwrap_or_default();
         Self {
-            symbol: signal.symbol,
+            symbol: signal.symbol.code().to_string(),
             kind: signal_kind_to_proto(signal.kind) as i32,
             confidence: signal.confidence,
             stop_loss: signal.stop_loss.map(to_decimal_proto),
@@ -208,6 +213,8 @@ impl From<Signal> for proto::Signal {
             id: signal.id.to_string(),
             generated_at: Some(to_timestamp_proto(signal.generated_at)),
             metadata,
+            quantity: signal.quantity.map(to_decimal_proto),
+            group_id: signal.group_id.map(|id| id.to_string()).unwrap_or_default(),
         }
     }
 }
@@ -223,27 +230,39 @@ fn signal_kind_to_proto(kind: SignalKind) -> proto::signal::Kind {
 }
 
 fn portfolio_state_to_proto(state: &PortfolioState) -> proto::PortfolioSnapshot {
-    let unrealized: Decimal = state.positions.values().map(|pos| pos.unrealized_pnl).sum();
-    let cash_value = state.balances.total_value();
+    let (positions, balances) = if state.sub_accounts.is_empty() {
+        (state.positions.clone(), state.balances.clone())
+    } else {
+        (
+            aggregate_positions(&state.sub_accounts),
+            aggregate_balances(&state.sub_accounts),
+        )
+    };
+    let unrealized: Decimal = positions.values().map(|pos| pos.unrealized_pnl).sum();
+    let cash_value = balances.total_value();
     let equity = cash_value + unrealized;
     let realized = equity - state.initial_equity - unrealized;
 
     proto::PortfolioSnapshot {
-        balances: state
-            .balances
+        balances: balances
             .iter()
-            .map(|(currency, cash)| cash_to_proto(currency, cash))
+            .map(|(currency, cash)| cash_to_proto(*currency, cash))
             .collect(),
-        positions: state.positions.values().cloned().map(Into::into).collect(),
+        positions: positions.values().cloned().map(Into::into).collect(),
         equity: Some(to_decimal_proto(equity)),
         initial_equity: Some(to_decimal_proto(state.initial_equity)),
         realized_pnl: Some(to_decimal_proto(realized)),
-        reporting_currency: state.reporting_currency.clone(),
+        reporting_currency: state.reporting_currency.to_string(),
         liquidate_only: state.liquidate_only,
+        sub_accounts: state
+            .sub_accounts
+            .iter()
+            .map(|(exchange, account)| sub_account_to_proto(*exchange, account))
+            .collect(),
     }
 }
 
-fn cash_to_proto(currency: &str, cash: &Cash) -> proto::CashBalance {
+fn cash_to_proto(currency: AssetId, cash: &Cash) -> proto::CashBalance {
     proto::CashBalance {
         currency: currency.to_string(),
         quantity: Some(to_decimal_proto(cash.quantity)),
@@ -251,10 +270,59 @@ fn cash_to_proto(currency: &str, cash: &Cash) -> proto::CashBalance {
     }
 }
 
+fn sub_account_to_proto(
+    exchange: ExchangeId,
+    account: &SubAccountState,
+) -> proto::SubAccountSnapshot {
+    let unrealized: Decimal = account
+        .positions
+        .values()
+        .map(|position| position.unrealized_pnl)
+        .sum();
+    let equity = account.balances.total_value() + unrealized;
+    proto::SubAccountSnapshot {
+        exchange: exchange.to_string(),
+        balances: account
+            .balances
+            .iter()
+            .map(|(currency, cash)| cash_to_proto(*currency, cash))
+            .collect(),
+        positions: account
+            .positions
+            .values()
+            .cloned()
+            .map(Into::into)
+            .collect(),
+        equity: Some(to_decimal_proto(equity)),
+    }
+}
+
+fn aggregate_positions(
+    sub_accounts: &HashMap<ExchangeId, SubAccountState>,
+) -> HashMap<Symbol, Position> {
+    let mut positions = HashMap::new();
+    for account in sub_accounts.values() {
+        for (symbol, position) in &account.positions {
+            positions.insert(*symbol, position.clone());
+        }
+    }
+    positions
+}
+
+fn aggregate_balances(sub_accounts: &HashMap<ExchangeId, SubAccountState>) -> CashBook {
+    let mut combined = CashBook::new();
+    for account in sub_accounts.values() {
+        for (_asset, cash) in account.balances.iter() {
+            combined.upsert(cash.clone());
+        }
+    }
+    combined
+}
+
 impl From<Position> for proto::Position {
     fn from(p: Position) -> Self {
         Self {
-            symbol: p.symbol,
+            symbol: p.symbol.code().to_string(),
             side: match p.side {
                 Some(Side::Buy) => proto::Side::Buy as i32,
                 Some(Side::Sell) => proto::Side::Sell as i32,
@@ -317,6 +385,14 @@ impl From<proto::Signal> for Signal {
         if !p.id.is_empty() {
             if let Ok(uuid) = Uuid::parse_str(&p.id) {
                 signal.id = uuid;
+            }
+        }
+        if let Some(qty) = p.quantity {
+            signal.quantity = Some(from_decimal_proto(qty));
+        }
+        if !p.group_id.is_empty() {
+            if let Ok(id) = Uuid::parse_str(&p.group_id) {
+                signal.group_id = Some(id);
             }
         }
 

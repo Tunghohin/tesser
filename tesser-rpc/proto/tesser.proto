@@ -102,6 +102,7 @@ message Fill {
   Decimal fill_quantity = 5;
   Decimal fee = 6;
   google.protobuf.Timestamp timestamp = 7;
+  string fee_asset = 8;
 }
 
 // Control Plane Structures
@@ -112,6 +113,13 @@ message CashBalance {
   Decimal conversion_rate = 3;
 }
 
+message SubAccountSnapshot {
+  string exchange = 1;
+  repeated CashBalance balances = 2;
+  repeated Position positions = 3;
+  Decimal equity = 4;
+}
+
 message PortfolioSnapshot {
   repeated CashBalance balances = 1;
   repeated Position positions = 2;
@@ -120,6 +128,7 @@ message PortfolioSnapshot {
   Decimal realized_pnl = 5;
   string reporting_currency = 6;
   bool liquidate_only = 7;
+  repeated SubAccountSnapshot sub_accounts = 8;
 }
 
 message OrderSnapshot {
@@ -184,6 +193,8 @@ message Signal {
   string id = 8;
   google.protobuf.Timestamp generated_at = 9;
   string metadata = 10;
+  Decimal quantity = 11;
+  string group_id = 12;
 }
 
 message SignalList {
@@ -260,6 +271,33 @@ message CancelAllResponse {
   uint32 cancelled_algorithms = 2;
 }
 
+message ManagedTradeInfo {
+  string trade_id = 1;
+  string symbol_a = 2;
+  string symbol_b = 3;
+  string direction = 4;
+  google.protobuf.Timestamp entry_timestamp = 5;
+  Decimal entry_z = 6;
+  uint64 candles_held = 7;
+  string exit_strategy_json = 8;
+}
+
+message ListManagedTradesRequest {}
+
+message ListManagedTradesResponse {
+  repeated ManagedTradeInfo trades = 1;
+}
+
+message UpdateTradeExitStrategyRequest {
+  string trade_id = 1;
+  string new_strategy_json = 2;
+}
+
+message UpdateTradeExitStrategyResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
 message MonitorRequest {}
 
 message Event {
@@ -286,5 +324,7 @@ service ControlService {
   rpc GetOpenOrders (GetOpenOrdersRequest) returns (GetOpenOrdersResponse);
   rpc GetStatus (GetStatusRequest) returns (GetStatusResponse);
   rpc CancelAll (CancelAllRequest) returns (CancelAllResponse);
+  rpc ListManagedTrades (ListManagedTradesRequest) returns (ListManagedTradesResponse);
+  rpc UpdateTradeExitStrategy (UpdateTradeExitStrategyRequest) returns (UpdateTradeExitStrategyResponse);
   rpc Monitor (MonitorRequest) returns (stream Event);
 }

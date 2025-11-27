@@ -20,8 +20,9 @@ use tesser_broker::{
     RateLimiterError,
 };
 use tesser_core::{
-    AccountBalance, Candle, Fill, Instrument, InstrumentKind, Order, OrderBook, OrderRequest,
-    OrderStatus, OrderType, OrderUpdateRequest, Position, Side, TimeInForce,
+    AccountBalance, AssetId, Candle, ExchangeId, Fill, Instrument, InstrumentKind, Order,
+    OrderBook, OrderRequest, OrderStatus, OrderType, OrderUpdateRequest, Position, Side, Symbol,
+    TimeInForce,
 };
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -79,10 +80,15 @@ pub struct BinanceClient {
     credentials: Option<BinanceCredentials>,
     config: BinanceConfig,
     weight_limiter: Option<RateLimiter>,
+    exchange: ExchangeId,
 }
 
 impl BinanceClient {
-    pub fn new(config: BinanceConfig, credentials: Option<BinanceCredentials>) -> Self {
+    pub fn new(
+        config: BinanceConfig,
+        credentials: Option<BinanceCredentials>,
+        exchange: ExchangeId,
+    ) -> Self {
         let mut builder = ConfigurationRestApi::builder();
         builder = builder.base_path(config.rest_url.clone());
         if let Some(creds) = credentials.as_ref() {
@@ -108,6 +114,7 @@ impl BinanceClient {
             credentials,
             config,
             weight_limiter,
+            exchange,
         }
     }
 
@@ -129,6 +136,10 @@ impl BinanceClient {
 
     pub fn rest(&self) -> Arc<rest_api::RestApi> {
         Arc::clone(&self.rest)
+    }
+
+    pub fn exchange(&self) -> ExchangeId {
+        self.exchange
     }
 
     async fn throttle_weight(&self, units: u32) -> BrokerResult<()> {
@@ -213,7 +224,8 @@ impl ExecutionClient for BinanceClient {
         self.throttle_weight(ORDER_WEIGHT).await?;
         let side = map_side(request.side);
         let order_type = map_order_type(request.order_type);
-        let mut builder = NewOrderParams::builder(request.symbol.clone(), side, order_type);
+        let symbol_code = request.symbol.code().to_string();
+        let mut builder = NewOrderParams::builder(symbol_code, side, order_type);
         let mut client_request = request.clone();
         if let Some(price) = request.price {
             builder = builder.price(Some(price));
@@ -253,9 +265,13 @@ impl ExecutionClient for BinanceClient {
         Ok(build_order_from_response(response, client_request))
     }
 
-    async fn cancel_order(&self, order_id: tesser_core::OrderId, symbol: &str) -> BrokerResult<()> {
+    async fn cancel_order(
+        &self,
+        order_id: tesser_core::OrderId,
+        symbol: Symbol,
+    ) -> BrokerResult<()> {
         self.throttle_weight(CANCEL_WEIGHT).await?;
-        let mut builder = rest_api::CancelOrderParams::builder(symbol.to_string())
+        let mut builder = rest_api::CancelOrderParams::builder(symbol.code().to_string())
             .recv_window(Some(self.config.recv_window as i64));
         if let Ok(id) = order_id.parse::<i64>() {
             builder = builder.order_id(Some(id));
@@ -279,7 +295,7 @@ impl ExecutionClient for BinanceClient {
             BrokerError::InvalidRequest("amend requires new quantity for Binance".into())
         })?;
         let mut builder = rest_api::ModifyOrderParams::builder(
-            request.symbol.clone(),
+            request.symbol.code().to_string(),
             map_modify_side(request.side),
             new_qty,
             new_price,
@@ -299,10 +315,10 @@ impl ExecutionClient for BinanceClient {
         Ok(build_order_from_modify_response(response, &request))
     }
 
-    async fn list_open_orders(&self, symbol: &str) -> BrokerResult<Vec<Order>> {
+    async fn list_open_orders(&self, symbol: Symbol) -> BrokerResult<Vec<Order>> {
         self.throttle_weight(QUERY_WEIGHT).await?;
         let params = rest_api::CurrentAllOpenOrdersParams::builder()
-            .symbol(Some(symbol.to_string()))
+            .symbol(Some(symbol.code().to_string()))
             .recv_window(Some(self.config.recv_window as i64))
             .build()
             .map_err(|err| BrokerError::InvalidRequest(err.to_string()))?;
@@ -311,7 +327,7 @@ impl ExecutionClient for BinanceClient {
             .await?;
         let mut orders = Vec::new();
         for entry in raw {
-            if let Some(order) = order_from_open_order(&entry) {
+            if let Some(order) = order_from_open_order(self.exchange, &entry) {
                 orders.push(order);
             }
         }
@@ -329,7 +345,7 @@ impl ExecutionClient for BinanceClient {
             .await?;
         Ok(balances
             .into_iter()
-            .filter_map(|entry| balance_from_entry(&entry))
+            .filter_map(|entry| balance_from_entry(self.exchange, &entry))
             .collect())
     }
 
@@ -344,7 +360,7 @@ impl ExecutionClient for BinanceClient {
             .await?;
         Ok(positions
             .into_iter()
-            .filter_map(|entry| position_from_entry(&entry))
+            .filter_map(|entry| position_from_entry(self.exchange, &entry))
             .collect())
     }
 
@@ -355,7 +371,7 @@ impl ExecutionClient for BinanceClient {
             .await?;
         let mut instruments = Vec::new();
         for symbol in info.symbols.unwrap_or_default() {
-            if let Some(instr) = instrument_from_symbol(&symbol) {
+            if let Some(instr) = instrument_from_symbol(self.exchange, &symbol) {
                 instruments.push(instr);
             }
         }
@@ -395,7 +411,8 @@ fn build_order_from_modify_response(
     let symbol = response
         .symbol
         .clone()
-        .unwrap_or_else(|| update.symbol.clone());
+        .map(|code| Symbol::from_code(update.symbol.exchange, code))
+        .unwrap_or(update.symbol);
     let order_type = response
         .r#type
         .as_deref()
@@ -441,9 +458,16 @@ fn build_order_from_modify_response(
     }
 }
 
-fn order_from_open_order(entry: &rest_api::AllOrdersResponseInner) -> Option<Order> {
+fn order_from_open_order(
+    exchange: ExchangeId,
+    entry: &rest_api::AllOrdersResponseInner,
+) -> Option<Order> {
+    let symbol = entry
+        .symbol
+        .as_deref()
+        .map(|code| Symbol::from_code(exchange, code))?;
     let request = OrderRequest {
-        symbol: entry.symbol.clone()?,
+        symbol,
         side: entry
             .side
             .as_deref()
@@ -482,20 +506,28 @@ fn order_from_open_order(entry: &rest_api::AllOrdersResponseInner) -> Option<Ord
 }
 
 fn balance_from_entry(
+    exchange: ExchangeId,
     entry: &rest_api::FuturesAccountBalanceV2ResponseInner,
 ) -> Option<AccountBalance> {
-    let currency = entry.asset.clone()?;
+    let asset = entry
+        .asset
+        .as_deref()
+        .map(|code| AssetId::from_code(exchange, code))?;
     let total = parse_decimal_opt(entry.balance.as_deref())?;
     let available = parse_decimal_opt(entry.available_balance.as_deref()).unwrap_or(total);
     Some(AccountBalance {
-        currency,
+        exchange,
+        asset,
         total,
         available,
         updated_at: timestamp_from_ms(entry.update_time),
     })
 }
 
-fn position_from_entry(entry: &rest_api::PositionInformationV2ResponseInner) -> Option<Position> {
+fn position_from_entry(
+    exchange: ExchangeId,
+    entry: &rest_api::PositionInformationV2ResponseInner,
+) -> Option<Position> {
     let qty = parse_decimal_opt(entry.position_amt.as_deref())?;
     if qty.is_zero() {
         return None;
@@ -505,8 +537,12 @@ fn position_from_entry(entry: &rest_api::PositionInformationV2ResponseInner) -> 
     } else {
         Some(Side::Sell)
     };
+    let symbol = entry
+        .symbol
+        .as_deref()
+        .map(|code| Symbol::from_code(exchange, code))?;
     Some(Position {
-        symbol: entry.symbol.clone()?,
+        symbol,
         side,
         quantity: qty.abs(),
         entry_price: parse_decimal_opt(entry.entry_price.as_deref()),
@@ -517,12 +553,26 @@ fn position_from_entry(entry: &rest_api::PositionInformationV2ResponseInner) -> 
 }
 
 fn instrument_from_symbol(
+    exchange: ExchangeId,
     symbol: &rest_api::ExchangeInformationResponseSymbolsInner,
 ) -> Option<Instrument> {
-    let symbol_name = symbol.symbol.clone()?;
-    let base = symbol.base_asset.clone()?;
-    let quote = symbol.quote_asset.clone()?;
-    let settlement = symbol.margin_asset.clone().unwrap_or_else(|| quote.clone());
+    let symbol_name = symbol
+        .symbol
+        .as_deref()
+        .map(|code| Symbol::from_code(exchange, code))?;
+    let base = symbol
+        .base_asset
+        .as_deref()
+        .map(|code| AssetId::from_code(exchange, code))?;
+    let quote = symbol
+        .quote_asset
+        .as_deref()
+        .map(|code| AssetId::from_code(exchange, code))?;
+    let settlement = symbol
+        .margin_asset
+        .as_deref()
+        .map(|code| AssetId::from_code(exchange, code))
+        .unwrap_or(quote);
     let mut tick_size = Decimal::ONE;
     let mut lot_size = Decimal::ONE;
     if let Some(filters) = &symbol.filters {
@@ -628,7 +678,10 @@ pub fn timestamp_from_ms(value: Option<i64>) -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
-pub fn fill_from_update(order: &websocket_streams::OrderTradeUpdateO) -> Option<Fill> {
+pub fn fill_from_update(
+    exchange: ExchangeId,
+    order: &websocket_streams::OrderTradeUpdateO,
+) -> Option<Fill> {
     let last_qty = parse_decimal_opt(order.l.as_deref())?;
     if last_qty.is_zero() {
         return None;
@@ -640,20 +693,38 @@ pub fn fill_from_update(order: &websocket_streams::OrderTradeUpdateO) -> Option<
         .as_deref()
         .map(map_order_side)
         .unwrap_or(Side::Buy);
+    let symbol = order
+        .s
+        .as_deref()
+        .map(|code| Symbol::from_code(exchange, code))
+        .unwrap_or(Symbol::unspecified());
+    let fee_currency = order
+        .n_uppercase
+        .as_deref()
+        .filter(|code| !code.is_empty())
+        .map(|code| AssetId::from_code(exchange, code));
     Some(Fill {
         order_id: order.i.map(|id| id.to_string()).unwrap_or_default(),
-        symbol: order.s.clone().unwrap_or_default(),
+        symbol,
         side,
         fill_price: price,
         fill_quantity: last_qty,
         fee: parse_decimal_opt(order.n.as_deref()),
+        fee_asset: fee_currency,
         timestamp: timestamp_from_ms(order.t_uppercase),
     })
 }
 
-pub fn order_from_update(order: &websocket_streams::OrderTradeUpdateO) -> Option<Order> {
+pub fn order_from_update(
+    exchange: ExchangeId,
+    order: &websocket_streams::OrderTradeUpdateO,
+) -> Option<Order> {
+    let symbol = order
+        .s
+        .as_deref()
+        .map(|code| Symbol::from_code(exchange, code))?;
     let request = OrderRequest {
-        symbol: order.s.clone()?,
+        symbol,
         side: order
             .s_uppercase
             .as_deref()
@@ -694,6 +765,8 @@ struct BinanceConnectorConfig {
     rest_url: String,
     #[serde(default = "default_ws_url")]
     ws_url: String,
+    #[serde(default = "default_exchange_name")]
+    exchange: String,
     #[serde(default)]
     api_key: String,
     #[serde(default)]
@@ -710,6 +783,10 @@ fn default_rest_url() -> String {
 
 fn default_ws_url() -> String {
     "wss://fstream.binance.com/stream".into()
+}
+
+fn default_exchange_name() -> String {
+    "binance_perp".into()
 }
 
 fn default_recv_window() -> u64 {
@@ -759,6 +836,7 @@ impl ConnectorFactory for BinanceFactory {
         config: &Value,
     ) -> BrokerResult<Arc<dyn ExecutionClient>> {
         let cfg = self.parse_config(config)?;
+        let exchange = ExchangeId::from(cfg.exchange.as_str());
         let binance_cfg = BinanceConfig {
             rest_url: cfg.rest_url.clone(),
             ws_url: cfg.ws_url.clone(),
@@ -768,6 +846,7 @@ impl ConnectorFactory for BinanceFactory {
         Ok(Arc::new(BinanceClient::new(
             binance_cfg,
             Self::credentials(&cfg),
+            exchange,
         )))
     }
 
@@ -777,10 +856,12 @@ impl ConnectorFactory for BinanceFactory {
         stream_config: ConnectorStreamConfig,
     ) -> BrokerResult<Box<dyn ConnectorStream>> {
         let cfg = self.parse_config(config)?;
+        let exchange = ExchangeId::from(cfg.exchange.as_str());
         let stream = BinanceMarketStream::connect(
             &cfg.ws_url,
             &cfg.rest_url,
             stream_config.connection_status,
+            exchange,
         )
         .await?;
         Ok(Box::new(BinanceConnectorStream::new(

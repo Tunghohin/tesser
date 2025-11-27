@@ -12,19 +12,31 @@ use tokio::time::sleep;
 use tesser_broker::ExecutionClient;
 use tesser_bybit::{BybitClient, BybitConfig, BybitCredentials};
 use tesser_core::{
-    AccountBalance, Candle, ExecutionHint, Interval, Order, OrderStatus, Side, Signal, SignalKind,
-    Tick,
+    AccountBalance, AssetId, Candle, ExchangeId, ExecutionHint, Interval, Order, OrderStatus, Side,
+    Signal, SignalKind, Symbol, Tick,
 };
 use tesser_execution::{
-    ExecutionEngine, FixedOrderSizer, NoopRiskChecker, OrderOrchestrator, RiskContext,
-    SqliteAlgoStateRepository,
+    ExecutionEngine, FixedOrderSizer, NoopRiskChecker, OrderOrchestrator, PanicCloseConfig,
+    RiskContext, SqliteAlgoStateRepository,
 };
 use tesser_test_utils::{AccountConfig, MockExchange, MockExchangeConfig};
 
 const SYMBOL: &str = "BTCUSDT";
 
+fn bybit_exchange() -> ExchangeId {
+    ExchangeId::from("bybit_linear")
+}
+
+fn test_symbol() -> Symbol {
+    Symbol::from_code(bybit_exchange(), SYMBOL)
+}
+
+fn usdt_asset() -> AssetId {
+    AssetId::from_code(bybit_exchange(), "USDT")
+}
+
 async fn assert_single_open_order(client: &BybitClient) -> Result<Order> {
-    let mut orders = client.list_open_orders(SYMBOL).await?;
+    let mut orders = client.list_open_orders(test_symbol()).await?;
     assert_eq!(orders.len(), 1, "expected exactly one open order");
     Ok(orders.remove(0))
 }
@@ -39,14 +51,16 @@ fn slice_number(client_id: &str) -> Option<u32> {
 #[tokio::test(flavor = "multi_thread")]
 async fn twap_orders_adopt_after_restart() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
+    let usdt = usdt_asset();
     let account = AccountConfig::new("test-key", "test-secret").with_balance(AccountBalance {
-        currency: "USDT".into(),
+        exchange: usdt.exchange,
+        asset: usdt,
         total: Decimal::new(10_000, 0),
         available: Decimal::new(10_000, 0),
         updated_at: Utc::now(),
     });
     let ticks = vec![Tick {
-        symbol: SYMBOL.into(),
+        symbol: test_symbol(),
         price: Decimal::new(20_000, 0),
         size: Decimal::ONE,
         side: Side::Buy,
@@ -54,7 +68,7 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
         received_at: Utc::now(),
     }];
     let candles = vec![Candle {
-        symbol: SYMBOL.into(),
+        symbol: test_symbol(),
         interval: Interval::OneMinute,
         open: Decimal::new(20_000, 0),
         high: Decimal::new(20_010, 0),
@@ -64,6 +78,7 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
         timestamp: Utc::now(),
     }];
     let config = MockExchangeConfig::new()
+        .with_exchange(bybit_exchange())
         .with_account(account)
         .with_ticks(ticks)
         .with_candles(candles);
@@ -80,6 +95,7 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
             api_key: "test-key".into(),
             api_secret: "test-secret".into(),
         }),
+        tesser_core::ExchangeId::from("bybit_linear"),
     ));
     let client: Arc<dyn ExecutionClient> = raw_client.clone();
 
@@ -96,16 +112,28 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
     let algo_path = temp.path().join("algos.db");
     let repo = Arc::new(SqliteAlgoStateRepository::new(&algo_path)?);
 
-    let orchestrator = OrderOrchestrator::new(engine.clone(), repo.clone(), Vec::new()).await?;
+    let orchestrator = OrderOrchestrator::new(
+        engine.clone(),
+        repo.clone(),
+        Vec::new(),
+        PanicCloseConfig::default(),
+        None,
+    )
+    .await?;
 
-    let signal = Signal::new(SYMBOL, SignalKind::EnterLong, 0.8).with_hint(ExecutionHint::Twap {
+    let symbol = test_symbol();
+    let signal = Signal::new(symbol, SignalKind::EnterLong, 0.8).with_hint(ExecutionHint::Twap {
         duration: ChronoDuration::seconds(4),
     });
     let ctx = RiskContext {
+        symbol,
+        exchange: symbol.exchange,
         signed_position_qty: Decimal::ZERO,
         portfolio_equity: Decimal::from(10_000),
+        exchange_equity: Decimal::from(10_000),
         last_price: Decimal::new(20_000, 0),
         liquidate_only: false,
+        ..RiskContext::default()
     };
     orchestrator.on_signal(&signal, &ctx).await?;
     sleep(Duration::from_millis(25)).await;
@@ -129,7 +157,10 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
     drop(orchestrator);
     sleep(Duration::from_millis(10)).await;
 
-    let open_orders = raw_client.list_open_orders(SYMBOL).await?;
+    let mut open_orders = raw_client.list_open_orders(test_symbol()).await?;
+    for order in &mut open_orders {
+        order.request.symbol = test_symbol();
+    }
     assert_eq!(open_orders.len(), 1);
     let adopted = open_orders[0].clone();
 
@@ -140,8 +171,16 @@ async fn twap_orders_adopt_after_restart() -> Result<()> {
         }),
         Arc::new(NoopRiskChecker),
     ));
-    let restored = OrderOrchestrator::new(restarted_engine, repo.clone(), open_orders).await?;
-    restored.update_risk_context(SYMBOL, ctx);
+    let restored = OrderOrchestrator::new(
+        restarted_engine,
+        repo.clone(),
+        open_orders,
+        PanicCloseConfig::default(),
+        None,
+    )
+    .await?;
+    restored.update_risk_context(adopted.request.symbol, ctx);
+    restored.update_risk_context(Symbol::from(SYMBOL), ctx);
     assert_eq!(restored.active_algorithms_count(), 1);
 
     let state = exchange.state();

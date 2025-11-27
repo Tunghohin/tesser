@@ -2,7 +2,8 @@ use crate::alerts::sanitize_webhook;
 use crate::analyze;
 use crate::data_validation::{validate_dataset, ValidationConfig, ValidationOutcome};
 use crate::live::{
-    run_live, ExecutionBackend, LiveSessionSettings, PersistenceBackend, PersistenceSettings,
+    run_live, ExecutionBackend, LiveSessionSettings, NamedExchange, PersistenceBackend,
+    PersistenceSettings,
 };
 use crate::state;
 use crate::telemetry::init_tracing;
@@ -34,9 +35,12 @@ use tesser_backtester::{
     stream_from_events, BacktestConfig, BacktestMode, BacktestStream, Backtester, MarketEvent,
     MarketEventKind, MarketEventStream,
 };
-use tesser_broker::ExecutionClient;
+use tesser_broker::{ExecutionClient, RouterExecutionClient};
 use tesser_config::{load_config, AppConfig, PersistenceEngine, RiskManagementConfig};
-use tesser_core::{Candle, DepthUpdate, Interval, OrderBook, OrderBookLevel, Side, Symbol, Tick};
+use tesser_core::{
+    AssetId, Candle, DepthUpdate, ExchangeId, Interval, OrderBook, OrderBookLevel, Side, Symbol,
+    Tick,
+};
 use tesser_data::analytics::ExecutionAnalysisRequest;
 use tesser_data::download::{
     BinanceDownloader, BybitDownloader, KlineRequest, NormalizedTrade, TradeRequest, TradeSource,
@@ -46,12 +50,12 @@ use tesser_data::merger::UnifiedEventStream;
 use tesser_data::parquet::ParquetMarketStream;
 use tesser_data::transform::Resampler;
 use tesser_execution::{
-    ExecutionEngine, FixedOrderSizer, NoopRiskChecker, OrderSizer, PortfolioPercentSizer,
-    RiskAdjustedSizer,
+    ExecutionEngine, FixedOrderSizer, NoopRiskChecker, OrderSizer, PanicCloseConfig,
+    PanicCloseMode, PortfolioPercentSizer, RiskAdjustedSizer,
 };
 use tesser_markets::MarketRegistry;
 use tesser_paper::{
-    FeeScheduleConfig, MatchingEngine, MatchingEngineConfig, PaperExecutionClient,
+    FeeModel, FeeScheduleConfig, MatchingEngine, MatchingEngineConfig, PaperExecutionClient,
     PaperMarketStream, QueueModel,
 };
 use tesser_strategy::{builtin_strategy_names, load_strategy};
@@ -937,6 +941,11 @@ pub struct LiveRunArgs {
     strategy_config: PathBuf,
     #[arg(long, default_value = "paper_sandbox")]
     exchange: String,
+    /// Optional list of additional exchange profiles to load (comma separated or repeated)
+    ///
+    /// Each entry must match a `[exchange.NAME]` table or a `[[exchanges]]` block in the selected config.
+    #[arg(long = "exchanges", value_name = "NAME", num_args = 0.., action = clap::ArgAction::Append)]
+    exchanges: Vec<String>,
     #[arg(long, default_value = "linear")]
     category: String,
     #[arg(long, default_value = "1m")]
@@ -1009,6 +1018,12 @@ pub struct LiveRunArgs {
     /// Order sizer (e.g. "fixed:0.01", "percent:0.02")
     #[arg(long, default_value = "fixed:1.0")]
     sizer: String,
+    /// Panic-close mode used when multi-leg groups desync
+    #[arg(long, value_enum, default_value = "market")]
+    panic_mode: PanicModeArg,
+    /// Basis points added/subtracted from the last price when using `panic_mode=aggressive-limit`
+    #[arg(long, default_value = "50")]
+    panic_limit_offset_bps: Decimal,
 }
 
 impl LiveRunArgs {
@@ -1055,13 +1070,11 @@ impl LiveRunArgs {
         }
     }
 
-    fn resolved_initial_balances(&self, config: &AppConfig) -> HashMap<Symbol, Decimal> {
+    fn resolved_initial_balances(&self, config: &AppConfig) -> HashMap<AssetId, Decimal> {
         let mut balances = clone_initial_balances(&config.backtest);
         if let Some(value) = self.initial_equity {
-            balances.insert(
-                config.backtest.reporting_currency.clone(),
-                value.max(Decimal::ZERO),
-            );
+            let reporting = AssetId::from(config.backtest.reporting_currency.as_str());
+            balances.insert(reporting, value.max(Decimal::ZERO));
         }
         balances
     }
@@ -1226,16 +1239,22 @@ impl BacktestRunArgs {
             })?,
         );
         let fee_schedule = self.resolve_fee_schedule()?;
+        let fee_model_template = fee_schedule.build_model();
+        let reporting_currency = AssetId::from(config.backtest.reporting_currency.as_str());
+        let initial_balances = clone_initial_balances(&config.backtest);
 
         let (market_stream, event_stream, execution_client, matching_engine) = match mode {
             BacktestMode::Candle => {
                 let stream = self.build_candle_stream(&symbols)?;
-                let exec_client: Arc<dyn ExecutionClient> = Arc::new(PaperExecutionClient::new(
-                    "paper-backtest".to_string(),
-                    symbols.clone(),
+                let exec_client = build_sim_execution_client(
+                    "paper-backtest",
+                    &symbols,
                     self.slippage_bps,
-                    fee_schedule.build_model(),
-                ));
+                    fee_model_template.clone(),
+                    &initial_balances,
+                    reporting_currency,
+                )
+                .await;
                 (Some(stream), None, exec_client, None)
             }
             BacktestMode::Tick => {
@@ -1244,7 +1263,16 @@ impl BacktestRunArgs {
                 }
                 let source = self.detect_lob_source()?;
                 let latency_ms = self.sim_latency_ms.min(i64::MAX as u64);
-                let fee_model = fee_schedule.build_model();
+                let fee_model = fee_model_template.clone();
+                let execution_client = build_sim_execution_client(
+                    "paper-tick",
+                    &symbols,
+                    self.slippage_bps,
+                    fee_model_template.clone(),
+                    &initial_balances,
+                    reporting_currency,
+                )
+                .await;
                 let engine = Arc::new(MatchingEngine::with_config(
                     "matching-engine",
                     symbols.clone(),
@@ -1253,6 +1281,7 @@ impl BacktestRunArgs {
                         latency: Duration::milliseconds(latency_ms as i64),
                         queue_model: self.sim_queue_model.into(),
                         fee_model: fee_model.clone(),
+                        cash_asset: Some(reporting_currency),
                     },
                 ));
                 let stream = match source {
@@ -1267,12 +1296,7 @@ impl BacktestRunArgs {
                         .build_flight_recorder_stream(&root, &symbols)
                         .context("failed to initialize flight recorder stream")?,
                 };
-                (
-                    None,
-                    Some(stream),
-                    engine.clone() as Arc<dyn ExecutionClient>,
-                    Some(engine),
-                )
+                (None, Some(stream), execution_client, Some(engine))
             }
         };
 
@@ -1280,10 +1304,10 @@ impl BacktestRunArgs {
         let order_quantity = self.quantity;
         let execution = ExecutionEngine::new(execution_client, sizer, Arc::new(NoopRiskChecker));
 
-        let mut cfg = BacktestConfig::new(symbols[0].clone());
+        let mut cfg = BacktestConfig::new(symbols[0]);
         cfg.order_quantity = order_quantity;
-        cfg.initial_balances = clone_initial_balances(&config.backtest);
-        cfg.reporting_currency = config.backtest.reporting_currency.clone();
+        cfg.initial_balances = initial_balances.clone();
+        cfg.reporting_currency = reporting_currency;
         cfg.execution.slippage_bps = self.slippage_bps.max(Decimal::ZERO);
         cfg.execution.fee_bps = self.fee_bps.max(Decimal::ZERO);
         cfg.execution.latency_candles = self.latency_candles.max(1);
@@ -1324,13 +1348,13 @@ impl BacktestRunArgs {
             let mut generated = Vec::new();
             for (idx, symbol) in symbols.iter().enumerate() {
                 let offset = idx as i64 * 10;
-                generated.extend(synth_candles(symbol, self.candles, offset));
+                generated.extend(synth_candles(*symbol, self.candles, offset));
             }
             generated.sort_by_key(|c| c.timestamp);
             if generated.is_empty() {
                 bail!("no synthetic candles generated; provide --data files instead");
             }
-            return Ok(memory_market_stream(&symbols[0], generated));
+            return Ok(memory_market_stream(symbols[0], generated));
         }
 
         match detect_data_format(&self.data_paths)? {
@@ -1340,7 +1364,7 @@ impl BacktestRunArgs {
                     bail!("no candles loaded from --data paths");
                 }
                 candles.sort_by_key(|c| c.timestamp);
-                Ok(memory_market_stream(&symbols[0], candles))
+                Ok(memory_market_stream(symbols[0], candles))
             }
             DataFormat::Parquet => Ok(parquet_market_stream(symbols, self.data_paths.clone())),
         }
@@ -1415,6 +1439,8 @@ impl BacktestBatchArgs {
                 self.fee_bps.max(Decimal::ZERO),
             )
         };
+        let reporting_currency = AssetId::from(config.backtest.reporting_currency.as_str());
+        let initial_balances = clone_initial_balances(&config.backtest);
         for config_path in &self.config_paths {
             let contents = std::fs::read_to_string(config_path).with_context(|| {
                 format!("failed to read strategy config {}", config_path.display())
@@ -1436,22 +1462,25 @@ impl BacktestBatchArgs {
                         bail!("no candles loaded from --data paths");
                     }
                     candles.sort_by_key(|c| c.timestamp);
-                    memory_market_stream(&symbols[0], candles)
+                    memory_market_stream(symbols[0], candles)
                 }
                 DataFormat::Parquet => parquet_market_stream(&symbols, self.data_paths.clone()),
             };
-            let execution_client: Arc<dyn ExecutionClient> = Arc::new(PaperExecutionClient::new(
-                format!("paper-batch-{}", def.name),
-                symbols.clone(),
+            let execution_client = build_sim_execution_client(
+                &format!("paper-batch-{}", def.name),
+                &symbols,
                 self.slippage_bps,
                 fee_schedule.build_model(),
-            ));
+                &initial_balances,
+                reporting_currency,
+            )
+            .await;
             let execution =
                 ExecutionEngine::new(execution_client, sizer, Arc::new(NoopRiskChecker));
-            let mut cfg = BacktestConfig::new(symbols[0].clone());
+            let mut cfg = BacktestConfig::new(symbols[0]);
             cfg.order_quantity = order_quantity;
-            cfg.initial_balances = clone_initial_balances(&config.backtest);
-            cfg.reporting_currency = config.backtest.reporting_currency.clone();
+            cfg.initial_balances = initial_balances.clone();
+            cfg.reporting_currency = reporting_currency;
             cfg.execution.slippage_bps = self.slippage_bps.max(Decimal::ZERO);
             cfg.execution.fee_bps = self.fee_bps.max(Decimal::ZERO);
             cfg.execution.latency_candles = self.latency_candles.max(1);
@@ -1488,15 +1517,162 @@ impl BacktestBatchArgs {
     }
 }
 
+async fn build_sim_execution_client(
+    name_prefix: &str,
+    symbols: &[Symbol],
+    slippage_bps: Decimal,
+    fee_model: Arc<dyn FeeModel>,
+    initial_balances: &HashMap<AssetId, Decimal>,
+    reporting_currency: AssetId,
+) -> Arc<dyn ExecutionClient> {
+    let mut grouped: HashMap<ExchangeId, Vec<Symbol>> = HashMap::new();
+    for symbol in symbols {
+        grouped.entry(symbol.exchange).or_default().push(*symbol);
+    }
+    if grouped.len() <= 1 {
+        let (exchange, group) = grouped
+            .into_iter()
+            .next()
+            .unwrap_or((ExchangeId::UNSPECIFIED, symbols.to_vec()));
+        return build_paper_client_for_exchange(
+            name_prefix,
+            exchange,
+            group,
+            slippage_bps,
+            fee_model,
+            initial_balances,
+            reporting_currency,
+        )
+        .await;
+    }
+    let mut routes = HashMap::new();
+    for (exchange, group) in grouped {
+        let client = build_paper_client_for_exchange(
+            name_prefix,
+            exchange,
+            group,
+            slippage_bps,
+            fee_model.clone(),
+            initial_balances,
+            reporting_currency,
+        )
+        .await;
+        routes.insert(exchange, client);
+    }
+    Arc::new(RouterExecutionClient::new(routes))
+}
+
+async fn build_paper_client_for_exchange(
+    name_prefix: &str,
+    exchange: ExchangeId,
+    symbols: Vec<Symbol>,
+    slippage_bps: Decimal,
+    fee_model: Arc<dyn FeeModel>,
+    initial_balances: &HashMap<AssetId, Decimal>,
+    reporting_currency: AssetId,
+) -> Arc<dyn ExecutionClient> {
+    let cash_asset = cash_asset_for_exchange(reporting_currency, exchange);
+    let client = Arc::new(PaperExecutionClient::with_cash_asset(
+        format!("{name_prefix}-{}", exchange),
+        symbols,
+        slippage_bps,
+        fee_model,
+        cash_asset,
+    ));
+    let balance = initial_balance_for_asset(initial_balances, cash_asset);
+    client.initialize_balance(cash_asset, balance).await;
+    let exec: Arc<dyn ExecutionClient> = client;
+    exec
+}
+
+fn cash_asset_for_exchange(reporting: AssetId, exchange: ExchangeId) -> AssetId {
+    if reporting.exchange.is_specified() {
+        if reporting.exchange == exchange {
+            reporting
+        } else {
+            AssetId::from_code(exchange, reporting.code())
+        }
+    } else if exchange.is_specified() {
+        AssetId::from_code(exchange, reporting.code())
+    } else {
+        reporting
+    }
+}
+
+fn initial_balance_for_asset(balances: &HashMap<AssetId, Decimal>, target: AssetId) -> Decimal {
+    if let Some(amount) = balances
+        .iter()
+        .find(|(asset, _)| asset.exchange == target.exchange && asset.code() == target.code())
+        .map(|(_, amount)| *amount)
+    {
+        return amount;
+    }
+    if target.exchange.is_specified() {
+        if let Some(amount) = balances
+            .iter()
+            .find(|(asset, _)| !asset.exchange.is_specified() && asset.code() == target.code())
+            .map(|(_, amount)| *amount)
+        {
+            return amount;
+        }
+    }
+    Decimal::from(10_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_balance_prefers_exchange_specific_entry() {
+        let mut balances = HashMap::new();
+        let exchange = ExchangeId::from("bybit_linear");
+        let global = AssetId::from("USDT");
+        let target = AssetId::from_code(exchange, "USDT");
+        balances.insert(global, Decimal::new(5_000, 0));
+        balances.insert(target, Decimal::new(2_500, 0));
+        assert_eq!(
+            initial_balance_for_asset(&balances, target),
+            Decimal::new(2_500, 0)
+        );
+    }
+
+    #[test]
+    fn initial_balance_falls_back_to_unspecified_exchange() {
+        let mut balances = HashMap::new();
+        balances.insert(AssetId::from("USDT"), Decimal::new(7_500, 0));
+        let exchange = ExchangeId::from("binance_perp");
+        let target = AssetId::from_code(exchange, "USDT");
+        assert_eq!(
+            initial_balance_for_asset(&balances, target),
+            Decimal::new(7_500, 0)
+        );
+    }
+}
+
 impl LiveRunArgs {
     async fn run(&self, config: &AppConfig) -> Result<()> {
-        let exchange_cfg = config
-            .exchange
-            .get(&self.exchange)
-            .cloned()
-            .ok_or_else(|| anyhow!("exchange profile {} not found", self.exchange))?;
-
-        let driver = exchange_cfg.driver.clone();
+        let exchange_names = if self.exchanges.is_empty() {
+            vec![self.exchange.clone()]
+        } else {
+            let mut names = self.exchanges.clone();
+            if !names.contains(&self.exchange) {
+                names.insert(0, self.exchange.clone());
+            }
+            names
+        };
+        let profiles = config.exchange_profiles();
+        let mut named_exchanges = Vec::new();
+        for name in exchange_names {
+            let config_entry = profiles
+                .get(&name)
+                .cloned()
+                .ok_or_else(|| anyhow!("exchange profile {} not found", name))?;
+            named_exchanges.push(NamedExchange {
+                name,
+                config: config_entry,
+            });
+        }
 
         let contents = fs::read_to_string(&self.strategy_config)
             .with_context(|| format!("failed to read {}", self.strategy_config.display()))?;
@@ -1513,7 +1689,7 @@ impl LiveRunArgs {
         }
         let quantity = self.quantity;
         let initial_balances = self.resolved_initial_balances(config);
-        let reporting_currency = config.backtest.reporting_currency.clone();
+        let reporting_currency = AssetId::from(config.backtest.reporting_currency.as_str());
         let markets_file = self
             .markets_file
             .clone()
@@ -1541,6 +1717,10 @@ impl LiveRunArgs {
         let orderbook_depth = self
             .orderbook_depth
             .unwrap_or(super::live::default_order_book_depth());
+        let panic_close = PanicCloseConfig {
+            mode: self.panic_mode.into(),
+            limit_offset_bps: self.panic_limit_offset_bps.max(Decimal::ZERO),
+        };
 
         let settings = LiveSessionSettings {
             category,
@@ -1559,18 +1739,22 @@ impl LiveRunArgs {
             risk: self.build_risk_config(config),
             reconciliation_interval,
             reconciliation_threshold,
-            driver,
             orderbook_depth,
             record_path: Some(self.record_data.clone()),
             control_addr,
+            panic_close,
         };
+
+        let exchange_labels: Vec<String> = named_exchanges
+            .iter()
+            .map(|ex| format!("{} ({})", ex.name, ex.config.driver))
+            .collect();
 
         info!(
             strategy = %def.name,
             symbols = ?symbols,
-            exchange = %self.exchange,
+            exchanges = ?exchange_labels,
             interval = %self.interval,
-            driver = ?settings.driver,
             exec = ?self.exec,
             persistence_engine = ?settings.persistence.engine,
             state_path = %settings.persistence.state_path.display(),
@@ -1578,7 +1762,7 @@ impl LiveRunArgs {
             "starting live session"
         );
 
-        run_live(strategy, symbols, exchange_cfg, settings)
+        run_live(strategy, symbols, named_exchanges, settings)
             .await
             .context("live session failed")
     }
@@ -1673,7 +1857,7 @@ fn print_report(report: &PerformanceReport) {
     println!("\n{}", report);
 }
 
-fn synth_candles(symbol: &str, len: usize, offset_minutes: i64) -> Vec<Candle> {
+fn synth_candles(symbol: Symbol, len: usize, offset_minutes: i64) -> Vec<Candle> {
     let mut candles = Vec::with_capacity(len);
     for i in 0..len {
         let base = 50_000.0 + ((i as f64) + offset_minutes as f64).sin() * 500.0;
@@ -1685,7 +1869,7 @@ fn synth_candles(symbol: &str, len: usize, offset_minutes: i64) -> Vec<Candle> {
         let high = Decimal::from_f64(open.max(close) + 20.0).unwrap_or(open_dec);
         let low = Decimal::from_f64(open.min(close) - 20.0).unwrap_or(close_dec);
         candles.push(Candle {
-            symbol: Symbol::from(symbol),
+            symbol,
             interval: Interval::OneMinute,
             open: open_dec,
             high,
@@ -1734,7 +1918,7 @@ fn load_candles_from_paths(paths: &[PathBuf]) -> Result<Vec<Candle>> {
         for record in reader.deserialize::<CandleCsvRow>() {
             let row = record.with_context(|| format!("invalid row in {}", path.display()))?;
             let timestamp = parse_datetime(&row.timestamp)?;
-            let symbol = row
+            let symbol_code = row
                 .symbol
                 .clone()
                 .or_else(|| infer_symbol_from_path(path))
@@ -1744,6 +1928,7 @@ fn load_candles_from_paths(paths: &[PathBuf]) -> Result<Vec<Candle>> {
                         path.display()
                     )
                 })?;
+            let symbol = Symbol::from(symbol_code.as_str());
             let interval = infer_interval_from_path(path).unwrap_or(Interval::OneMinute);
             let open = Decimal::from_f64(row.open).ok_or_else(|| {
                 anyhow!("invalid open value '{}' in {}", row.open, path.display())
@@ -1808,12 +1993,8 @@ fn detect_data_format(paths: &[PathBuf]) -> Result<DataFormat> {
     detected.ok_or_else(|| anyhow!("no data paths provided"))
 }
 
-fn memory_market_stream(symbol: &str, candles: Vec<Candle>) -> BacktestStream {
-    Box::new(PaperMarketStream::from_data(
-        symbol.to_string(),
-        Vec::new(),
-        candles,
-    ))
+fn memory_market_stream(symbol: Symbol, candles: Vec<Candle>) -> BacktestStream {
+    Box::new(PaperMarketStream::from_data(symbol, Vec::new(), candles))
 }
 
 fn parquet_market_stream(symbols: &[Symbol], paths: Vec<PathBuf>) -> BacktestStream {
@@ -1866,13 +2047,14 @@ fn load_lob_events_from_paths(paths: &[PathBuf]) -> Result<Vec<MarketEvent>> {
                     asks,
                 } => {
                     let ts = parse_datetime(&timestamp)?;
-                    let symbol = symbol
+                    let symbol_code = symbol
                         .or_else(|| symbol_hint.clone())
                         .ok_or_else(|| anyhow!("missing symbol in snapshot {}", path.display()))?;
+                    let symbol = Symbol::from(symbol_code.as_str());
                     let bids = convert_levels(&bids)?;
                     let asks = convert_levels(&asks)?;
                     let book = OrderBook {
-                        symbol: symbol.clone(),
+                        symbol,
                         bids,
                         asks,
                         timestamp: ts,
@@ -1891,13 +2073,14 @@ fn load_lob_events_from_paths(paths: &[PathBuf]) -> Result<Vec<MarketEvent>> {
                     asks,
                 } => {
                     let ts = parse_datetime(&timestamp)?;
-                    let symbol = symbol.or_else(|| symbol_hint.clone()).ok_or_else(|| {
+                    let symbol_code = symbol.or_else(|| symbol_hint.clone()).ok_or_else(|| {
                         anyhow!("missing symbol in depth update {}", path.display())
                     })?;
+                    let symbol = Symbol::from(symbol_code.as_str());
                     let bids = convert_levels(&bids)?;
                     let asks = convert_levels(&asks)?;
                     let update = DepthUpdate {
-                        symbol: symbol.clone(),
+                        symbol,
                         bids,
                         asks,
                         timestamp: ts,
@@ -1915,9 +2098,10 @@ fn load_lob_events_from_paths(paths: &[PathBuf]) -> Result<Vec<MarketEvent>> {
                     size,
                 } => {
                     let ts = parse_datetime(&timestamp)?;
-                    let symbol = symbol
+                    let symbol_code = symbol
                         .or_else(|| symbol_hint.clone())
                         .ok_or_else(|| anyhow!("missing symbol in trade {}", path.display()))?;
+                    let symbol = Symbol::from(symbol_code.as_str());
                     let side = match side.to_lowercase().as_str() {
                         "buy" | "bid" | "b" => Side::Buy,
                         "sell" | "ask" | "s" => Side::Sell,
@@ -1930,7 +2114,7 @@ fn load_lob_events_from_paths(paths: &[PathBuf]) -> Result<Vec<MarketEvent>> {
                         anyhow!("invalid trade size '{}' in {}", size, path.display())
                     })?;
                     let tick = Tick {
-                        symbol: symbol.clone(),
+                        symbol,
                         price,
                         size,
                         side,
@@ -2030,8 +2214,8 @@ fn interval_label(interval: Interval) -> &'static str {
 }
 
 #[derive(Serialize)]
-struct CandleRow<'a> {
-    symbol: &'a str,
+struct CandleRow {
+    symbol: String,
     timestamp: String,
     open: f64,
     high: f64,
@@ -2049,7 +2233,7 @@ fn write_candles_csv(path: &Path, candles: &[Candle]) -> Result<()> {
         Writer::from_path(path).with_context(|| format!("failed to create {}", path.display()))?;
     for candle in candles {
         let row = CandleRow {
-            symbol: &candle.symbol,
+            symbol: candle.symbol.code().to_string(),
             timestamp: candle.timestamp.to_rfc3339(),
             open: candle.open.to_f64().unwrap_or(0.0),
             high: candle.high.to_f64().unwrap_or(0.0),
@@ -2057,7 +2241,7 @@ fn write_candles_csv(path: &Path, candles: &[Candle]) -> Result<()> {
             close: candle.close.to_f64().unwrap_or(0.0),
             volume: candle.volume.to_f64().unwrap_or(0.0),
         };
-        writer.serialize(row)?;
+        writer.serialize(&row)?;
     }
     writer.flush()?;
     Ok(())
@@ -2086,11 +2270,11 @@ fn write_batch_report(path: &Path, rows: &[BatchRow]) -> Result<()> {
     Ok(())
 }
 
-fn clone_initial_balances(config: &tesser_config::BacktestConfig) -> HashMap<Symbol, Decimal> {
+fn clone_initial_balances(config: &tesser_config::BacktestConfig) -> HashMap<AssetId, Decimal> {
     config
         .initial_balances
         .iter()
-        .map(|(currency, amount)| (currency.clone(), *amount))
+        .map(|(currency, amount)| (AssetId::from(currency.as_str()), *amount))
         .collect()
 }
 
@@ -2131,5 +2315,20 @@ fn parse_sizer(value: &str, cli_quantity: Option<Decimal>) -> Result<Box<dyn Ord
         _ => Err(anyhow!(
             "invalid sizer format, expected 'fixed:value', 'percent:value', or 'risk-adjusted:value'"
         )),
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum PanicModeArg {
+    Market,
+    AggressiveLimit,
+}
+
+impl From<PanicModeArg> for PanicCloseMode {
+    fn from(arg: PanicModeArg) -> Self {
+        match arg {
+            PanicModeArg::Market => PanicCloseMode::Market,
+            PanicModeArg::AggressiveLimit => PanicCloseMode::AggressiveLimit,
+        }
     }
 }
