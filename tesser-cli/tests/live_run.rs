@@ -142,7 +142,7 @@ async fn wait_for_positions_flat(exchange: &MockExchange, timeout_dur: Duration)
             if positions.iter().all(|position| position.quantity.is_zero()) {
                 return Ok::<(), anyhow::Error>(());
             }
-            if iterations % 20 == 0 {
+            if iterations.is_multiple_of(20) {
                 println!(
                     "[pairs-test] waiting for {venue} positions to flatten, snapshot={positions:?}"
                 );
