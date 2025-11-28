@@ -59,7 +59,7 @@ use tesser_events::{
 use tesser_execution::{
     AlgoStateRepository, BasicRiskChecker, ExecutionEngine, FixedOrderSizer, OrderOrchestrator,
     PanicCloseConfig, PanicObserver, PreTradeRiskChecker, RiskContext, RiskLimits,
-    SqliteAlgoStateRepository, StoredAlgoState,
+    SqliteAlgoStateRepository, StoredAlgoState, WasmPluginEngine,
 };
 use tesser_journal::LmdbJournal;
 use tesser_markets::{InstrumentCatalog, MarketRegistry};
@@ -722,12 +722,22 @@ pub async fn run_live_with_shutdown(
         .as_ref()
         .map(|data| data.open_orders.clone())
         .unwrap_or_default();
+    let wasm_plugins = if let Some(dir) = settings.plugins_dir.as_ref() {
+        Some(Arc::new(
+            WasmPluginEngine::new(dir).with_context(|| {
+                format!("failed to initialize plugin runtime at {}", dir.display())
+            })?,
+        ))
+    } else {
+        None
+    };
     let orchestrator = OrderOrchestrator::new(
         Arc::new(execution),
         persistence.algo.clone(),
         initial_open_orders,
         settings.panic_close,
         Some(panic_hook.clone()),
+        wasm_plugins.clone(),
     )
     .await?;
 

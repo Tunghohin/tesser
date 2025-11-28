@@ -10,18 +10,21 @@ readme = "README.md"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 chrono.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-async-trait.workspace = true
 tesser-broker = { version = "0.9.1", path = "../tesser-broker" }
 tesser-core = { version = "0.9.1", path = "../tesser-core" }
 tesser-strategy = { version = "0.9.1", path = "../tesser-strategy" }
+tesser-wasm = { path = "../tesser-wasm" }
 thiserror.workspace = true
 uuid.workspace = true
 rust_decimal.workspace = true
+wasmtime = { version = "18.0", features = ["component-model"] }
+wasmtime-wasi = { version = "18.0", features = ["preview2"] }
 
 [dev-dependencies]
 tempfile = "3.10"

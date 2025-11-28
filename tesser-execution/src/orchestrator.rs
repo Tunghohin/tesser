@@ -13,7 +13,9 @@ use crate::algorithm::{
     PeggedBestAlgorithm, SniperAlgorithm, TrailingStopAlgorithm, TwapAlgorithm, VwapAlgorithm,
 };
 use crate::repository::{AlgoStateRepository, StoredAlgoState};
+use crate::wasm::{WasmAlgorithm, WasmAlgorithmState, WasmPluginEngine};
 use crate::{ExecutionEngine, PanicCloseConfig, PanicCloseMode, PanicObserver, RiskContext};
+use serde_json::Value;
 use tesser_core::{
     ExecutionHint, Fill, Order, OrderRequest, OrderStatus, OrderType, Price, Quantity, Side,
     Signal, SignalPanicBehavior, Symbol, Tick, TimeInForce,
@@ -158,6 +160,7 @@ pub struct OrderOrchestrator {
     execution_groups: Arc<Mutex<HashMap<Uuid, ExecutionGroupState>>>,
     /// Maps order IDs to their execution group identifiers.
     group_order_mapping: Arc<Mutex<HashMap<String, (Uuid, Symbol)>>>,
+    wasm_plugins: Option<Arc<WasmPluginEngine>>,
 }
 
 impl OrderOrchestrator {
@@ -168,6 +171,7 @@ impl OrderOrchestrator {
         open_orders: Vec<Order>,
         panic_config: PanicCloseConfig,
         panic_observer: Option<Arc<dyn PanicObserver>>,
+        wasm_plugins: Option<Arc<WasmPluginEngine>>,
     ) -> Result<Self> {
         let algorithms = Arc::new(Mutex::new(HashMap::new()));
         let order_mapping = Arc::new(Mutex::new(HashMap::new()));
@@ -185,6 +189,7 @@ impl OrderOrchestrator {
             panic_observer,
             execution_groups: Arc::new(Mutex::new(HashMap::new())),
             group_order_mapping: Arc::new(Mutex::new(HashMap::new())),
+            wasm_plugins,
         };
 
         // Restore algorithms from persistent state
@@ -203,7 +208,7 @@ impl OrderOrchestrator {
         let mut restored = 0usize;
 
         for (id, stored) in states {
-            match Self::instantiate_algorithm(&stored.algo_type, stored.state.clone()) {
+            match self.instantiate_algorithm(id, &stored.algo_type, stored.state.clone()) {
                 Ok(algo) => {
                     tracing::info!(
                         id = %id,
@@ -313,8 +318,10 @@ impl OrderOrchestrator {
     }
 
     fn instantiate_algorithm(
+        &self,
+        algo_id: Uuid,
         algo_type: &str,
-        state: serde_json::Value,
+        state: Value,
     ) -> Result<Box<dyn ExecutionAlgorithm>> {
         match algo_type {
             "TWAP" => Ok(Box::new(TwapAlgorithm::from_state(state)?)),
@@ -323,6 +330,17 @@ impl OrderOrchestrator {
             "PEGGED_BEST" => Ok(Box::new(PeggedBestAlgorithm::from_state(state)?)),
             "SNIPER" => Ok(Box::new(SniperAlgorithm::from_state(state)?)),
             "TRAILING_STOP" => Ok(Box::new(TrailingStopAlgorithm::from_state(state)?)),
+            "WASM_PLUGIN" => {
+                let engine = self
+                    .wasm_plugins
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("plugin runtime not configured"))?
+                    .clone();
+                let snapshot: WasmAlgorithmState = serde_json::from_value(state)?;
+                Ok(Box::new(WasmAlgorithm::from_snapshot(
+                    engine, algo_id, snapshot,
+                )?))
+            }
             other => bail!("unsupported algorithm type '{other}'"),
         }
     }
@@ -609,6 +627,10 @@ impl OrderOrchestrator {
         if let Some(rest) = client_id.strip_prefix("trailing-") {
             return Uuid::parse_str(rest).ok();
         }
+        if let Some(rest) = client_id.strip_prefix("plugin-") {
+            let (id_part, _) = rest.split_once('-')?;
+            return Uuid::parse_str(id_part).ok();
+        }
         None
     }
 
@@ -676,6 +698,10 @@ impl OrderOrchestrator {
                     ctx,
                 )
                 .await
+            }
+            Some(ExecutionHint::Plugin { name, params }) => {
+                self.handle_plugin_signal(signal.clone(), name.clone(), params.clone(), ctx)
+                    .await
             }
             None => {
                 // Handle normal, non-algorithmic orders
@@ -970,6 +996,49 @@ impl OrderOrchestrator {
         self.persist_algo_state(&algo_id).await?;
         for child in initial_orders {
             self.send_child_order(child, Some(*ctx)).await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_plugin_signal(
+        &self,
+        signal: Signal,
+        plugin_name: String,
+        params: Value,
+        ctx: &RiskContext,
+    ) -> Result<()> {
+        let Some(engine) = &self.wasm_plugins else {
+            bail!("plugin execution requested but wasm runtime not configured");
+        };
+        self.update_risk_context(signal.symbol, *ctx);
+        let total_quantity = self.execution_engine.determine_quantity(&signal, ctx)?;
+        if total_quantity <= Decimal::ZERO {
+            tracing::warn!(
+                symbol = %signal.symbol,
+                plugin = %plugin_name,
+                "plugin order size resolved to zero, skipping"
+            );
+            return Ok(());
+        }
+        let context =
+            WasmAlgorithm::context_from_signal(&plugin_name, params, &signal, total_quantity, ctx);
+        let mut algo = WasmAlgorithm::new(engine.clone(), context)?;
+        let algo_id = *algo.id();
+        tracing::info!(
+            id = %algo_id,
+            plugin = %plugin_name,
+            symbol = %signal.symbol,
+            qty = %total_quantity,
+            "Starting plugin execution algorithm"
+        );
+        let initial_orders = algo.start()?;
+        {
+            let mut algorithms = self.algorithms.lock().unwrap();
+            algorithms.insert(algo_id, Box::new(algo));
+        }
+        self.persist_algo_state(&algo_id).await?;
+        for request in initial_orders {
+            self.send_child_order(request, Some(*ctx)).await?;
         }
         Ok(())
     }
