@@ -332,7 +332,7 @@ async fn handle_private_stream(
 ) -> Result<()> {
     let (mut sink, mut source) = stream.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<PrivateMessage>();
-    state.set_private_ws_sender(tx.clone()).await;
+    let mut authenticated = false;
     let forward = tokio::spawn(async move {
         while let Some(payload) = rx.recv().await {
             if sink.send(Message::Text(payload.to_string())).await.is_err() {
@@ -350,6 +350,10 @@ async fn handle_private_stream(
                         }
                         Some("auth") => {
                             let _ = tx.send(json!({"op":"auth","success":true}));
+                            if !authenticated {
+                                state.set_private_ws_sender(tx.clone()).await;
+                                authenticated = true;
+                            }
                         }
                         _ => {}
                     }
