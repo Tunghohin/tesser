@@ -3,11 +3,13 @@
 pub mod algorithm;
 pub mod orchestrator;
 pub mod repository;
+pub mod wasm;
 
 // Re-export key types for convenience
 pub use algorithm::{AlgoStatus, ChildOrderRequest, ExecutionAlgorithm};
 pub use orchestrator::OrderOrchestrator;
 pub use repository::{AlgoStateRepository, SqliteAlgoStateRepository, StoredAlgoState};
+pub use wasm::{WasmAlgorithm, WasmAlgorithmState, WasmPluginEngine};
 
 use anyhow::{bail, Context};
 use rust_decimal::Decimal;

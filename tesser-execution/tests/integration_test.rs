@@ -88,6 +88,7 @@ async fn test_orchestrator_integration() {
         Vec::new(),
         PanicCloseConfig::default(),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -156,6 +157,7 @@ async fn orchestrator_restores_from_sqlite() {
         Vec::new(),
         PanicCloseConfig::default(),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -179,10 +181,16 @@ async fn orchestrator_restores_from_sqlite() {
 
     drop(orchestrator);
 
-    let restored =
-        OrderOrchestrator::new(engine, repo, Vec::new(), PanicCloseConfig::default(), None)
-            .await
-            .unwrap();
+    let restored = OrderOrchestrator::new(
+        engine,
+        repo,
+        Vec::new(),
+        PanicCloseConfig::default(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(restored.active_algorithms_count(), 1);
 }
 
@@ -295,6 +303,7 @@ async fn router_failure_triggers_panic_observer() {
         Vec::new(),
         PanicCloseConfig::default(),
         Some(Arc::new(observer)),
+        None,
     )
     .await
     .unwrap();
