@@ -45,6 +45,9 @@ use tesser_data::analytics::ExecutionAnalysisRequest;
 use tesser_data::download::{
     BinanceDownloader, BybitDownloader, KlineRequest, NormalizedTrade, TradeRequest, TradeSource,
 };
+use tesser_data::etl::{
+    MappingConfig as EtlMappingConfig, Partitioning as EtlPartitioning, Pipeline as EtlPipeline,
+};
 use tesser_data::io::{self, DatasetFormat as IoDatasetFormat, TicksWriter};
 use tesser_data::merger::UnifiedEventStream;
 use tesser_data::parquet::ParquetMarketStream;
@@ -120,6 +123,8 @@ pub enum DataCommand {
     Resample(DataResampleArgs),
     /// Inspect a parquet file emitted by the flight recorder
     InspectParquet(DataInspectParquetArgs),
+    /// Normalize raw data into the canonical schema
+    Normalize(DataNormalizeArgs),
 }
 
 #[derive(Subcommand)]
@@ -211,6 +216,31 @@ pub struct DataDownloadTradesArgs {
     /// Binance public archive market (spot/futures)
     #[arg(long, value_enum, default_value_t = BinanceMarketArg::FuturesUm)]
     binance_market: BinanceMarketArg,
+}
+
+#[derive(Args)]
+pub struct DataNormalizeArgs {
+    /// Glob pointing at the raw input files (e.g. ./raw/binance/*.csv)
+    #[arg(long)]
+    pub source: String,
+    /// Output directory for canonical parquet partitions
+    #[arg(long)]
+    pub output: PathBuf,
+    /// Path to the mapping configuration TOML file
+    #[arg(long)]
+    pub config: PathBuf,
+    /// Symbol identifier recorded in the canonical set (e.g. binance:BTCUSDT)
+    #[arg(long)]
+    pub symbol: String,
+    /// Partitioning strategy (daily or monthly)
+    #[arg(long, value_enum, default_value = "daily")]
+    pub partition: DataPartitionArg,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, ValueEnum)]
+pub enum DataPartitionArg {
+    Daily,
+    Monthly,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -614,6 +644,33 @@ impl DataDownloadTradesArgs {
         writer.finish()?;
         info!("Saved {} raw trades to {}", total, output_path.display());
         Ok(())
+    }
+}
+
+impl DataNormalizeArgs {
+    fn run(&self) -> Result<()> {
+        let raw = fs::read_to_string(&self.config)
+            .with_context(|| format!("failed to read {}", self.config.display()))?;
+        let mapping: EtlMappingConfig = toml::from_str(&raw)
+            .with_context(|| format!("failed to parse mapping config {}", self.config.display()))?;
+        let pipeline = EtlPipeline::new(mapping);
+        let rows = pipeline.run(
+            &self.source,
+            &self.output,
+            &self.symbol,
+            self.partition.into(),
+        )?;
+        info!(rows, output = %self.output.display(), "normalized data written");
+        Ok(())
+    }
+}
+
+impl From<DataPartitionArg> for EtlPartitioning {
+    fn from(value: DataPartitionArg) -> Self {
+        match value {
+            DataPartitionArg::Daily => EtlPartitioning::Daily,
+            DataPartitionArg::Monthly => EtlPartitioning::Monthly,
+        }
     }
 }
 
@@ -1185,6 +1242,9 @@ async fn handle_data(cmd: DataCommand, config: &AppConfig) -> Result<()> {
             args.run()?;
         }
         DataCommand::InspectParquet(args) => {
+            args.run()?;
+        }
+        DataCommand::Normalize(args) => {
             args.run()?;
         }
     }
