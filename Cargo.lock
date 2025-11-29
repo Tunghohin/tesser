@@ -4601,6 +4601,7 @@ dependencies = [
  "tesser-core",
  "tesser-data",
  "tesser-execution",
+ "tesser-ledger",
  "tesser-markets",
  "tesser-paper",
  "tesser-portfolio",
@@ -4705,6 +4706,7 @@ dependencies = [
  "tesser-events",
  "tesser-execution",
  "tesser-journal",
+ "tesser-ledger",
  "tesser-markets",
  "tesser-paper",
  "tesser-portfolio",
@@ -4848,6 +4850,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tesser-ledger"
+version = "0.9.1"
+dependencies = [
+ "arrow",
+ "chrono",
+ "parking_lot",
+ "parquet",
+ "rusqlite",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tesser-core",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
 name = "tesser-markets"
 version = "0.9.1"
 dependencies = [
@@ -4888,6 +4909,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tesser-core",
+ "tesser-ledger",
  "tesser-markets",
  "thiserror 1.0.69",
  "uuid",
