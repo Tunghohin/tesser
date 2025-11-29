@@ -38,6 +38,7 @@ tesser-data = { version = "0.9.1", path = "../tesser-data" }
 tesser-events = { version = "0.9.1", path = "../tesser-events" }
 tesser-execution = { version = "0.9.1", path = "../tesser-execution" }
 tesser-portfolio = { version = "0.9.1", path = "../tesser-portfolio" }
+tesser-ledger = { version = "0.9.1", path = "../tesser-ledger" }
 tesser-markets = { version = "0.9.1", path = "../tesser-markets" }
 tesser-strategy = { version = "0.9.1", path = "../tesser-strategy" }
 tesser-broker = { version = "0.9.1", path = "../tesser-broker" }

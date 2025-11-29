@@ -62,6 +62,10 @@ use tesser_execution::{
     SqliteAlgoStateRepository, StoredAlgoState, WasmPluginEngine,
 };
 use tesser_journal::LmdbJournal;
+use tesser_ledger::{
+    entries_from_fill, FillLedgerContext, LedgerEntry, LedgerRepository, LedgerSequencer,
+    SqliteLedgerRepository,
+};
 use tesser_markets::{InstrumentCatalog, MarketRegistry};
 use tesser_paper::{FeeScheduleConfig, PaperExecutionClient, PaperFactory};
 use tesser_portfolio::{
@@ -505,11 +509,20 @@ impl PersistenceSettings {
     fn algo_repo_path(&self) -> &PathBuf {
         &self.algo_path
     }
+
+    fn ledger_path(&self) -> PathBuf {
+        match self.engine {
+            PersistenceEngine::Sqlite => self.state_path.clone(),
+            PersistenceEngine::Lmdb => self.state_path.join("ledger.db"),
+        }
+    }
 }
 
 struct PersistenceHandles {
     state: Arc<dyn StateRepository<Snapshot = LiveState>>,
     algo: Arc<dyn AlgoStateRepository<State = StoredAlgoState>>,
+    ledger: Arc<dyn LedgerRepository>,
+    ledger_seq: Arc<LedgerSequencer>,
 }
 
 #[derive(Clone)]
@@ -579,9 +592,19 @@ fn build_persistence_handles(settings: &LiveSessionSettings) -> Result<Persisten
             let algo_repo: Arc<dyn AlgoStateRepository<State = StoredAlgoState>> = Arc::new(
                 SqliteAlgoStateRepository::new(settings.persistence.algo_repo_path())?,
             );
+            let ledger_repo: Arc<dyn LedgerRepository> = Arc::new(
+                SqliteLedgerRepository::new(settings.persistence.ledger_path())
+                    .map_err(|err| anyhow!(err.to_string()))?,
+            );
+            let ledger_seq = Arc::new(
+                LedgerSequencer::bootstrap(ledger_repo.as_ref())
+                    .map_err(|err| anyhow!(err.to_string()))?,
+            );
             Ok(PersistenceHandles {
                 state: state_repo,
                 algo: algo_repo,
+                ledger: ledger_repo,
+                ledger_seq,
             })
         }
         PersistenceEngine::Lmdb => {
@@ -590,9 +613,19 @@ fn build_persistence_handles(settings: &LiveSessionSettings) -> Result<Persisten
                 Arc::new(journal.state_repo());
             let algo_repo: Arc<dyn AlgoStateRepository<State = StoredAlgoState>> =
                 Arc::new(journal.algo_repo());
+            let ledger_repo: Arc<dyn LedgerRepository> = Arc::new(
+                SqliteLedgerRepository::new(settings.persistence.ledger_path())
+                    .map_err(|err| anyhow!(err.to_string()))?,
+            );
+            let ledger_seq = Arc::new(
+                LedgerSequencer::bootstrap(ledger_repo.as_ref())
+                    .map_err(|err| anyhow!(err.to_string()))?,
+            );
             Ok(PersistenceHandles {
                 state: state_repo,
                 algo: algo_repo,
+                ledger: ledger_repo,
+                ledger_seq,
             })
         }
     }
@@ -746,7 +779,9 @@ pub async fn run_live_with_shutdown(
         routes,
         router.clone(),
         orchestrator,
-        persistence.state,
+        persistence.state.clone(),
+        persistence.ledger.clone(),
+        persistence.ledger_seq.clone(),
         settings,
         metrics,
         alerts,
@@ -915,6 +950,8 @@ impl LiveRuntime {
         router: Option<Arc<RouterExecutionClient>>,
         orchestrator: OrderOrchestrator,
         state_repo: Arc<dyn StateRepository<Snapshot = LiveState>>,
+        ledger_repo: Arc<dyn LedgerRepository>,
+        ledger_seq: Arc<LedgerSequencer>,
         settings: LiveSessionSettings,
         metrics: Arc<LiveMetrics>,
         alerts: Arc<AlertManager>,
@@ -1202,6 +1239,8 @@ impl LiveRuntime {
             strategy_handle.clone(),
             market_registry.clone(),
             settings.exec_backend,
+            ledger_repo,
+            ledger_seq,
             shutdown.clone(),
         );
         for symbol in &symbols {
@@ -1945,6 +1984,8 @@ struct OmsActor {
     strategy: StrategyHandle,
     market_registry: Arc<MarketRegistry>,
     exec_backend: ExecutionBackend,
+    ledger_repo: Arc<dyn LedgerRepository>,
+    ledger_seq: Arc<LedgerSequencer>,
     shutdown: ShutdownSignal,
 }
 
@@ -1967,6 +2008,8 @@ impl OmsActor {
         strategy: StrategyHandle,
         market_registry: Arc<MarketRegistry>,
         exec_backend: ExecutionBackend,
+        ledger_repo: Arc<dyn LedgerRepository>,
+        ledger_seq: Arc<LedgerSequencer>,
         shutdown: ShutdownSignal,
     ) -> Self {
         Self {
@@ -1986,6 +2029,8 @@ impl OmsActor {
             strategy,
             market_registry,
             exec_backend,
+            ledger_repo,
+            ledger_seq,
             shutdown,
         }
     }
@@ -2121,24 +2166,42 @@ impl OmsActor {
 
     async fn handle_fill(&mut self, fill: Fill) -> Result<()> {
         let was_liquidate_only = self.portfolio.liquidate_only();
+        let instrument = self
+            .market_registry
+            .get(fill.symbol)
+            .ok_or_else(|| anyhow!("unknown instrument {}", fill.symbol))?
+            .clone();
+        let impact = self
+            .portfolio
+            .apply_fill_positions(&fill)
+            .with_context(|| format!("failed to update positions for {}", fill.symbol))?;
+        let mut ledger_entries = entries_from_fill(FillLedgerContext::new(
+            &fill,
+            &instrument,
+            impact.realized_pnl,
+        ));
+        for entry in &mut ledger_entries {
+            entry.sequence = self.ledger_seq.next();
+        }
         self.portfolio
-            .apply_fill(&fill)
-            .with_context(|| format!("Failed to apply fill to portfolio for {}", fill.symbol))?;
+            .apply_ledger_entries(&ledger_entries)
+            .context("failed to update portfolio balances from ledger entries")?;
+        self.persist_ledger_entries(ledger_entries).await;
         self.snapshot_portfolio();
-        if let Some(instr) = self.market_registry.get(fill.symbol) {
+        {
             let base_balance = self
                 .portfolio
-                .balance(instr.base)
+                .balance(instrument.base)
                 .map(|cash| cash.quantity)
                 .unwrap_or_default();
             let quote_balance = self
                 .portfolio
-                .balance(instr.quote)
+                .balance(instrument.quote)
                 .map(|cash| cash.quantity)
                 .unwrap_or_default();
             let settlement_balance = self
                 .portfolio
-                .balance(instr.settlement_currency)
+                .balance(instrument.settlement_currency)
                 .map(|cash| cash.quantity)
                 .unwrap_or_default();
             debug!(
@@ -2252,6 +2315,20 @@ impl OmsActor {
             }
         }
         self.persistence.save(snapshot).await;
+    }
+
+    async fn persist_ledger_entries(&self, entries: Vec<LedgerEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        let repo = self.ledger_repo.clone();
+        if let Err(err) = tokio::task::spawn_blocking(move || repo.append_batch(&entries))
+            .await
+            .map_err(|err| anyhow!("ledger persistence task failed: {err}"))
+            .and_then(|result| result.map_err(|e| anyhow!(e.to_string())))
+        {
+            warn!(error = %err, "failed to persist ledger entries");
+        }
     }
 
     fn snapshot_portfolio(&mut self) {
