@@ -5,6 +5,7 @@ edition = "2021"
 license.workspace = true
 authors.workspace = true
 description = "gRPC interface for external Tesser strategies"
+readme = "README.md"
 
 [dependencies]
 anyhow.workspace = true
