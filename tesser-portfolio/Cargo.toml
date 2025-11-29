@@ -16,6 +16,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tesser-core = { version = "0.9.1", path = "../tesser-core" }
 tesser-markets = { version = "0.9.1", path = "../tesser-markets" }
+tesser-ledger = { version = "0.9.1", path = "../tesser-ledger" }
 rust_decimal.workspace = true
 
 [dev-dependencies]
