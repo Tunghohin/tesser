@@ -6,6 +6,7 @@ authors = ["Tesser Contributors <dev@tesser.local>"]
 license = "MIT OR Apache-2.0"
 description = "Ledger primitives for Tesser accounting"
 repository = "https://github.com/tesserspace/tesser"
+readme = "README.md"
 
 [dependencies]
 arrow = { workspace = true }
