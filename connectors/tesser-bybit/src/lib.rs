@@ -603,10 +603,7 @@ impl ExecutionClient for BybitClient {
         for symbol in symbols.unwrap_or(&vec![]) {
             let query = vec![
                 ("category".to_string(), self.config.category.clone()),
-                (
-                    "symbol".to_string(),
-                    Self::symbol_code(symbol.clone()).to_string(),
-                ),
+                ("symbol".to_string(), Self::symbol_code(*symbol).to_string()),
             ];
             let resp: ApiResponse<PositionListResult> = self
                 .signed_request(Method::GET, "/v5/position/list", Value::Null, Some(query))

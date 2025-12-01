@@ -2739,7 +2739,13 @@ fn spawn_bybit_private_stream(
                     if let Some(bybit) = exec_client.as_any().downcast_ref::<BybitClient>() {
                         let since = {
                             let guard = last_sync.lock().await;
-                            guard.unwrap_or_else(|| Utc::now() - chrono::Duration::minutes(30))
+                            let raw_since =
+                                guard.unwrap_or_else(|| Utc::now() - chrono::Duration::minutes(30));
+                            if Utc::now() - raw_since > chrono::Duration::days(7) {
+                                Utc::now() - chrono::Duration::minutes(30)
+                            } else {
+                                raw_since
+                            }
                         };
                         match bybit.list_executions_since(since).await {
                             Ok(fills) => {
